@@ -96,27 +96,28 @@ export function rememberAccountCurrency(
     if (entries[userId] === currency) return;
     const next = { ...entries, [userId]: currency };
     memo = next;
+    const file = storePath();
+    // 写临时文件 + rename 原子落位（同 learn-host/runStore）。直接覆盖写会在崩溃或断电时
+    // 留下截断的 JSON，readEntries 解析失败后把 entries 当空 —— 整份币种快照丢失，冷启动
+    // 回退链退到 USD 兜底，对 CNY 结算账号就是本 PR 要修的那个错账。
+    // tmp 名带 pid + 随机串，避免多进程残留碰撞。
+    const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`;
     try {
-      const file = storePath();
       await fs.mkdir(path.dirname(file), { recursive: true });
       const payload: StorePayload = { version: STORE_VERSION, entries: next };
-      await fs.writeFile(file, JSON.stringify(payload), 'utf8');
+      await fs.writeFile(tmp, JSON.stringify(payload), 'utf8');
+      await fs.rename(tmp, file);
       log.info(`ledger currency remembered: user=${userId} currency=${currency}`);
     } catch (err) {
       log.warn(
         'persist ledger currency failed:',
         err instanceof Error ? err.message : String(err),
       );
+      await fs.rm(tmp, { force: true }).catch(() => undefined);
     }
   });
 }
 
-/**
- * 启动时把当前账号上次已知的结算币种恢复给 ledgerCurrency。
- *
- * 必须在任何记账路径之前跑（prewarm 阶段）：否则 /models 回来之前的那几轮会按兜底
- * 币种入账，而那正是币种翻转的主要来源之一。
- */
 /**
  * 记录「当前是哪个账号在记账」，账号变了就丢掉内存里的「上次已知」币种。
  *
@@ -133,11 +134,25 @@ export function noteActiveAccount(userId: string | null | undefined): void {
   hydratedUserId = userId;
 }
 
+/**
+ * 启动时把当前账号上次已知的结算币种恢复给 ledgerCurrency。
+ *
+ * 必须在任何记账路径之前跑（prewarm 阶段）：否则 /models 回来之前的那几轮会按兜底
+ * 币种入账，而那正是币种翻转的主要来源之一。
+ *
+ * 落盘读取是异步的，期间账号可能已经切走 —— 回来后必须复核 hydratedUserId，否则
+ * 上一个账号的币种会被写进刚清空的 lastKnown，新账号目录没声明 currency 时就按别人的
+ * 口径记账。切号清空发生在 await 之前，只有这道复核能挡住迟到的写回。
+ */
 export async function hydrateAccountCurrency(userId?: string): Promise<MoneyCurrency | null> {
   const resolved = userId ?? getCurrentDbClientUserId();
   if (!resolved) return null;
   noteActiveAccount(resolved);
   const entries = await readEntries();
+  if (hydratedUserId !== resolved) {
+    log.info(`ledger currency hydrate discarded: account changed away from ${resolved}`);
+    return null;
+  }
   const currency = entries[resolved] ?? null;
   if (currency) {
     hydrateLastKnownLedgerCurrency(currency);

@@ -14,7 +14,13 @@ vi.mock('../../logger', () => ({
 import * as schema from '../schema';
 import type { DbClient } from '../client/DbClient';
 import { clearCurrentDbClient, setCurrentDbClient } from '../client/current';
-import { getTodaySpend, incrementDailySpend, localDayKey } from '../dailySpend';
+import {
+  collapseDayMonies,
+  getAllSpendDays,
+  getTodaySpend,
+  incrementDailySpend,
+  localDayKey,
+} from '../dailySpend';
 import { incrementDailyModelUsage } from '../dailyModelUsage';
 import {
   __resetActiveLedgerCurrencyForTesting,
@@ -141,6 +147,40 @@ describe('daily ledger multi-currency rows', () => {
       });
       setActiveLedgerCurrency('CNY');
       await expect(getTodaySpend()).resolves.toMatchObject({
+        amount: 149.13,
+        currency: 'CNY',
+      });
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('returns per-day rows unfolded so the caller collapses after the currency is known', async () => {
+    // 回归护栏。折叠是一个依赖账本币种的决定，而账本币种要等报价快照恢复才确定。
+    // 若在 getAllSpendDays 内部折叠，冷启动时(usageHistory 与 getModelPricing 并发)
+    // 会先按兜底币种把本账号那一行丢掉，调用方再怎么等也拿不回来。
+    const harness = createHarness();
+    try {
+      setActiveLedgerCurrency('CNY');
+      await incrementDailySpend(cny(149.13));
+      setActiveLedgerCurrency('USD');
+      await incrementDailySpend(usd(15.44));
+
+      // 读侧不折叠：两个币种都原样返回，与当前账本币种无关。
+      const days = await getAllSpendDays();
+      expect(days).toHaveLength(1);
+      const monies = [...days[0].monies].sort((a, b) => a.currency.localeCompare(b.currency));
+      expect(monies.map((m) => [m.currency, m.amount])).toEqual([
+        ['CNY', 149.13],
+        ['USD', 15.44],
+      ]);
+
+      // 折叠由调用方在币种确定后做，两个方向都能取到自己那一行。
+      expect(collapseDayMonies(days[0].monies, 'USD')).toMatchObject({
+        amount: 15.44,
+        currency: 'USD',
+      });
+      expect(collapseDayMonies(days[0].monies, 'CNY')).toMatchObject({
         amount: 149.13,
         currency: 'CNY',
       });

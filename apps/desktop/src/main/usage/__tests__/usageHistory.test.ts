@@ -286,8 +286,8 @@ describe('readUsageHistoryWith', () => {
     const estimateAmount = regionalUsdAmount(2);
     const result = await readUsageHistoryWith(makeDeps({
       getAllSpendDays: async () => [
-        { day: '2026-06-10', money: actual(3) },
-        { day: TODAY, money: actual(5) },
+        { day: '2026-06-10', monies: [actual(3)] },
+        { day: TODAY, monies: [actual(5)] },
       ],
       getModelUsageSince: async () => [
         modelRow(
@@ -390,12 +390,12 @@ describe('readUsageHistoryWith', () => {
         getAllSpendDays: async () => [
           {
             day: TODAY,
-            money: {
+            monies: [{
               amount: 5,
               currency: historicalCurrency,
               approximate: false,
               kind: 'actual-cost',
-            },
+            }],
           },
         ],
         getModelUsageSince: async () => [
@@ -471,8 +471,8 @@ describe('readUsageHistoryWith', () => {
     const result = await readUsageHistoryWith(
       makeDeps({
         getAllSpendDays: async () => [
-          { day: '2026-06-10', money: usdRow(3) },
-          { day: TODAY, money: usdRow(5) },
+          { day: '2026-06-10', monies: [usdRow(3)] },
+          { day: TODAY, monies: [usdRow(5)] },
         ],
         getModelUsageSince: async () => [],
         getModelPricing: async () => ({
@@ -550,12 +550,12 @@ describe('readUsageHistoryWith', () => {
   it('propagates approximate legacy history into anomaly and totals', async () => {
     const trailing = Array.from({ length: 7 }, (_, index) => ({
       day: shiftDayKey(TODAY, -(index + 1)),
-      money: actual(1, true),
+      monies: [actual(1, true)],
     }));
     const result = await readUsageHistoryWith(makeDeps({
       getAllSpendDays: async () => [
         ...trailing,
-        { day: TODAY, money: actual(7, true) },
+        { day: TODAY, monies: [actual(7, true)] },
       ],
     }));
     expect(result.anomaly).toMatchObject({
@@ -572,7 +572,7 @@ describe('readUsageHistoryWith', () => {
 describe('production cache and empty payload', () => {
   it('writes a structured fresh payload and serves it from memory', async () => {
     vi.mocked(getAllSpendDays).mockResolvedValue([
-      { day: TODAY, money: actual(2) },
+      { day: TODAY, monies: [actual(2)] },
     ]);
     const first = await readUsageHistory({ days: 30 });
     const second = await readUsageHistory({ days: 30 });

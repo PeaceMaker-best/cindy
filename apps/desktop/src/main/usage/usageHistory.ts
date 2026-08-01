@@ -223,7 +223,7 @@ export function computeAnomaly(
 
 /** 测试注入用的数据读取依赖。 */
 export interface UsageHistoryDeps {
-  getAllSpendDays(): Promise<Array<{ day: string; money: RegionalMoney }>>;
+  getAllSpendDays(): Promise<Array<{ day: string; monies: RegionalMoney[] }>>;
   getModelUsageSince(sinceDayKey: string): Promise<DailyModelUsageRow[]>;
   getModelPricing(): Promise<ModelPricingMap | null>;
   /** 覆盖记录快照,一次聚合读一份——历史重合并逐行读文件会在慢盘上拖垮 Main 线程。 */
@@ -526,13 +526,6 @@ export async function readUsageHistoryWith(
   });
   const keepCompatibleMoney = (money: RegionalMoney): RegionalMoney =>
     money.currency === ledgerCurrency ? money : zeroActual();
-  const allDays = spendDayRows.map((row) => ({
-    ...row,
-    money: keepCompatibleMoney(row.money),
-  }));
-  const spendByDay = new Map(
-    allDays.map((row) => [row.day, row.money.amount]),
-  );
   const addOrZero = (
     values: RegionalMoney[],
     kind: 'actual-cost' | 'value-estimate' = 'actual-cost',
@@ -541,6 +534,17 @@ export async function readUsageHistoryWith(
       values.filter((value) => value.currency === ledgerCurrency),
       ledgerCurrency,
     ) ?? (kind === 'actual-cost' ? zeroActual() : zeroEstimate());
+  // 日账按币种拆开取回，折叠推迟到这里 —— 与上面等 pricing 是同一个理由：折叠依赖账本
+  // 币种，而它要等报价快照恢复才确定。若在 getAllSpendDays 内部折叠，冷启动时会先按
+  // 兜底币种把本账号那一行丢掉，等到这里再怎么等也拿不回来。
+  // 与 model 行共用 addOrZero，异币种同样归零，两条链路口径一致。
+  const allDays = spendDayRows.map((row) => ({
+    day: row.day,
+    money: addOrZero(row.monies),
+  }));
+  const spendByDay = new Map(
+    allDays.map((row) => [row.day, row.money.amount]),
+  );
 
   const heatmapCutoff = shiftDayKey(todayKey, -(windowDays - 1));
   const modelCutoff = shiftDayKey(todayKey, -(MODEL_WINDOW_DAYS - 1));
