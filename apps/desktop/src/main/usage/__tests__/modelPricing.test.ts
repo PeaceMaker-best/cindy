@@ -83,8 +83,10 @@ import {
 } from '../modelPricing';
 
 let tempUserDataDir: string | null = null;
-const EXPECTED_GATEWAY_CURRENCY =
-  CURRENT_CINDY_REGION === 'global' ? 'USD' : 'CNY';
+// 目录整份没声明 currency 时的回落值。不再按构建区域推断 —— 服务端漏发 currency 时
+// 按区域猜会把 USD 口径的报价数值盖上 CNY 戳,产生 6.7 倍量级的错账。回落链是
+// 「上次已知 → USD」(见 usage/ledgerCurrency),测试从干净状态起跑,所以是 USD。
+const EXPECTED_GATEWAY_CURRENCY = 'USD';
 
 function userDataPath(...segments: string[]): string {
   if (!tempUserDataDir) throw new Error('temp userData is not initialized');
@@ -157,6 +159,8 @@ describe('gateway model pricing projection', () => {
           cacheReadPerMtok: 0.3,
           cacheCreatePerMtok: 3.75,
           costDiscount: 0.4,
+          // 这批 model 都没声明 currency,回落值是本地推断的 —— 下游据此把金额标成估算。
+          currencyInferred: true,
         },
         'codex/gpt-5.5': {
           providerId: 'xd',
@@ -167,6 +171,7 @@ describe('gateway model pricing projection', () => {
           inputPerMtok: 2,
           outputPerMtok: 8,
           cacheReadPerMtok: expect.closeTo(0.2),
+          currencyInferred: true,
         },
       },
     });

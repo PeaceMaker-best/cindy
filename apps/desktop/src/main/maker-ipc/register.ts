@@ -298,7 +298,7 @@ import { detectClaudeModelMismatch } from '../../shared/modelMismatch.js';
 import { triggerClaudeAccountUsageRefresh } from '../usage/claudeAccountUsage.js';
 import { broadcastEffectiveModelPricing, getCodexProviderSubscriptionValuePrice, getGatewayAccountCurrency, getModelPriceQuote, getModelPricing, getModelPricingForModel, getSubscriptionDirectValuePrice } from '../usage/modelPricing.js';
 import { clearModelPriceOverride, stageProviderModelPriceOverridesClear, readModelPriceOverrideView, setModelPriceOverride } from '../usage/modelPriceOverrideStore.js';
-import { computeModelUsageDeltas, type ModelUsageCumulative, type ModelUsageDeltaEntry } from '../usage/modelUsageDelta.js';
+import { computeModelUsageDeltas, detectOutputLag, type ModelUsageCumulative, type ModelUsageDeltaEntry } from '../usage/modelUsageDelta.js';
 import { claudeSubscriptionUsageModelKey, codexApiUsageModelKey, codexSubscriptionUsageModelKey } from '../usage/usageHistory.js';
 import { billingRouteForExplicitProvider, buildClaudeTurnUsageDetails, computePriceQuoteTurnMoney, estimateClaudeSubscriptionTurnValue, isAnthropicModel, normalizeModelIdForPricing, resolveClaudeTurnCostSinks, type BillingRoute } from '../usage/turnCostCalculator.js';
 import { CHATGPT_MODEL_PREFIX, XAI_MODEL_PREFIX, isSubscriptionDirectModel } from '../../shared/subscriptionModels.js';
@@ -3222,6 +3222,20 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
       // 判定主线被上游静默替换(如 fable-5 高负载被路由到 opus-4-8),把标记挂到本轮
       // 收尾 assistant 的 agent_meta 上(AssistantMessage 渲染降级提示行)。
       // fire-and-forget,与记账 sink 互不阻塞;判定纯函数见 shared/modelMismatch.ts。
+      if (modelUsageDeltas && detectOutputLag(modelUsageDeltas)) {
+        // 上游在 done 时点还没结算本轮输出(实测 Vertex),这一轮的费用会偏低、下一轮偏高。
+        // 总量不丢,只是归属错位;不做纠正的理由见 usage/modelUsageDelta 文件头。
+        log.warn(
+          `turn output likely lagging upstream settlement (session=${session.id}): ` +
+            modelUsageDeltas
+              .map(
+                (d) =>
+                  `${d.model} out=${d.outputTokensDelta} in=${d.inputTokensDelta} ` +
+                  `cacheRead=${d.cacheReadTokensDelta} cacheCreate=${d.cacheCreateTokensDelta}`,
+              )
+              .join('; '),
+        );
+      }
       if (turnAssistantPersistId && modelUsageDeltas && modelUsageDeltas.length > 0) {
         const mismatchClientId = turnAssistantPersistId;
         const actualEntries = modelUsageDeltas.map((d) => ({
