@@ -95,7 +95,6 @@ export function rememberAccountCurrency(
     const entries = await readEntries();
     if (entries[userId] === currency) return;
     const next = { ...entries, [userId]: currency };
-    memo = next;
     const file = storePath();
     // 写临时文件 + rename 原子落位（同 learn-host/runStore）。直接覆盖写会在崩溃或断电时
     // 留下截断的 JSON，readEntries 解析失败后把 entries 当空 —— 整份币种快照丢失，冷启动
@@ -107,6 +106,10 @@ export function rememberAccountCurrency(
       const payload: StorePayload = { version: STORE_VERSION, entries: next };
       await fs.writeFile(tmp, JSON.stringify(payload), 'utf8');
       await fs.rename(tmp, file);
+      // memo 表示「磁盘上是什么」，只在落位成功后才提交。抢先更新会让上面第 96 行的
+      // 同值短路把后续同步一并跳过 —— 一次瞬时写失败就变成本进程再也不重试，重启后
+      // 报价缓存又恰好失效时，CNY 账号会丢掉这份独立快照并回落 USD。
+      memo = next;
       log.info(`ledger currency remembered: user=${userId} currency=${currency}`);
     } catch (err) {
       log.warn(

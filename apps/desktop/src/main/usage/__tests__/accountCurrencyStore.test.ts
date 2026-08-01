@@ -125,6 +125,29 @@ describe('persistence durability', () => {
     expect(leftovers).toEqual([]);
   });
 
+  it('retries after a transient write failure instead of giving up for the process', async () => {
+    // memo 表示「磁盘上是什么」。抢在落位前更新它，会让同值短路把后续同步一并跳过 ——
+    // 一次瞬时写失败就变成本进程再也不重试，重启后报价缓存又恰好失效时，CNY 账号会
+    // 丢掉这份独立快照并回落 USD。
+    const fsp = await import('node:fs/promises');
+    const renameSpy = vi
+      .spyOn(fsp.default, 'rename')
+      .mockRejectedValueOnce(new Error('EBUSY: transient'));
+
+    rememberAccountCurrency('user-a', 'CNY');
+    await flushWrites();
+    expect(renameSpy).toHaveBeenCalledTimes(1);
+    await expect(readFile(storeFile(), 'utf8').catch(() => null)).resolves.toBeNull();
+
+    // 同一账号同一币种再来一次：不能被同值短路吃掉。
+    renameSpy.mockRestore();
+    rememberAccountCurrency('user-a', 'CNY');
+    await flushWrites();
+    expect(JSON.parse(await readFile(storeFile(), 'utf8')).entries).toEqual({
+      'user-a': 'CNY',
+    });
+  });
+
   it('keeps other accounts when appending a new one', async () => {
     await writeStore({ 'user-b': 'USD' });
     rememberAccountCurrency('user-a', 'CNY');
