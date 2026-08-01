@@ -588,7 +588,9 @@ describe('production cache and empty payload', () => {
         ),
       );
       expect(raw).toMatchObject({
-        version: 4,
+        // 日账改为按币种分行、折叠推迟到读侧之后升到 5:v4 快照是用「按区域猜出来的
+        // 账本币种」折叠出来的聚合值，不能沿用。改折叠口径时同步这里。
+        version: 5,
         optsKey: 'user=user-a|days=30',
         payload: {
           totals: {

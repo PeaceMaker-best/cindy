@@ -54,11 +54,14 @@ export type {
 } from '../../shared/regionalMoney.js';
 
 const log = createLogger('modelPricing');
+// v9:币种回落不再按构建区域猜，且猜出来的报价会带 currencyInferred。v8 快照里那些
+//    按区域兜底写入的 accountCurrency 与 quote 没有这个标记，复用它们会让「猜的币种」
+//    重新冒充精确报价 —— 离线或 /models 失败时正好绕过本次修复，必须整份作废重取。
 // v8:账号币种与报价同快照持久化；无报价模型也可能明确声明结算币种。
 // v7:币种改为优先使用 Model Access 明确声明，不能复用按 region 猜测的旧 quote。
 // v6:所有 Gateway 模型统一按服务端 costDiscount 计费。v5 的 codex/ quote 已
 // 硬编码乘过 0.15 且丢弃 costDiscount，不能继续复用。
-const DISK_CACHE_VERSION = 8;
+const DISK_CACHE_VERSION = 9;
 const DISK_CACHE_FILE = 'model-pricing.json';
 
 export const MODEL_PRICING_CHANGED_CHANNEL = 'usage:model-pricing-changed';

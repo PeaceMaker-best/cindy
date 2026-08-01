@@ -305,9 +305,10 @@ describe('pricing cache lifecycle', () => {
     await vi.waitFor(async () => {
       const raw = JSON.parse(await readFile(userDataPath('cache', 'model-pricing.json'), 'utf8'));
       expect(raw).toMatchObject({
-        // 账号币种与报价同快照持久化后升到 8:旧缓存缺少账号币种，
-        // 必须靠版本号失效掉。改缓存结构时同步这里。
-        version: 8,
+        // 币种回落不再按构建区域猜之后升到 9:v8 快照里那些按区域兜底写入的
+        // accountCurrency 与 quote 没有 currencyInferred 标记，复用会让猜出来的币种
+        // 重新冒充精确报价。改缓存结构或币种语义时同步这里。
+        version: 9,
         scope: expectedScope(),
         pricing,
       });
@@ -405,6 +406,44 @@ describe('pricing cache lifecycle', () => {
     await expect(getModelPricing()).resolves.toMatchObject({
       openai: expect.any(Object),
     });
+  });
+
+  it('discards a v8 snapshot whose currency was guessed by build region', async () => {
+    // 回归护栏。v8 快照里的 accountCurrency 与 quote 币种可能是旧版本按构建区域兜底
+    // 写进去的，而那一版还没有 currencyInferred 字段 —— 无从分辨「服务端声明的」与
+    // 「本地猜的」。若继续复用，离线或 /models 失败时猜出来的币种会重新冒充精确报价，
+    // 正好绕过本次修复。只能靠版本号整份作废。
+    await mkdir(userDataPath('cache'), { recursive: true });
+    await writeFile(
+      userDataPath('cache', 'model-pricing.json'),
+      JSON.stringify({
+        version: 8,
+        scope: expectedScope(),
+        fetchedAt: Date.now(),
+        accountCurrency: 'CNY',
+        pricing: {
+          xd: {
+            'gpt-5.5': {
+              providerId: 'xd',
+              modelId: 'gpt-5.5',
+              currency: 'CNY',
+              source: 'gateway',
+              approximate: false,
+              inputPerMtok: 5,
+              outputPerMtok: 30,
+            },
+          },
+        },
+      }),
+      'utf8',
+    );
+
+    __resetActiveLedgerCurrencyForTesting();
+    const hydrated = await getModelPricing();
+    // 那份 v8 的 xd 报价一条都不能进来（registry 参考价不受影响，另有来源）。
+    expect(hydrated?.xd).toBeUndefined();
+    // 账本币种也不能被它带偏，回退链重新从「上次已知 → USD」起算。
+    expect(currentLedgerCurrency()).toBe('USD');
   });
 
   it('does not hydrate pricing written for an older gateway key identity', async () => {

@@ -58,8 +58,10 @@ const ANOMALY_MIN_TODAY_USD = 1;
 const ANOMALY_MIN_ACTIVE_DAYS = 3;
 /** 模型拆分统计窗口 (天)。 */
 const MODEL_WINDOW_DAYS = 30;
+// v5:日账改为按币种分行后折叠口径变了；v4 快照是用「按区域猜出来的账本币种」折叠出来
+//    的聚合值，直接沿用会让升级后的首页继续显示按错币种算出的历史。整份作废重算。
 // v4:恢复 CN usage 的 CNY 账本口径，并让订阅 USD 估值按 6.7 投影到 CNY。
-const DISK_CACHE_VERSION = 4;
+const DISK_CACHE_VERSION = 5;
 const DISK_CACHE_FILE = 'usage-history.json';
 /** 后台刷新完成后, renderer 的短轮询能拿到 fresh payload, 避免 stale 状态自循环。 */
 const MEMORY_FRESH_MS = 10_000;
