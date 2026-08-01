@@ -42,6 +42,14 @@ interface StorePayload {
 let memo: Record<string, MoneyCurrency> | null = null;
 let writeChain: Promise<void> = Promise.resolve();
 let hydratedUserId: string | null = null;
+/**
+ * 账号代际。每次活跃账号真正发生变化时 +1，唯一写入者是 noteActiveAccount。
+ *
+ * 存在的理由是 A→B→A：跨 await 的写入只比较「当前 userId 是否还等于发起时的 userId」
+ * 不足以判定期间没换过人 —— 切走又切回会让这个比较重新相等，于是一份在 B 期间就已
+ * 过期的读取结果被当成有效值提交。代际号单调递增，切回来也不会复用旧值。
+ */
+let accountGeneration = 0;
 
 function storePath(): string {
   return path.join(app.getPath('userData'), 'cache', STORE_FILE);
@@ -130,11 +138,13 @@ export function rememberAccountCurrency(
  */
 export function noteActiveAccount(userId: string | null | undefined): void {
   if (!userId) return;
-  if (hydratedUserId && hydratedUserId !== userId) {
+  if (hydratedUserId === userId) return;
+  if (hydratedUserId) {
     resetLedgerCurrencyForAccountSwitch();
     log.info(`ledger currency reset for account switch: ${hydratedUserId} -> ${userId}`);
   }
   hydratedUserId = userId;
+  accountGeneration += 1;
 }
 
 /**
@@ -143,17 +153,23 @@ export function noteActiveAccount(userId: string | null | undefined): void {
  * 必须在任何记账路径之前跑（prewarm 阶段）：否则 /models 回来之前的那几轮会按兜底
  * 币种入账，而那正是币种翻转的主要来源之一。
  *
- * 落盘读取是异步的，期间账号可能已经切走 —— 回来后必须复核 hydratedUserId，否则
- * 上一个账号的币种会被写进刚清空的 lastKnown，新账号目录没声明 currency 时就按别人的
- * 口径记账。切号清空发生在 await 之前，只有这道复核能挡住迟到的写回。
+ * ## 不变量
+ *
+ * 跨越 await 的账号相关写入，只有在这段 await 期间**账号身份一次都没变过**时才允许
+ * 提交。判据是账号代际号，不是 userId 相等 —— 后者挡得住 A→B，挡不住 A→B→A：切回来
+ * 之后 userId 重新相等，一份在 B 期间就已过期的读取结果会被当成有效值写进 lastKnown。
  */
 export async function hydrateAccountCurrency(userId?: string): Promise<MoneyCurrency | null> {
   const resolved = userId ?? getCurrentDbClientUserId();
   if (!resolved) return null;
   noteActiveAccount(resolved);
+  const generation = accountGeneration;
   const entries = await readEntries();
-  if (hydratedUserId !== resolved) {
-    log.info(`ledger currency hydrate discarded: account changed away from ${resolved}`);
+  if (accountGeneration !== generation) {
+    log.info(
+      `ledger currency hydrate discarded: account changed during read (user=${resolved}, ` +
+        `generation ${generation} -> ${accountGeneration})`,
+    );
     return null;
   }
   const currency = entries[resolved] ?? null;
@@ -166,6 +182,7 @@ export async function hydrateAccountCurrency(userId?: string): Promise<MoneyCurr
 
 /** 仅测试：丢掉内存快照，强制下次重读磁盘。 */
 export function __resetAccountCurrencyStoreForTesting(): void {
+  accountGeneration = 0;
   memo = null;
   writeChain = Promise.resolve();
   hydratedUserId = null;

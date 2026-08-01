@@ -71,20 +71,42 @@ afterEach(async () => {
 });
 
 describe('hydrate across an account switch', () => {
-  it('discards a hydrate that lands after the account already switched away', async () => {
-    // 回归护栏。落盘读取是异步的：A 的读还在途中就切到 B，切号逻辑先清空 lastKnown，
-    // 若 A 的读回来不复核当前账号就把旧币种写回，B 的目录没声明 currency 时会按 A 的
-    // 口径记账 —— 跨账号错账。
-    await writeStore({ 'user-a': 'CNY', 'user-b': 'USD' });
+  // 不变量：跨越 await 的账号相关写入，只有在这段 await 期间**账号身份一次都没变过**
+  // 时才允许提交。
+  //
+  // 判据必须是账号代际号而不是「当前 userId 是否还等于发起时的 userId」——后者挡得住
+  // A→B，挡不住 A→B→A：切回来之后 userId 重新相等，一份在 B 期间就已过期的读取结果
+  // 会被当成有效值写进 lastKnown。
+  //
+  // 表驱动交错序列而不是逐条孤立用例：ABA 与 ABCA 两行对「只比 userId」的实现必然
+  // 失败，「期间重复 note 同一账号」一行则对「每次 note 都递增代际」的实现失败 ——
+  // 两个方向都能把错误修法区分出来。
+  const interleavings: Array<{ name: string; during: string[]; committed: boolean }> = [
+    { name: '期间无任何账号事件', during: [], committed: true },
+    { name: '期间重复 note 同一账号', during: ['user-a', 'user-a'], committed: true },
+    { name: '切走未回 (A→B)', during: ['user-b'], committed: false },
+    { name: '切走又切回 (A→B→A)', during: ['user-b', 'user-a'], committed: false },
+    { name: '绕一圈再回 (A→B→C→A)', during: ['user-b', 'user-c', 'user-a'], committed: false },
+  ];
 
-    const pending = hydrateAccountCurrency('user-a');
-    // await 期间账号切走（真实链路里是 replaceGatewayModelPricing 的同步 noteActiveAccount）。
-    noteActiveAccount('user-b');
-    await expect(pending).resolves.toBeNull();
+  for (const { name, during, committed } of interleavings) {
+    it(`${committed ? 'commits' : 'discards'} the hydrate — ${name}`, async () => {
+      await writeStore({ 'user-a': 'CNY', 'user-b': 'USD', 'user-c': 'USD' });
 
-    expect(isLedgerCurrencyKnown()).toBe(false);
-    expect(currentLedgerCurrency()).toBe('USD');
-  });
+      const pending = hydrateAccountCurrency('user-a');
+      // await 期间的账号事件（真实链路里是 replaceGatewayModelPricing 的同步 noteActiveAccount）。
+      for (const userId of during) noteActiveAccount(userId);
+
+      await expect(pending).resolves.toBe(committed ? 'CNY' : null);
+      if (committed) {
+        expect(currentLedgerCurrency()).toBe('CNY');
+      } else {
+        // 丢弃时绝不能把 A 的币种留在账本上，回退链要回到「上次已知 → USD」。
+        expect(isLedgerCurrencyKnown()).toBe(false);
+        expect(currentLedgerCurrency()).toBe('USD');
+      }
+    });
+  }
 
   it('hydrates normally when the account stays put', async () => {
     await writeStore({ 'user-a': 'CNY' });
