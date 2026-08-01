@@ -4,7 +4,6 @@ import { __resetActiveLedgerCurrencyForTesting } from '../ledgerCurrency';
 import { detectOutputLag, type ModelUsageDeltaEntry } from '../modelUsageDelta';
 import {
   computePriceQuoteTurnMoney,
-  hasPricingVariantSuffix,
   normalizeModelIdForPricing,
   resolveTurnCost,
   type TurnPricingContext,
@@ -72,50 +71,51 @@ describe('inferred currency downgrades the money to an estimate', () => {
   });
 });
 
-describe('context-variant models', () => {
-  it('detects bracketed variant suffixes', () => {
-    expect(hasPricingVariantSuffix('claude-fable-5[1m]')).toBe(true);
-    expect(hasPricingVariantSuffix('claude-fable-5')).toBe(false);
-    expect(hasPricingVariantSuffix(null)).toBe(false);
+describe('long-context turns pick the right pricing band', () => {
+  // 定档只看本轮实际 input token 落进哪个 band，不看模型 id 的 `[1m]` 后缀 ——
+  // 后缀只说明会话开了大窗口，不代表这一轮真的超过阈值。
+  const BANDED = gatewayQuote('claude-fable-5', {
+    inputTokenPriceBands: [
+      { minInputTokens: 200_001, inputPerMtok: 20, outputPerMtok: 75, cacheReadPerMtok: 2 },
+    ],
   });
 
-  it('prefers an exact variant quote when the catalog registers one', () => {
-    // 目录一旦登记 `xxx[1m]` 这样的独立计费档就自动生效,无需再改代码。
+  it('charges the long-context band once the turn crosses the threshold', () => {
+    // 实测形态：40 万 token 上下文的轮次此前一律按 200K 档标准价记账。
+    const resolved = resolveTurnCost({
+      rawModel: 'claude-fable-5[1m]',
+      tokens: {
+        inputTokens: 1_000,
+        outputTokens: 1_000,
+        cacheReadTokens: 400_000,
+        cacheCreateTokens: 0,
+      },
+      pricing: catalog(BANDED),
+      context: XD_GATEWAY,
+    });
+    // 1000*20 + 1000*75 + 400000*2 = 895_000 → 0.895
+    expect(resolved.money?.amount).toBeCloseTo(0.895, 10);
+  });
+
+  it('stays on the baseline for a short turn of the same model', () => {
     const resolved = resolveTurnCost({
       rawModel: 'claude-fable-5[1m]',
       tokens: TOKENS,
-      pricing: catalog(
-        gatewayQuote('claude-fable-5'),
-        gatewayQuote('claude-fable-5[1m]', { inputPerMtok: 20, outputPerMtok: 75 }),
-      ),
+      pricing: catalog(BANDED),
       context: XD_GATEWAY,
     });
-    // 20 * 1000 + 75 * 1000 = 95_000 → 0.095
-    expect(resolved.money?.amount).toBeCloseTo(0.095, 10);
-    expect(resolved.money?.approximate).toBe(false);
-  });
-
-  it('falls back to the base tier but stops calling it exact', () => {
-    // 变体档没有独立报价时不臆造倍率 —— 猜一个乘数会把"可能少算"变成"确定算错"。
-    // 沿用基础档数值,但标记成不精确。
-    const resolved = resolveTurnCost({
-      rawModel: 'claude-fable-5[1m]',
-      tokens: TOKENS,
-      pricing: catalog(gatewayQuote('claude-fable-5')),
-      context: XD_GATEWAY,
-    });
+    // 1000*10 + 1000*50 = 60_000 → 0.06，与不带后缀的同轮一致。
     expect(resolved.money?.amount).toBeCloseTo(0.06, 10);
-    expect(resolved.money?.approximate).toBe(true);
-    expect(resolved.model).toBe('claude-fable-5');
   });
 
-  it('leaves plain models exact', () => {
+  it('normalizes the variant suffix away for catalog lookup', () => {
     const resolved = resolveTurnCost({
-      rawModel: 'claude-fable-5',
+      rawModel: 'claude-fable-5[1m]',
       tokens: TOKENS,
       pricing: catalog(gatewayQuote('claude-fable-5')),
       context: XD_GATEWAY,
     });
+    expect(resolved.model).toBe('claude-fable-5');
     expect(resolved.money?.approximate).toBe(false);
     expect(normalizeModelIdForPricing('claude-fable-5[1m]')).toBe('claude-fable-5');
   });
