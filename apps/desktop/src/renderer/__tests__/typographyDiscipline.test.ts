@@ -133,11 +133,13 @@ function segmentsAfter(line: string, keyword: string): string[] {
   return segments;
 }
 
-/** 规则 3a:fontWeight 值片段(冒号 / JSX = / style 赋值 / 三元两臂)全数落梯。 */
+/** 规则 3a:fontWeight 值片段(冒号 / JSX = / style 赋值 / 三元两臂)全数落梯。
+ *  任意数字字面量(含 550/650 等中间值与 <100/>1000 越界值)都参与判定,
+ *  不再只认整百形态(复审轮 P1)。 */
 export function findInlineWeightViolations(line: string): string[] {
   const hits: string[] = [];
   for (const seg of segmentsAfter(line, 'fontWeight')) {
-    for (const m of seg.matchAll(/\b([1-9]00)\b|\bbold(?:er)?\b/g)) {
+    for (const m of seg.matchAll(/\b(\d+(?:\.\d+)?)\b|\bbold(?:er)?\b/g)) {
       if (m[1] && WEIGHT_SET.has(Number(m[1]))) continue;
       hits.push(`fontWeight …${m[0]}`);
     }
@@ -169,11 +171,27 @@ export function findStringWeightViolations(line: string): string[] {
   return hits;
 }
 
-/** 规则 4b:font: shorthand 禁止 —— 值内含尺寸单位即视为 shorthand
- *  (数字起头、normal/bold 等关键字起头、冒号前空格的合法变体全覆盖);
- *  `font: inherit` 与非 CSS 语境的对象键(值无尺寸单位)天然放行。 */
+/** 规则 4b:font: shorthand 禁止,只放行 `font: inherit`。三类形态全判
+ *  (复审轮 P1:不再只认「数字+单位」子集):
+ *   a) 值含尺寸单位(600 12px/22px、bold 1.2em、900 12px 等);
+ *   b) CSS system font 关键字(caption / icon / menu / message-box /
+ *      small-caption / status-bar);
+ *   c) style/weight/variant/stretch 关键字或三位数字重起头且后随更多 token
+ *      (bold medium system-ui、normal 700 …)。
+ *  非 CSS 语境对象键(`font: 20,`、`font: someVar`)与带引号值不满足
+ *  上述任一形态,天然放行。 */
 export function findFontShorthands(line: string): string[] {
-  return [...line.matchAll(/\bfont\s*:\s*[^;,}]*?\d+(?:\.\d+)?(?:px|em|rem|pt|%)/g)].map((m) => m[0]);
+  const hits: string[] = [];
+  for (const m of line.matchAll(/\bfont\s*:\s*([^;,}'"]*)/g)) {
+    const value = m[1].trim();
+    if (!value || value === 'inherit') continue;
+    const unitForm = /\d+(?:\.\d+)?(?:px|em|rem|pt|%)/.test(value);
+    const systemKeyword = /^(?:caption|icon|menu|message-box|small-caption|status-bar)\b/.test(value);
+    const keywordShorthand =
+      /^(?:normal|italic|oblique|bold|bolder|lighter|small-caps|(?:ultra-|extra-|semi-)?(?:condensed|expanded)|[1-9]\d{2})\s+\S/.test(value);
+    if (unitForm || systemKeyword || keywordShorthand) hits.push(`font: ${value}`.slice(0, 60));
+  }
+  return hits;
 }
 
 // ── 文件遍历 ────────────────────────────────────────────────────────
@@ -307,6 +325,12 @@ describe('typography discipline (DESIGN.md §3, #1505)', () => {
       expect(findOffLadderTokenSizes('className="text-17 font-medium"')).toEqual(['text-17']);
       expect(findInlineWeightViolations('fontWeight: 700,')).toHaveLength(1);
       expect(findInlineWeightViolations("fontWeight: 'bold' }")).toHaveLength(1);
+      // 中间值与越界值(复审轮 P1:不再只认整百)
+      expect(findInlineWeightViolations('fontWeight: 550,')).toHaveLength(1);
+      expect(findInlineWeightViolations("fontWeight: '650' }")).toHaveLength(1);
+      expect(findInlineWeightViolations('fontWeight: 999,')).toHaveLength(1);
+      expect(findInlineWeightViolations('fontWeight: 1000,')).toHaveLength(1);
+      expect(findInlineWeightViolations('fontWeight: 50,')).toHaveLength(1);
       // 三元 / style 赋值 / JSX 属性形态(评审轮 P1:非直接字面量形态)
       expect(findInlineWeightViolations('fontWeight: filled ? 700 : 400,')).toHaveLength(1);
       expect(findInlineWeightViolations("el.style.fontWeight = '700';")).toHaveLength(1);
@@ -324,6 +348,9 @@ describe('typography discipline (DESIGN.md §3, #1505)', () => {
       expect(findFontShorthands('font: normal 700 12px/22px sans-serif;')).toHaveLength(1);
       expect(findFontShorthands('font : 900 12px sans-serif;')).toHaveLength(1);
       expect(findFontShorthands('font: bold 1.2em serif;')).toHaveLength(1);
+      // system font 关键字与无单位 keyword shorthand(复审轮 P1)
+      expect(findFontShorthands('font: caption;')).toHaveLength(1);
+      expect(findFontShorthands('font: bold medium system-ui;')).toHaveLength(1);
     });
 
     it('passes green samples', () => {
