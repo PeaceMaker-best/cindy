@@ -54,7 +54,11 @@ import { useAppShortcut } from '@/hooks/useAppShortcut';
 import { useModifierHold } from '@/hooks/useModifierHold';
 import { isSecondaryWindow } from '@/lib/secondaryWindow';
 import { getAppShortcutCombos, getAppShortcutPlatform } from '@/lib/appShortcutStore';
-import { formatAppShortcutCombo, SWITCH_SESSION_SHORTCUT_IDS } from '../../../shared/appShortcuts';
+import {
+  formatAppShortcutCombo,
+  matchesKeyboardEvent,
+  SWITCH_SESSION_SHORTCUT_IDS,
+} from '../../../shared/appShortcuts';
 import { setSessionOrdinalBadges } from './sidebar/sessionOrdinalBadges';
 import { useSidebarCollapsedState } from '../feature-context';
 import { stripTrailingPathSeparators } from '../../../shared/pathText';
@@ -69,6 +73,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { Tooltip } from '@/components/ui/tooltip';
@@ -116,6 +121,7 @@ import {
 } from '../scheduler/lib/scheduleRunReadSync';
 import { useSessionLifecycleActions } from './hooks/useSessionLifecycleActions';
 import { useSidebarFilter, type UseSidebarFilterReturn } from './hooks/useSidebarFilter';
+import { useHiddenProjects, type UseHiddenProjectsReturn } from './hooks/useHiddenProjects';
 import {
   normalizeProjectKey,
   normalizeWorkingDir,
@@ -132,6 +138,17 @@ import {
 import { sessionActivityMs } from './lib/dateSessionGrouping';
 import { sortProjectsForSidebar, sortSessionsForSidebar } from './lib/sidebarProjectSorting';
 import { isOrcaWorkerSession, resolveSessionRoute } from '@/lib/orcaSessionIdentity';
+import {
+  buildProjectKeyComparisonSet,
+  isProjectHidden,
+  projectKeyComparisonSetHas,
+  sidebarSessionsWithHiddenProjectsAsDialogues,
+  visibleSidebarProjects,
+} from './lib/sidebarProjectVisibility';
+import {
+  collectRestorableProjectKeys,
+  restoreHiddenProjectIfPresent,
+} from './lib/sidebarProjectRestore';
 import { PinnedSection, type PinnedSidebarEntry } from './sidebar/sections/PinnedSection';
 import { ProjectNode as ProjectNodeView } from './sidebar/sections/ProjectNode';
 import {
@@ -355,12 +372,15 @@ function cutoffForLastActivity(
 
 export function CCAgentSidebarUpper() {
   const { t } = useTranslation();
+  const localPlatform = window.electronAPI.platform;
   const isCollapsed = useSidebarCollapsedState();
   // 错误红点的派生真源:拉取存在未处理告警(中断 ∪ 未 dismissed 错误尾行)的会话
   // 并在收敛触发点重算 —— 横幅不被处置,红点就不消失。
   usePendingAlertAttention();
   // F-PJ-10：filter.status 决定后端 fetch 时是否带 ?status=archived|all
-  const filter = useSidebarFilter();
+  const hiddenProjects = useHiddenProjects();
+  const { hiddenProjectKeys } = hiddenProjects;
+  const filter = useSidebarFilter(hiddenProjectKeys);
   const includeArchived = filter.status;
   const sessionsHook = useCCSessions({ includeArchived });
   const { sessions: allSessionsForAttention } = useCCSessions({ includeArchived: 'all' });
@@ -370,6 +390,24 @@ export function CCAgentSidebarUpper() {
   );
   const projectAliases = useProjectAliases();
   const searchProjectGroups = useProjectGroups(searchProjectSessions, projectAliases.aliases);
+  const visibleSearchProjects = useMemo(
+    () =>
+      visibleSidebarProjects(
+        searchProjectGroups.projects,
+        hiddenProjectKeys,
+        localPlatform,
+      ),
+    [searchProjectGroups.projects, hiddenProjectKeys, localPlatform],
+  );
+  const visibleSearchSessionIds = useMemo(
+    () =>
+      sidebarSessionsWithHiddenProjectsAsDialogues(
+        searchProjectSessions,
+        hiddenProjectKeys,
+        localPlatform,
+      ).map((session) => session.id),
+    [searchProjectSessions, hiddenProjectKeys, localPlatform],
+  );
   const attentionNotifications = useSessionAttentionSnapshot();
   const scheduleSessionIndex = useAutomationScheduleSessionIndex();
   // 侧栏右侧 urgent 红点的"额外"来源:定时任务未读且失败(status != 'success')。
@@ -463,10 +501,21 @@ export function CCAgentSidebarUpper() {
     () => resolveDocModeFilesSession(allSessionsForAttention, filesSessionId),
     [allSessionsForAttention, filesSessionId],
   );
+  const hiddenProjectComparisonKeys = useMemo(
+    () => buildProjectKeyComparisonSet(hiddenProjectKeys, localPlatform),
+    [hiddenProjectKeys, localPlatform],
+  );
   const docModeSwitchProjects = useMemo(() => {
     const switchableSessions = allSessionsForAttention.filter((s) => !isOrcaWorkerSession(s));
-    return buildDocModeSwitchProjects(switchableSessions);
-  }, [allSessionsForAttention]);
+    return buildDocModeSwitchProjects(switchableSessions).filter(
+      (project) =>
+        !projectKeyComparisonSetHas(
+          hiddenProjectComparisonKeys,
+          project.projectKey,
+          localPlatform,
+        ),
+    );
+  }, [allSessionsForAttention, hiddenProjectComparisonKeys, localPlatform]);
   const filesProjectKey = filesSession ? projectIdentityKeyForSession(filesSession) : null;
 
   // Refresh sessions only when a NEW session appears (e.g. after index redirect
@@ -494,6 +543,15 @@ export function CCAgentSidebarUpper() {
   const sessionsWithRemote = useMemo(
     () => selectVisibleSessions(sessionsHook.sessions, remoteProjectSessions, selectedMachineId),
     [sessionsHook.sessions, remoteProjectSessions, selectedMachineId],
+  );
+  const visibleSessionsWithRemote = useMemo(
+    () =>
+      sidebarSessionsWithHiddenProjectsAsDialogues(
+        sessionsWithRemote,
+        hiddenProjectKeys,
+        localPlatform,
+      ),
+    [sessionsWithRemote, hiddenProjectKeys, localPlatform],
   );
 
   // rail 未读集与展开态(ExpandedView.sidebarNotifications)同口径:把"定时任务有未读运行"的
@@ -590,6 +648,7 @@ export function CCAgentSidebarUpper() {
                 // (codex review)。id 相等性语义不需要完整 Session 对象。
                 viewedSessionId={activeSessionId ?? filesSessionId}
                 filter={filter}
+                hiddenProjects={hiddenProjects}
                 projectAliases={projectAliases}
                 scheduleSessionIndex={scheduleSessionIndex}
               />
@@ -607,8 +666,10 @@ export function CCAgentSidebarUpper() {
             <CollapsedView
               navigate={navigate}
               onAutomationsContextMenu={handleAutomationsContextMenu}
-              allSearchProjects={searchProjectGroups.projects}
-              sessions={sessionsWithRemote}
+              allSearchProjects={visibleSearchProjects}
+              searchableSessionIds={visibleSearchSessionIds}
+              hiddenProjectKeys={hiddenProjectKeys}
+              sessions={visibleSessionsWithRemote}
               activeSessionId={activeSessionId}
               notifications={railNotifications}
               manualPinnedOrder={filter.manualPinnedOrder}
@@ -676,6 +737,7 @@ interface ExpandedProps {
    *  files 模式下从面板点击该会话仍要能导航回聊天视图。 */
   viewedSessionId: string | undefined;
   filter: UseSidebarFilterReturn;
+  hiddenProjects: UseHiddenProjectsReturn;
   projectAliases: ReturnType<typeof useProjectAliases>;
   scheduleSessionIndex: ReturnType<typeof useAutomationScheduleSessionIndex>;
 }
@@ -705,11 +767,14 @@ function ExpandedView({
   activeSessionId,
   viewedSessionId,
   filter,
+  hiddenProjects,
   projectAliases,
   scheduleSessionIndex,
 }: ExpandedProps) {
   const { t, i18n } = useTranslation();
+  const localPlatform = window.electronAPI.platform;
   const { sessions, refreshSessions, patchLocal, effectiveIncludeArchived } = sessionsHook;
+  const { hiddenProjectKeys, setProjectHidden } = hiddenProjects;
   const refreshWorktrees = useRefreshWorktrees();
   const projectPickerOptions = useProjectPickerOptions();
 
@@ -1083,12 +1148,21 @@ function ExpandedView({
     },
     [filter.status, effectiveIncludeArchived],
   );
-  const sidebarSessions = useMemo(
+  const scopedSidebarSessions = useMemo(
     () =>
       selectVisibleSessions(sessions, remoteProjectSessions, selectedMachineId).filter(
         passesOrcaAndStatus,
       ),
     [sessions, remoteProjectSessions, selectedMachineId, passesOrcaAndStatus],
+  );
+  const sidebarSessions = useMemo(
+    () =>
+      sidebarSessionsWithHiddenProjectsAsDialogues(
+        scopedSidebarSessions,
+        hiddenProjectKeys,
+        localPlatform,
+      ),
+    [scopedSidebarSessions, hiddenProjectKeys, localPlatform],
   );
 
   const activityFilteredSessions = useMemo(() => {
@@ -1126,6 +1200,13 @@ function ExpandedView({
     [sessions, remoteProjectSessions, passesOrcaAndStatus],
   );
   const projectUniverse = useProjectGroups(unfilteredProjectSessions, projectAliases.aliases, true);
+  // Visibility is a negative overlay only. Keep the raw universe above for
+  // filter/manual-order GC, and expose a separate catalogue to sidebar UI.
+  const visibleProjectUniverse = useMemo(
+    () =>
+      visibleSidebarProjects(projectUniverse.projects, hiddenProjectKeys, localPlatform),
+    [projectUniverse.projects, hiddenProjectKeys, localPlatform],
+  );
 
   // 内联会话搜索:输入行在 SidebarTopNav 的第 4 行,状态经 ConversationSearchProvider 共享;
   // 这里只取 search 来渲染下方的结果 overlay(query 非空时盖住置顶 + 项目 + 对话)。
@@ -1223,10 +1304,15 @@ function ExpandedView({
 
   /* ---- F-PJ-10: 在 render 阶段把 filter.projects 应用到 ProjectNode 列表 ---- */
   const visibleProjects = useMemo(() => {
-    if (filter.projectsAsSet === null) return groupsWithPinnedProjects.projects;
+    const notHidden = visibleSidebarProjects(
+      groupsWithPinnedProjects.projects,
+      hiddenProjectKeys,
+      localPlatform,
+    );
+    if (filter.projectsAsSet === null) return notHidden;
     const allowed = filter.projectsAsSet;
-    return groupsWithPinnedProjects.projects.filter((p) => allowed.has(p.projectKey));
-  }, [groupsWithPinnedProjects.projects, filter.projectsAsSet]);
+    return notHidden.filter((p) => allowed.has(p.projectKey));
+  }, [groupsWithPinnedProjects.projects, hiddenProjectKeys, filter.projectsAsSet, localPlatform]);
 
   /* ---- M41: Vendor 过滤 — 应用到 pinned / unclassified / project sessions ---- */
   const vendorPredicate = useMemo(() => {
@@ -1244,6 +1330,23 @@ function ExpandedView({
     return keys;
   }, [filter.manualPinnedOrder]);
 
+  const restorableProjectKeys = useMemo(
+    () =>
+      collectRestorableProjectKeys({
+        sessions: scopedSidebarSessions,
+        lastActivityCutoff: cutoffForLastActivity(filter.lastActivity),
+        pinnedProjectKeys,
+        vendorPredicate,
+      }),
+    [filter.lastActivity, pinnedProjectKeys, scopedSidebarSessions, vendorPredicate],
+  );
+  const restorableProjectKeysRef = useRef(restorableProjectKeys);
+  restorableProjectKeysRef.current = restorableProjectKeys;
+  const hiddenProjectComparisonKeys = useMemo(
+    () => buildProjectKeyComparisonSet(hiddenProjectKeys, localPlatform),
+    [hiddenProjectKeys, localPlatform],
+  );
+
   const visiblePinnedSessions = useMemo(() => {
     // 置顶段用 allGroups.pinned(未经"最近活跃 N 天"筛选)——置顶内容不受活跃时间过滤影响,
     // 久未活跃的置顶会话也始终显示。vendor / project 过滤仍照常生效。
@@ -1260,6 +1363,9 @@ function ExpandedView({
   const visiblePinnedProjects = useMemo(() => {
     const allowedProjects = filter.projectsAsSet;
     return allProjectGroups.projects.flatMap((project) => {
+      if (projectKeyComparisonSetHas(hiddenProjectComparisonKeys, project.projectKey, localPlatform)) {
+        return [];
+      }
       if (!pinnedProjectKeys.has(project.projectKey)) return [];
       if (allowedProjects !== null && !allowedProjects.has(project.projectKey)) return [];
 
@@ -1277,7 +1383,13 @@ function ExpandedView({
         },
       ];
     });
-  }, [allProjectGroups.projects, pinnedProjectKeys, filter.projectsAsSet, vendorPredicate]);
+  }, [
+    allProjectGroups.projects,
+    hiddenProjectComparisonKeys,
+    pinnedProjectKeys,
+    filter.projectsAsSet,
+    vendorPredicate,
+  ]);
 
   const visiblePinnedEntries = useMemo<PinnedSidebarEntry[]>(() => {
     const entries: PinnedSidebarEntry[] = [
@@ -1700,7 +1812,17 @@ function ExpandedView({
   // 重排前的行。标签取生效组合的显示形(mac '⌘1' / win 'Ctrl+1',跟随用户
   // 改绑),删除绑定或让位后的槽位无徽标。写入 sessionOrdinalBadges 模块
   // store,由 SessionItem / SessionCard 精准订阅。
-  const switchModifierHeld = useModifierHold({ enabled: sessionSwitchEnabled });
+  const preserveSwitchHintOnKeyDown = useCallback(
+    (event: KeyboardEvent) =>
+      SWITCH_SESSION_SHORTCUT_IDS.some((shortcutId) =>
+        getAppShortcutCombos(shortcutId).some((combo) => matchesKeyboardEvent(event, combo)),
+      ),
+    [],
+  );
+  const switchModifierHeld = useModifierHold({
+    enabled: sessionSwitchEnabled,
+    preserveOnKeyDown: preserveSwitchHintOnKeyDown,
+  });
   useEffect(() => {
     if (!switchModifierHeld) return;
     let lastSerialized: string | null = null;
@@ -1795,9 +1917,26 @@ function ExpandedView({
   );
 
   const handleCreateProject = useCallback(async () => {
+    const hiddenProjectKeysAtPickerOpen = new Set(hiddenProjectKeys);
     try {
       const result = await window.electronAPI.showOpenDirectoryDialog();
       if (result.canceled || !result.path) return;
+      const localProjectKey = normalizeProjectKey(result.path);
+      if (localProjectKey?.startsWith('local:')) {
+        const restored = await restoreHiddenProjectIfPresent({
+          projectKey: localProjectKey,
+          wasHiddenAtPickerOpen: isProjectHidden(
+            localProjectKey,
+            hiddenProjectKeysAtPickerOpen,
+            localPlatform,
+          ),
+          setProjectHidden,
+          getCurrentProjectKeys: () => restorableProjectKeysRef.current,
+          ensureProjectIncluded: filter.ensureProjectIncluded,
+          localPlatform,
+        });
+        if (restored) return;
+      }
       handleClearSelection();
       patchNewMakerDraft({ workingDir: result.path, remoteHostId: null });
       navigate('/cc-agent/new', { state: makeNewMakerRouteState('dialogue') });
@@ -1805,7 +1944,14 @@ function ExpandedView({
       log.warn('create project directory picker failed', err);
       toast.error(t('ccAgent.sidebar.createProjectFailed'));
     }
-  }, [handleClearSelection, navigate, t]);
+  }, [
+    filter.ensureProjectIncluded,
+    handleClearSelection,
+    hiddenProjectKeys,
+    navigate,
+    setProjectHidden,
+    t,
+  ]);
 
   const handleCreateDialogue = useCallback(() => {
     handleClearSelection();
@@ -1948,6 +2094,32 @@ function ExpandedView({
       }
     },
     [projectAliases, t],
+  );
+
+  const handleRemoveProjectFromSidebar = useCallback(
+    async (project: ProjectNode) => {
+      // Add Project currently restores local directories only, so remote
+      // projects do not expose this action until they have a symmetric path.
+      if (project.scope !== 'local') return;
+      const confirmed = await confirmDialog({
+        title: t('ccAgent.sidebar.projectAction.removeFromSidebarConfirmTitle', {
+          name: project.displayName,
+        }),
+        description: t('ccAgent.sidebar.projectAction.removeFromSidebarConfirmDescription'),
+        confirmText: t('ccAgent.sidebar.projectAction.removeFromSidebarConfirmAction'),
+        autoFocusConfirm: true,
+      });
+      if (!confirmed) return;
+      try {
+        await setProjectHidden(project.projectKey, true);
+        handleClearSelection();
+        railPanelStore.closeAll();
+      } catch (err) {
+        log.warn('remove project from sidebar failed', err);
+        toast.error(t('ccAgent.sidebar.projectAction.removeFromSidebarFailed'));
+      }
+    },
+    [confirmDialog, handleClearSelection, setProjectHidden, t],
   );
 
   /* ---- Pin / Unpin handler ---- */
@@ -2782,7 +2954,7 @@ function ExpandedView({
               )}
               <PinnedSection
                 entries={visiblePinnedEntries}
-                allKnownProjects={projectUniverse.projects}
+                allKnownProjects={visibleProjectUniverse}
                 renderProject={(
                   project,
                   displaySessions,
@@ -2807,6 +2979,7 @@ function ExpandedView({
                     isProjectPinned
                     onToggleProjectPin={handleToggleProjectPin}
                     onRenameProject={handleProjectAliasChange}
+                    onRemoveFromSidebar={handleRemoveProjectFromSidebar}
                     onSessionClick={handleSessionClick}
                     onAction={handleActionClick}
                     onRename={handleRename}
@@ -2840,7 +3013,7 @@ function ExpandedView({
                 <DateGroupedSessionsSection
                   sessions={visibleDateSessions}
                   isLoading={isLoadingSidebarSessions}
-                  allKnownProjects={projectUniverse.projects}
+                  allKnownProjects={visibleProjectUniverse}
                   filter={filter}
                   activeSessionId={activeSessionId}
                   runningSessionIds={displayRunningSessionIds}
@@ -2861,7 +3034,8 @@ function ExpandedView({
                   <ProjectsSection
                     unclassified={visibleUnclassified}
                     projects={visibleProjectsWithVendor}
-                    allKnownProjects={projectUniverse.projects}
+                    allKnownProjects={visibleProjectUniverse}
+                    allProjectKeysForOrder={gcProjectKeys}
                     filter={filter}
                     collapsed={collapse.collapsed}
                     isAllCollapsed={collapse.isAllCollapsed}
@@ -2881,6 +3055,7 @@ function ExpandedView({
                     onToggleProject={collapse.toggle}
                     onToggleProjectPin={handleToggleProjectPin}
                     onRenameProject={handleProjectAliasChange}
+                    onRemoveFromSidebar={handleRemoveProjectFromSidebar}
                     onCollapseAll={collapse.collapseAll}
                     onExpandAll={collapse.expandAll}
                     onCreateProject={handleCreateProject}
@@ -2996,6 +3171,7 @@ function ExpandedView({
         onCreateDialogue={handleCreateDialogue}
         onCreateInProject={handleCreateInProject}
         onToggleProjectPin={handleToggleProjectPin}
+        onRemoveProjectFromSidebar={handleRemoveProjectFromSidebar}
       />
       {deleteScheduleDialog}
     </>
@@ -3009,6 +3185,8 @@ interface CollapsedProps {
   onAutomationsContextMenu: (e: React.MouseEvent) => void;
   /** 全量项目(供 rail 搜索图标钮的 ConversationSearchBox 用)。 */
   allSearchProjects: ProjectNode[];
+  searchableSessionIds: string[];
+  hiddenProjectKeys: ReadonlySet<string>;
   /** rail 数据源——全量可见 sessions(本地 + 远程镜像合并),RailNav 内部切片。 */
   sessions: Session[];
   activeSessionId: string | undefined;
@@ -3030,6 +3208,8 @@ function CollapsedView({
   navigate,
   onAutomationsContextMenu,
   allSearchProjects,
+  searchableSessionIds,
+  hiddenProjectKeys,
   sessions,
   activeSessionId,
   notifications,
@@ -3130,6 +3310,8 @@ function CollapsedView({
       <ConversationSearchBox
         navigate={navigate}
         allKnownProjects={allSearchProjects}
+        allowedSessionIds={searchableSessionIds}
+        hiddenProjectKeys={hiddenProjectKeys}
         triggerClassName={SIDEBAR_RAIL_ICON_BUTTON_CLASS}
       />
 
@@ -3261,6 +3443,8 @@ interface RailPanelsProps {
   onCreateInProject: (project: ProjectNode) => void;
   /** 折叠态项目菜单仍需提供置顶/取消置顶，避免置顶项目只能展开侧栏后管理。 */
   onToggleProjectPin: (project: ProjectNode, currentlyPinned: boolean) => void;
+  /** 与展开态同源的本地项目侧栏移除动作。 */
+  onRemoveProjectFromSidebar: (project: ProjectNode) => void;
 }
 
 /**
@@ -3294,6 +3478,7 @@ function RailPanels({
   onCreateDialogue,
   onCreateInProject,
   onToggleProjectPin,
+  onRemoveProjectFromSidebar,
 }: RailPanelsProps) {
   const { t } = useTranslation();
   const panelState = useSyncExternalStore(railPanelStore.subscribe, railPanelStore.getSnapshot);
@@ -3879,6 +4064,20 @@ function RailPanels({
                     ? t('ccAgent.remoteSession.actionsUnavailable')
                     : t('ccAgent.sidebar.projectAction.newInDirectory')}
                 </DropdownMenuItem>
+                {menuTarget?.scope === 'local' && (
+                  <>
+                    <DropdownMenuSeparator className="my-1 h-px bg-[var(--cmd-palette-border)]" />
+                    <DropdownMenuItem
+                      onSelect={() => {
+                        setProjectMenu(null);
+                        onRemoveProjectFromSidebar(menuTarget);
+                      }}
+                      className="cursor-pointer text-sm text-[var(--msg-assistant-text)] hover:bg-[var(--cmd-palette-item-hover)]"
+                    >
+                      {t('ccAgent.sidebar.projectAction.removeFromSidebar')}
+                    </DropdownMenuItem>
+                  </>
+                )}
               </>
             );
           })()}

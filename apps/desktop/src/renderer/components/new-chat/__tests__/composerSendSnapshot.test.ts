@@ -10,7 +10,7 @@ const attachment = {
   id: 'file-1',
   name: 'one.txt',
   path: '/tmp/one.txt',
-  ext: 'txt',
+  ext: '.txt',
   size: 3,
   category: 'text' as const,
   mimeType: 'text/plain',
@@ -18,11 +18,11 @@ const attachment = {
 const comment = {
   id: 'comment-1',
   markerNumber: 1,
-  pageUrl: 'https://example.com/one',
+  pageUrl: 'https://example.com/page',
   target: {
     kind: 'element' as const,
-    point: { x: 1, y: 2 },
-    viewport: { width: 800, height: 600 },
+    point: { x: 10, y: 10 },
+    viewport: { width: 1280, height: 800 },
     region: null,
     selectedText: null,
     immediate: false,

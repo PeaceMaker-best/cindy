@@ -25,6 +25,9 @@ type DesktopLoginAction = import('../shared/authIpc').DesktopLoginAction;
 type DesktopLoginActionResult = import('../shared/authIpc').DesktopLoginActionResult;
 type UtilityTextFailure = import('../shared/utilityTextResult').UtilityTextFailure;
 type MakerSessionTreeSnapshot = import('@cindy/maker-core').SessionTreeSnapshot;
+type BrowserBackendHealth = import('../shared/browserBackend').BrowserBackendHealth;
+type BrowserBackendRecoveryResult =
+  import('../shared/browserBackend').BrowserBackendRecoveryResult;
 type DesktopAccountDeletionConfirmInput =
   import('../shared/authIpc').DesktopAccountDeletionConfirmInput;
 type DesktopAccountDeletionAvailabilityResult =
@@ -1611,6 +1614,7 @@ interface ElectronAPI {
       sessionId: string | null;
       workdir: string | null;
       remoteHostId: string | null;
+      deviceLinkDeviceId?: string | null;
       available: boolean;
     } | null>;
     /** 子窗口根组件挂载握手。 */
@@ -1625,6 +1629,7 @@ interface ElectronAPI {
       sessionId: string | null;
       workdir: string | null;
       remoteHostId: string | null;
+      deviceLinkDeviceId?: string | null;
       available: boolean;
     }) => void;
     onStateChanged: (cb: (state: { detached: boolean; open: boolean }) => void) => () => void;
@@ -1633,6 +1638,7 @@ interface ElectronAPI {
         sessionId: string | null;
         workdir: string | null;
         remoteHostId: string | null;
+        deviceLinkDeviceId?: string | null;
         available: boolean;
       }) => void,
     ) => () => void;
@@ -2205,9 +2211,8 @@ interface ElectronAPI {
   openExternal: (url: string) => Promise<{ success: boolean }>;
   openChatGPTApp: () => Promise<{ success: boolean }>;
 
-  // file-chip 右键菜单 "在浏览器中查看": 把本地文件用 file:// 喂给系统
-  // 默认浏览器(或 .html/.pdf/.svg 等扩展名的默认 handler)。
-  openFileInBrowser: (filePath: string) => Promise<{ success: boolean; error?: string }>;
+  // 绝对路径或完整本地 file:// URL;URL 形态用于保留 query/hash 页面状态。
+  openFileInBrowser: (filePathOrUrl: string) => Promise<{ success: true }>;
 
   // ── 系统级通知（CC Agent session 状态变更）──
   /**
@@ -3494,6 +3499,11 @@ interface ElectronAPI {
   sidebarSettingsLoadPinnedOrderSync: () => string[];
   sidebarSettingsSavePinnedOrder: (order: readonly string[]) => Promise<void>;
   sidebarSettingsOnPinnedOrderChanged: (cb: (order: string[]) => void) => () => void;
+  sidebarSettings: {
+    loadHiddenProjectKeys: () => string[];
+    setProjectHidden: (projectKey: string, hidden: boolean) => Promise<boolean>;
+    onHiddenProjectKeysChanged: (cb: (projectKeys: string[]) => void) => () => void;
+  };
 
   remotePrecreatedWorktreeLedger: {
     list: () => Promise<RemotePrecreatedWorktreeLedgerSnapshot>;
@@ -3897,7 +3907,7 @@ interface ElectronAPI {
     onUnpin: (cb: (payload: { tabId: string }) => void) => () => void;
     /**
      * main → renderer:Phase 3 backend 让 renderer 代调 store 的 tab-op
-     * 请求(open / focus / close)。payload 是带 reqId 的 union;renderer 处理
+     * 请求(probe / open / focus / close)。payload 是带 reqId 的 union;renderer 处理
      * 完后通过 `tabOpResult` 回报。
      */
     onTabOpRequest: (
@@ -3941,6 +3951,8 @@ interface ElectronAPI {
       active: 'external' | 'rsb-webview';
     }>;
     reset: () => Promise<{ ok: true; active: 'external' | 'rsb-webview' }>;
+    getHealth: () => Promise<BrowserBackendHealth>;
+    recover: () => Promise<BrowserBackendRecoveryResult>;
   };
 
   // ── Dialog（v0.6 新增） ────────────────────────────────────────────────────
@@ -4919,7 +4931,7 @@ interface ElectronAPI {
       getCodexRateLimits: () => Promise<
         import('@cindy/maker-shared/device-link-contract').MobileCodexRateLimitsResult
       >;
-      /** provider-scoped 模型单价表；XD 价格与 model-access /models 同快照更新。 */
+      /** Cindy AI /models 下发的 XD 原生报价。 */
       getModelPricing: () => Promise<
         import('../shared/regionalMoney').ModelPricingCatalog | null
       >;
@@ -4927,6 +4939,13 @@ interface ElectronAPI {
         cb: (
           pricing: import('../shared/regionalMoney').ModelPricingCatalog | null,
         ) => void,
+      ) => () => void;
+      /** 非 XD Provider 的 Catalog 参考价与用户覆盖。 */
+      getReferenceModelPricing: () => Promise<
+        import('../shared/regionalMoney').ModelPricingCatalog
+      >;
+      onReferenceModelPricingChanged: (
+        cb: (pricing: import('../shared/regionalMoney').ModelPricingCatalog) => void,
       ) => () => void;
       /** 用量历史聚合 (首页仪表盘)。wire 形态与 main/usage/usageHistory.ts 的 UsageHistoryPayload 同形。 */
       getHistory: (

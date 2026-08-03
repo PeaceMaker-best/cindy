@@ -69,6 +69,10 @@ import { isIpcErrorCode, type IpcErrorCode } from '../shared/ipc-errors';
 import type { VoiceInputSyncErrorResult } from '../shared/voiceInputData';
 import type { UtilityTextFailure } from '../shared/utilityTextResult';
 import type {
+  BrowserBackendHealth,
+  BrowserBackendRecoveryResult,
+} from '../shared/browserBackend';
+import type {
   ReviewBranchDiffData,
   ReviewCommitDiffData,
   ReviewCommitListData,
@@ -337,8 +341,9 @@ const fanOutCorruptionRestored = createIpcFanOut('local-db:corruption-restored')
 // #37: release 端检测到 schema drift 时一次性 toast 提示开发者切回 dev 自动修复
 const fanOutSchemaDriftWarning = createIpcFanOut('local-db:schema-drift-warning');
 const fanOutProjectAliasesChanged = createIpcFanOut('local-db:project-aliases:changed');
-const fanOutSidebarPinnedOrderChanged = createIpcFanOut(
-  'sidebar-settings:pinned-order-changed',
+const fanOutSidebarPinnedOrderChanged = createIpcFanOut('sidebar-settings:pinned-order-changed');
+const fanOutSidebarHiddenProjectKeysChanged = createIpcFanOut(
+  'sidebar-settings:hidden-project-keys-changed',
 );
 // Workdir File Browser — push events from chokidar (add/change/unlink/...)
 const fanOutFileBrowserEvent = createIpcFanOut('maker:file-browser:event');
@@ -514,6 +519,7 @@ const fanOutMakerSessionBackgroundActivityChanged = createIpcFanOut('maker:sessi
 const fanOutMakerUsageTodaySpend = createIpcFanOut('usage:today-spend-changed');    // Claude USD
 const fanOutMakerUsageTodayTokens = createIpcFanOut('usage:today-tokens-changed');  // Codex token
 const fanOutMakerUsageModelPricing = createIpcFanOut('usage:model-pricing-changed');
+const fanOutMakerUsageReferenceModelPricing = createIpcFanOut('usage:reference-model-pricing-changed');
 const fanOutMakerUsageClaudeAccount = createIpcFanOut('usage:claude-account-changed'); // Claude 月度配额
 const fanOutMakerUsageCodexAccount = createIpcFanOut('usage:codex-account-changed'); // Codex 订阅用量
 const fanOutMakerUsageXaiRateLimit = createIpcFanOut('usage:xai-rate-limit-changed'); // xAI bridge 限流快照
@@ -1319,6 +1325,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
       sessionId: string | null;
       workdir: string | null;
       remoteHostId: string | null;
+      deviceLinkDeviceId?: string | null;
       available: boolean;
     } | null> => ipcRenderer.invoke('maker:rsb-window:get-context'),
     /** 子窗口根组件挂载握手(main 侧 ensureOpen 等它)。 */
@@ -1331,6 +1338,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
       sessionId: string | null;
       workdir: string | null;
       remoteHostId: string | null;
+      deviceLinkDeviceId?: string | null;
       available: boolean;
     }): void => ipcRenderer.send('maker:rsb-window:set-context', ctx),
     onStateChanged: fanOutRsbWindowStateChanged,
@@ -2672,11 +2680,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   openChatGPTApp: (): Promise<{ success: boolean }> =>
     ipcRenderer.invoke('shell:open-chatgpt-app'),
 
-  // file-chip 右键菜单 "在浏览器中查看": 把本地文件用 file:// 喂给系统
-  // 默认浏览器(或 .html/.pdf/.svg 等扩展名的默认 handler)。main 端会再做
-  // 一次扩展名白名单校验和 isPathAllowed 安全校验。
-  openFileInBrowser: (filePath: string): Promise<{ success: boolean; error?: string }> =>
-    ipcRenderer.invoke('shell:open-file-in-browser', filePath),
+  // file-chip 传绝对路径;内置浏览器传完整本地 file:// URL 以保留 query/hash。
+  // main 端统一解析并做扩展名白名单与 isPathAllowed 安全校验。
+  openFileInBrowser: (filePathOrUrl: string): Promise<{ success: true }> =>
+    ipcRenderer.invoke('shell:open-file-in-browser', filePathOrUrl),
 
   // ── 系统级通知（CC Agent session 状态变更）──
   // kind: 'done' = 真正完成；'error' = 执行失败；'needs-reply' = 等用户回复 ask/permission/plan-review。
@@ -3854,6 +3861,25 @@ contextBridge.exposeInMainWorld('electronAPI', {
         cb(payload);
       }
     }),
+  sidebarSettings: {
+    loadHiddenProjectKeys: (): string[] => {
+      const value = ipcRenderer.sendSync('sidebar-settings:load-hidden-project-keys-sync');
+      return Array.isArray(value) && value.every((entry) => typeof entry === 'string')
+        ? Array.from(value)
+        : [];
+    },
+    setProjectHidden: (projectKey: string, hidden: boolean): Promise<boolean> =>
+      ipcRenderer.invoke('sidebar-settings:set-project-hidden', projectKey, hidden),
+    onHiddenProjectKeysChanged: (cb: (projectKeys: string[]) => void): (() => void) =>
+      fanOutSidebarHiddenProjectKeysChanged((payload) => {
+        if (
+          Array.isArray(payload) &&
+          payload.every((entry): entry is string => typeof entry === 'string')
+        ) {
+          cb(Array.from(payload));
+        }
+      }),
+  },
 
   remotePrecreatedWorktreeLedger: {
     list: (): Promise<RemotePrecreatedWorktreeLedgerSnapshot> =>
@@ -4205,6 +4231,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('browser-backend:set-kind', { kind }),
     /** Clear user override → follow current system default. */
     reset: (): Promise<unknown> => ipcRenderer.invoke('browser-backend:reset'),
+    /** Probe the active backend; main performs one automatic embedded recovery. */
+    getHealth: (): Promise<BrowserBackendHealth> =>
+      ipcRenderer.invoke('browser-backend:get-health'),
+    /** Force a fresh embedded backend instance and verify the new connection. */
+    recover: (): Promise<BrowserBackendRecoveryResult> =>
+      ipcRenderer.invoke('browser-backend:recover'),
   },
 
   // electronAPI.codex.* 已退役 —— auth / agent status / usage 全部走 electronAPI.maker.*(agentKind),
@@ -5307,10 +5339,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
       /** Claude 订阅账号余量 (5h/周/分模型窗口, cached-first, main 侧按需后台刷新)。 */
       getClaudeSubscription: (): Promise<unknown | null> =>
         ipcRenderer.invoke('maker:usage:claude-subscription'),
-      /** provider-scoped 模型单价表，由 model-access /models 同次快照更新。 */
+      /** Cindy AI /models 下发的 XD 原生报价。 */
       getModelPricing: (): Promise<unknown | null> =>
         ipcRenderer.invoke('maker:usage:model-pricing-v2'),
       onModelPricingChanged: fanOutMakerUsageModelPricing,
+      /** 非 XD Provider 的 Catalog 参考价与用户覆盖。 */
+      getReferenceModelPricing: (): Promise<unknown> =>
+        ipcRenderer.invoke('maker:usage:reference-model-pricing'),
+      onReferenceModelPricingChanged: fanOutMakerUsageReferenceModelPricing,
       /** 用量历史聚合 (首页仪表盘: 热力图 + streak + 按模型拆分, main 侧算好)。 */
       getHistory: (opts?: { days?: number; forceRefresh?: boolean }): Promise<unknown> =>
         ipcRenderer.invoke('maker:usage:history', opts),

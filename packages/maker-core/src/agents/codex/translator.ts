@@ -41,8 +41,16 @@ import {
   formatOverloadRetryMessage,
   parseOverloadError,
 } from '../shared/overload-error.js';
+import {
+  CONTEXT_OVERFLOW_REASON,
+  isContextOverflowErrorMessage,
+} from '../shared/context-overflow-error.js';
 import { commandExecutionDisplayInput, type CommandExecutionDisplayInput } from './command-display.js';
 import { codexErrorInfoTag } from './app-server/protocol.js';
+import {
+  formatTerminalRateLimitRetryMessage,
+  TERMINAL_RATE_LIMIT_RETRY_REASON,
+} from './terminal-rate-limit-retry.js';
 import type {
   ItemCompletedNotification,
   ItemStartedNotification,
@@ -133,6 +141,14 @@ export interface CodexTranslateContext {
    * 会话是否已关), 而错误脱敏与 error 事件构造在 translator。缺省 = 不接管。
    */
   tryTakeOverOverload?: () => { attempt: number; maxAttempts: number } | null;
+  /**
+   * daemon 已耗尽内部 retry budget 的终态 429 接管钩子。agent 层负责严格分类、
+   * turn 归属、产出守卫与预算；translator 只编码独立 reason / 进度契约。
+   */
+  tryTakeOverTerminalRateLimit?: () => {
+    attempt: number;
+    maxAttempts: number;
+  } | null;
 }
 
 // ── 主入口: 三个 item.* notification 的统一分发 ────────────────────────────────
@@ -341,6 +357,15 @@ export function translateErrorNotification(
   // 驱动)。不带的话 renderer 只能回退到文案匹配 —— codex 改一次措辞, 用户就会在整段
   // 重试窗口里看到英文原文, 也就是本次改动要消除的那个依赖在 UI 侧原样残留。
   const overloadReason = isCapacityError ? { reason: UPSTREAM_OVERLOAD_REASON } : {};
+  // 上下文超限同样带稳定 reason key(#1429): 原样重试必然再撞同一个 4xx, renderer 靠
+  // 它隐藏 Retry 并给出压缩 / 新开会话入口。结构化 contextWindowExceeded 优先，
+  // 文案匹配仅兼容旧版 app-server；与 capacity 互斥时 overload 优先 —— 它还驱动
+  // 退避重投接管，语义更具体。
+  const contextOverflowReason =
+    !isCapacityError &&
+    (errorInfoTag === 'contextWindowExceeded' || isContextOverflowErrorMessage(safeMessage))
+      ? { reason: CONTEXT_OVERFLOW_REASON }
+      : {};
   if (!params.willRetry && isCapacityError) {
     const progress = ctx.tryTakeOverOverload?.();
     if (progress) {
@@ -358,12 +383,34 @@ export function translateErrorNotification(
       return;
     }
   }
+  if (!params.willRetry && !isCapacityError) {
+    const progress = ctx.tryTakeOverTerminalRateLimit?.();
+    if (progress) {
+      queue.push({
+        type: 'error',
+        data: {
+          ...safeErrorData,
+          reason: TERMINAL_RATE_LIMIT_RETRY_REASON,
+          message: formatTerminalRateLimitRetryMessage(
+            safeMessage,
+            progress.attempt,
+            progress.maxAttempts,
+          ),
+          isTerminal: false,
+          willRetry: true,
+        },
+        source: 'codex',
+      });
+      return;
+    }
+  }
   ctx.log.warn('codex turn error', { message: safeMessage, willRetry: params.willRetry, isAuthMissing, threadId: params.threadId, turnId: params.turnId });
   queue.push({
     type: 'error',
     data: {
       ...safeErrorData,
       ...overloadReason,
+      ...contextOverflowReason,
       isTerminal: !params.willRetry,
       willRetry: params.willRetry,
     },
