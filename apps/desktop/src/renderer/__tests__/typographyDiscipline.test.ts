@@ -15,9 +15,14 @@ import { describe, expect, it } from 'vitest';
  *     length: 前缀;token 类 text-<n> 的 <n> 必须在白名单内。
  *  3. fontWeight / fontSize 的值片段(冒号、JSX 属性 =、style 赋值、三元两臂,
  *     **允许跨行**)必须落梯:weight 任意数字字面量 ∈ {400,500,600}(550/650
- *     中间值与 <100/>1000 越界值同判);size 裸数字与 px 值 ∈ 白名单,
+ *     中间值与 <100/>1000 越界值同判),bold/bolder/lighter 关键字大小写
+ *     不敏感全红;size 裸数字与 px 值 ∈ 白名单,
  *     pt/ch 等非 px 绝对/视口单位一律红(em/rem/% 相对比例域放行,已登记)。
- *  4. JS 字符串内嵌 CSS 与 .css 的 font-weight 声明(允许跨行)同样 ≤600;
+ *  4. JS 字符串内嵌 CSS 与 .css 的 font-weight 声明(允许跨行)按**完整值**
+ *     白名单判定:数值(含小数,400.5 不会截成 400 放行)必须精确 ∈
+ *     {400,500,600};关键字大小写归一后 bold/bolder/lighter 判红,
+ *     normal(=400)与 inherit(继承梯内值)放行;属性名与关键字均
+ *     大小写不敏感(CSS 语义);
  *     font: shorthand 只放行 `font: inherit`:尺寸单位形态、system font
  *     关键字(caption 等六个)、size 关键字起头(medium serif / large Arial)、
  *     style/weight/variant/stretch 关键字或三位字重起头、var(...)、
@@ -44,6 +49,8 @@ import { describe, expect, it } from 'vitest';
  *    值首行;
  *  - fontSize 的相对比例值(em / rem / %,如编辑器标题系数)与算式派生值
  *    (`size * 0.86`、`17 / 1`,片段含 * 或 / 即跳过)—— 非静态可判;
+ *  - CSS font-weight 的动态值(var(...)、模板插值、calc())与
+ *    initial/unset/revert 全局关键字(计算结果不引入梯外静态值)不判红;
  *  - .css 与字符串内嵌 CSS 的 font-size 值域(紧凑模式 -1px 派生、
  *    FileBrowserBody 的 em 标题系数、oauthResultPage 品牌块等机制/豁免域,
  *    v1 不做值校验);
@@ -186,7 +193,9 @@ export function findInlineWeightViolations(text: string): Hit[] {
   const hits: Hit[] = [];
   for (const seg of segmentsAfter(text, 'fontWeight')) {
     if (/[()]/.test(seg.match)) continue;
-    for (const m of seg.match.matchAll(/\b(\d+(?:\.\d+)?)\b|\bbold(?:er)?\b/g)) {
+    // 关键字大小写不敏感(值最终进 CSS,'BOLD' 与 'bold' 等效):bold/bolder/
+    // lighter 全红;normal(=400)放行。
+    for (const m of seg.match.matchAll(/\b(\d+(?:\.\d+)?)\b|\b(?:bold(?:er)?|lighter)\b/gi)) {
       if (m[1] && WEIGHT_SET.has(Number(m[1]))) continue;
       hits.push({ match: `fontWeight …${m[0]}`, index: seg.index });
     }
@@ -215,13 +224,22 @@ export function findInlineSizeViolations(text: string): Hit[] {
   return hits;
 }
 
-/** 规则 4a/5:CSS 声明(字符串内嵌或 .css,允许跨行)的 font-weight 全数 ≤600。 */
+/** 规则 4a/5:CSS 声明(字符串内嵌或 .css,允许跨行)的 font-weight 按完整值
+ *  白名单判定(gate-audit 四轮):值截到 [;}\n],剥 !important 后——数值
+ *  (含小数)必须精确 ∈ WEIGHT_SET(400.5 不再截成 400 放行);关键字统一
+ *  lower-case 后 bold/bolder/lighter 判红,normal/inherit 放行;var(...)、
+ *  模板插值等动态值与 initial/unset/revert 为登记盲区。属性名 /i。 */
 export function findStringWeightViolations(text: string): Hit[] {
   const hits: Hit[] = [];
-  for (const m of text.matchAll(/font-weight\s*:\s*(\d+|bold(?:er)?)\b/g)) {
-    if (m[1] === 'bold' || m[1] === 'bolder' || !WEIGHT_SET.has(Number(m[1]))) {
-      hits.push({ match: m[0].replace(/\s+/g, ' '), index: m.index ?? 0 });
+  for (const m of text.matchAll(/font-weight\s*:\s*([^;}\n]+)/gi)) {
+    const value = m[1].replace(/\s*!important\s*$/i, '').trim().toLowerCase();
+    if (!value) continue;
+    if (/^\d+(?:\.\d+)?$/.test(value)) {
+      if (WEIGHT_SET.has(Number(value))) continue;
+    } else if (!/^(?:bold(?:er)?|lighter)$/.test(value)) {
+      continue;
     }
+    hits.push({ match: m[0].replace(/\s+/g, ' ').slice(0, 60), index: m.index ?? 0 });
   }
   return hits;
 }
@@ -238,11 +256,12 @@ export function findFontShorthands(text: string): Hit[] {
   // 裸值与引号值双通道:style 对象里的 font: 'bold 12px system-ui' 属引号值
   // 形态(红队四轮),同样按六形态判;含 && / || 的 TS 逻辑表达式跳过
   // (bold && medium 这类标识符运算不是 CSS 声明,防误报)。
+  // 属性名同样 /i(CSS property 大小写不敏感,`FONT:` 不得绕过)。
   const candidates: Hit[] = [];
-  for (const m of text.matchAll(/\bfont\s*:\s*(['"`])([^'"`\n]*)\1/g)) {
+  for (const m of text.matchAll(/\bfont\s*:\s*(['"`])([^'"`\n]*)\1/gi)) {
     candidates.push({ match: m[2], index: m.index ?? 0 });
   }
-  for (const m of text.matchAll(/\bfont\s*:\s*([^;,}'"]*)/g)) {
+  for (const m of text.matchAll(/\bfont\s*:\s*([^;,}'"]*)/gi)) {
     candidates.push({ match: m[1], index: m.index ?? 0 });
   }
   for (const c of candidates) {
@@ -449,6 +468,19 @@ describe('typography discipline (DESIGN.md §3, #1505)', () => {
       expect(findFontShorthands("style={{ font: 'bold 12px system-ui' }}")).toHaveLength(1);
       expect(findFontShorthands('style={{ font: "caption" }}')).toHaveLength(1);
       expect(findFontShorthands('font: CAPTION;')).toHaveLength(1);
+      // 属性名大小写与完整值判定(gate-audit 四轮)
+      expect(findFontShorthands('FONT: medium serif;')).toHaveLength(1);
+      expect(findStringWeightViolations('FONT-WEIGHT: 900;')).toHaveLength(1);
+      expect(findStringWeightViolations('font-weight: BOLD;')).toHaveLength(1);
+      expect(findStringWeightViolations('font-weight: lighter;')).toHaveLength(1);
+      // 小数中间值:完整值判定,不再截成 400/500/600 静默放行
+      expect(findStringWeightViolations('font-weight: 400.5;')).toHaveLength(1);
+      expect(findStringWeightViolations('font-weight: 500.5;')).toHaveLength(1);
+      expect(findStringWeightViolations('font-weight: 600.5;')).toHaveLength(1);
+      expect(findStringWeightViolations('font-weight: 900 !important;')).toHaveLength(1);
+      expect(findInlineWeightViolations("fontWeight: 'lighter' }")).toHaveLength(1);
+      expect(findInlineWeightViolations("fontWeight: 'BOLD' }")).toHaveLength(1);
+      expect(findInlineWeightViolations("fontWeight: 'Bolder' }")).toHaveLength(1);
     });
 
     it('passes green samples', () => {
@@ -474,6 +506,12 @@ describe('typography discipline (DESIGN.md §3, #1505)', () => {
         findInlineWeightViolations('<text\n  fontSize="10"\n  fontWeight="500"\n  letterSpacing="0.3"\n/>'),
       ).toEqual([]);
       expect(findStringWeightViolations('font-weight: 600;')).toEqual([]);
+      // normal(=400)/inherit 落梯放行;动态值与 initial/unset/revert 为登记盲区
+      expect(findStringWeightViolations('font-weight: normal;')).toEqual([]);
+      expect(findStringWeightViolations('font-weight: NORMAL;')).toEqual([]);
+      expect(findStringWeightViolations('font-weight: inherit;')).toEqual([]);
+      expect(findStringWeightViolations('font-weight: var(--w);')).toEqual([]);
+      expect(findStringWeightViolations('font-weight: 500 !important;')).toEqual([]);
       expect(findFontShorthands("font: 'inherit'")).toEqual([]);
       expect(findFontShorthands('font: inherit;')).toEqual([]);
       expect(findFontShorthands('font: 20,')).toEqual([]);
