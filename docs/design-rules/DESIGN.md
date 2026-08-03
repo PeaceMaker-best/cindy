@@ -109,19 +109,19 @@ The grayscale rule is near-absolute. The following are the **only** sanctioned n
 | Body Large      | Inter          | 18px (1.13rem) | 400–500 | 1.56         | normal                                 | Hero descriptions, button text                                                                                                                                                                                                                               |
 | Body / Link     | Inter          | 16px (1rem)    | 400–500 | 1.50         | normal                                 | Standard body text, navigation                                                                                                                                                                                                                               |
 | Caption         | Inter          | 14px (0.88rem) | 400     | 1.43         | normal                                 | Metadata, descriptions                                                                                                                                                                                                                                       |
-| Small           | Inter          | 12px (0.75rem) | 400     | 1.33         | normal                                 | Smallest sans-serif text                                                                                                                                                                                                                                     |
+| Small           | Inter          | 12px (0.75rem) | 400     | 1.33         | normal                                 | Smallest reading-text size (auxiliary Micro Label may go smaller, floor 10px)                                                                                                                                                                                                                                     |
 | Micro Label     | Inter          | 10–13px        | 400–500 | 1.20–1.40    | optional 0.5–1px tracking on uppercase | **Auxiliary / non-reading** labels only — sidebar tree section heads (13px), tree row counts, frontmatter field names, scope chips, tag pills, status badges, breadcrumb segments. Never used for body text or anything the user reads sentence-by-sentence. |
 | Code Body       | JetBrains Mono | 16px (1rem)    | 400     | 1.50         | normal                                 | Inline code, commands                                                                                                                                                                                                                                        |
 | Code Caption    | JetBrains Mono | 14px (0.88rem) | 400     | 1.43         | normal                                 | Code snippets, secondary                                                                                                                                                                                                                                     |
 | Code Small      | JetBrains Mono | 11–12px        | 400–500 | 1.40–1.63    | normal                                 | Tags, labels, in-tree paths                                                                                                                                                                                                                                  |
 
 
-*Positioning note: the Display / Section Heading / Sub-heading rows are for brand-scale surfaces (login, splash, empty states); everyday app chrome lives in the Body / Caption / Small / Micro rows. For `apps/desktop` code, the normative size set is the「桌面 UI 字号白名单」below — this table describes roles, the whitelist constrains values.*
+*Positioning note: the Display / Section Heading / Sub-heading rows are conceptual role targets for **brand canvases only** (the §16 login / splash family and its self-contained pages) — their concrete values live in canvas constants and §16 tables under the「排版豁免登记表」below, not in app code. Everything else — everyday chrome **and** in-app empty states — lives in the Body / Caption / Small / Micro rows, and for `apps/desktop` code the normative size set is the「桌面 UI 字号白名单」below: this table describes roles, the whitelist constrains values.*
 
 ### Principles
 
 - **Single sans family**: Inter carries both display headlines and body text — no typeface switching between hierarchy levels. Size and weight alone create hierarchy, keeping the typographic system maximally simple.
-- **Weight restraint**: Everyday chrome uses only 400 (regular) and 500 (medium); 600 exists as a rationed emphasis tier, and 700 lives exclusively inside registered exemption domains. No light, no black weight, no in-between values. The full ladder and its rules are in「字重阶梯」below (2026-08 revision, issue #1505 — this supersedes the former "400/500 only" wording).
+- **Weight restraint**: Everyday chrome defaults to 400 (regular) and 500 (medium); 600 is a rationed emphasis tier, and 700 lives exclusively inside registered exemption domains. No light, no black weight, no in-between values. The full ladder and its rules are in「字重阶梯」below (2026-08 revision, issue #1505 — this supersedes the former "400/500 only" wording).
 - **Tight display, comfortable body**: Headlines compress to 1.0 line-height, while body text relaxes to 1.43–1.56. The contrast creates clear hierarchy without needing weight contrast.
 - **Monospace for code only**: JetBrains Mono is reserved for inline code, terminal commands, and code blocks — never used for UI chrome.
 
@@ -144,7 +144,7 @@ The grayscale rule is near-absolute. The following are the **only** sanctioned n
 - **UI 段:{10, 11, 12, 13, 14, 15, 16}px;标题 / 内容段:{18, 20, 24, 28}px。** 下限 10px —— 9px 及以下禁止(再小就不是文字是纹理)。
 - **写法**:一律用 `tailwind.config.ts` 的 `text-<n>` token 类(映射 `--text-<n>` 变量;doc 紧凑模式与后续字号缩放能力都挂在这层变量上,任意值类会静默漏掉这些机制)。语义类 `text-xs / text-sm / text-base / text-lg` 为收编存量(等值 12 / 14 / 16 / 18)。**禁止新增任意值 `text-[Npx]`(含一切小数)与白名单外档位**;需要新档先改本表与 `tailwind.config.ts`,再进组件。
 - `tailwind.config.ts` 的 fontSize 档与本白名单**互为镜像**:改一处必须同步另一处(守卫做镜像检查,见 issue #1505 PR4)。
-- 品牌画布域(登录 / `oauthResultPage` 等设计 px 坐标系表面)不映射本白名单:字面量只允许进画布常量文件(`loginDesignTokens.ts` 的地位,对齐手机端 `loginSkinLayout.ts`),组件消费端照常受守卫扫描。
+- 品牌画布域(登录 / Splash 家族等设计 px 坐标系表面)不映射本白名单:字面量只允许进画布常量文件(`loginDesignTokens.ts` 的地位,对齐手机端 `loginSkinLayout.ts`)**或下表登记的自包含品牌页生成器**(`oauthResultPage.ts` 整页由 main 侧生成,其内嵌 raw CSS 即该页的常量载体),组件消费端照常受守卫扫描。
 
 ### 排版豁免登记表(2026-08,issue #1505)
 
@@ -152,8 +152,8 @@ The grayscale rule is near-absolute. The following are the **only** sanctioned n
 
 | 域 | 范围 | 允许 | 理由 |
 | --- | --- | --- | --- |
-| 登录品牌画布 | `LoginControls.tsx`、`loginDesignTokens.ts`、`LegacyMigrationDialog.tsx`(仅字重)、`oauthResultPage.ts` 品牌块 | 700 + 设计 px 字号 | §16 已登记 Bold,figma 画布坐标系 |
-| markdown 内容 | `<strong>`(Tailwind preflight `bolder`) | 700 | 用户内容语义,非 UI chrome |
+| 登录 / Splash 品牌画布 | `LoginControls.tsx`、`loginDesignTokens.ts`(Splash 借用同族面板)、`LegacyMigrationDialog.tsx`(仅字重)、`oauthResultPage.ts`(自包含品牌页生成器,raw CSS 为其常量载体) | 700 + 设计 px 字号 | §16 已登记 Bold,figma 画布坐标系 |
+| markdown 内容 | DOM `<strong>`(Tailwind preflight `bolder`)+ CodeMirror strong 语法节点(`codemirrorGithubTheme.ts` 的 `t.strong` → `fontWeight: 'bold'`) | 700 / `bold` | 用户内容语义,非 UI chrome;编辑器内 strong 与渲染后 `<strong>` 同权 |
 | hljs 主题移植 | `globals.css` 内 hljs 规则 | `bold` | 第三方主题移植,保真优先 |
 | 外部页注入 | `browserCommentPreload.ts` | 系统字体族 | 注入他人网页,不强加 Inter |
 | 手机 WebView HTML 生成器 | `selectableMarkdownHtml.ts` 等 | CSS 语法字面量 | 手机守卫已自登记盲区,值仍须守本阶梯 |
@@ -166,6 +166,7 @@ The grayscale rule is near-absolute. The following are the **only** sanctioned n
 - line-height:桌面存在 `leading-[1.45]` / `leading-[1.55]` 等微调档与无单位 / px 混轨。
 - 语义类 `text-xs/sm/base/lg` → `text-<n>` 的机械统一:等值改写零收益,收编即可。
 - letter-spacing 与 font-family 治理。
+- 原生层排版:macOS agent-island helper 等 Swift / 原生 UI 的字号字重不在本白名单域(Web 白名单与守卫均不覆盖,治理需另立 issue)。
 
 ## 4. Component Stylings
 
@@ -308,7 +309,7 @@ Three tiers — **these three only**:
 - Use 12px radius on all non-interactive containers — code blocks, cards, panels
 - Use 8px radius only for inner controls that can't be a pill — multi-line inputs, dropdown/menu rows (see §5)
 - Keep the palette strictly grayscale — chromatic color only via the sanctioned semantic set in §2, always through tokens
-- Use Inter at weight 500 for display headings — hierarchy comes from size + weight, not typeface switching
+- Use Inter at weight 400–500 for display headings (per the §3 Hierarchy rows) — hierarchy comes from size + weight, not typeface switching
 - Maintain zero shadows — depth comes from borders and background shifts only
 - Keep content density low — each section should present one clear idea
 - Use monospace for terminal commands and code — it's primary content, not decoration
