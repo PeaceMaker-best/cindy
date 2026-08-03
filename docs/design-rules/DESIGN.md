@@ -116,14 +116,56 @@ The grayscale rule is near-absolute. The following are the **only** sanctioned n
 | Code Small      | JetBrains Mono | 11–12px        | 400–500 | 1.40–1.63    | normal                                 | Tags, labels, in-tree paths                                                                                                                                                                                                                                  |
 
 
-*Positioning note: the Display / Section Heading / Sub-heading rows are for brand-scale surfaces (login, splash, empty states); everyday app chrome lives in the Body / Caption / Small / Micro rows.*
+*Positioning note: the Display / Section Heading / Sub-heading rows are for brand-scale surfaces (login, splash, empty states); everyday app chrome lives in the Body / Caption / Small / Micro rows. For `apps/desktop` code, the normative size set is the「桌面 UI 字号白名单」below — this table describes roles, the whitelist constrains values.*
 
 ### Principles
 
 - **Single sans family**: Inter carries both display headlines and body text — no typeface switching between hierarchy levels. Size and weight alone create hierarchy, keeping the typographic system maximally simple.
-- **Weight restraint**: Only two weights matter — 400 (regular) for body and 500 (medium) for headings. No bold, no light, no black weight. This extreme restraint reinforces the minimal philosophy.
+- **Weight restraint**: Everyday chrome uses only 400 (regular) and 500 (medium); 600 exists as a rationed emphasis tier, and 700 lives exclusively inside registered exemption domains. No light, no black weight, no in-between values. The full ladder and its rules are in「字重阶梯」below (2026-08 revision, issue #1505 — this supersedes the former "400/500 only" wording).
 - **Tight display, comfortable body**: Headlines compress to 1.0 line-height, while body text relaxes to 1.43–1.56. The contrast creates clear hierarchy without needing weight contrast.
 - **Monospace for code only**: JetBrains Mono is reserved for inline code, terminal commands, and code blocks — never used for UI chrome.
+
+### 字重阶梯(2026-08 修订,issue #1505)
+
+全站字重只允许以下四档整百值,禁止一切中间值(550/650…)与 800 及以上:
+
+| 档 | 名称 | 用途 |
+| --- | --- | --- |
+| 400 | Regular | 长文阅读正文、代码 |
+| 500 | Medium | UI 默认强调、标题 —— 日常 chrome 的主力档 |
+| 600 | Semibold | 限量强调(徽标、表头、选中态等局部加重)。新增使用要能说出「为什么 500 不够」 |
+| 700 | Bold | **仅限下方豁免登记表中的域**,禁止出现在普通 UI chrome |
+
+- 与手机端 `apps/mobile/src/theme/tokens.ts` 的 `fontWeight` token(regular / medium / semibold / bold)一一对应 —— 两端一张梯子。
+- **CJK 注记**:桌面未设 `font-synthesis: none`,中文回退字体(PingFang)公开档位到 600 —— UI 里用 700 会在中文上触发伪粗体(算法加粗、边缘发糊),且 600 与 700 在 CJK 上的渲染差异不可靠。**中文层级不得依赖 600 vs 700 区分**,强调靠字号或颜色。
+
+### 桌面 UI 字号白名单(2026-08,issue #1505)
+
+- **UI 段:{10, 11, 12, 13, 14, 15, 16}px;标题 / 内容段:{18, 20, 24, 28}px。** 下限 10px —— 9px 及以下禁止(再小就不是文字是纹理)。
+- **写法**:一律用 `tailwind.config.ts` 的 `text-<n>` token 类(映射 `--text-<n>` 变量;doc 紧凑模式与后续字号缩放能力都挂在这层变量上,任意值类会静默漏掉这些机制)。语义类 `text-xs / text-sm / text-base / text-lg` 为收编存量(等值 12 / 14 / 16 / 18)。**禁止新增任意值 `text-[Npx]`(含一切小数)与白名单外档位**;需要新档先改本表与 `tailwind.config.ts`,再进组件。
+- `tailwind.config.ts` 的 fontSize 档与本白名单**互为镜像**:改一处必须同步另一处(守卫做镜像检查,见 issue #1505 PR4)。
+- 品牌画布域(登录 / `oauthResultPage` 等设计 px 坐标系表面)不映射本白名单:字面量只允许进画布常量文件(`loginDesignTokens.ts` 的地位,对齐手机端 `loginSkinLayout.ts`),组件消费端照常受守卫扫描。
+
+### 排版豁免登记表(2026-08,issue #1505)
+
+以下是**登记过的刻意分歧**,不要当 bug「修」;新增豁免必须先改本表:
+
+| 域 | 范围 | 允许 | 理由 |
+| --- | --- | --- | --- |
+| 登录品牌画布 | `LoginControls.tsx`、`loginDesignTokens.ts`、`LegacyMigrationDialog.tsx`(仅字重)、`oauthResultPage.ts` 品牌块 | 700 + 设计 px 字号 | §16 已登记 Bold,figma 画布坐标系 |
+| markdown 内容 | `<strong>`(Tailwind preflight `bolder`) | 700 | 用户内容语义,非 UI chrome |
+| hljs 主题移植 | `globals.css` 内 hljs 规则 | `bold` | 第三方主题移植,保真优先 |
+| 外部页注入 | `browserCommentPreload.ts` | 系统字体族 | 注入他人网页,不强加 Inter |
+| 手机 WebView HTML 生成器 | `selectableMarkdownHtml.ts` 等 | CSS 语法字面量 | 手机守卫已自登记盲区,值仍须守本阶梯 |
+| 紧凑模式派生值 | `globals.css` `.chat-rail-compact` 段 | calc / -1px 派生 | 机制本体 |
+
+### 排版 non-goals(2026-08 登记)
+
+以下漂移**已知且本轮明确不治理**,后人见到不要当「漏网」顺手修,治理需另立 issue:
+
+- line-height:桌面存在 `leading-[1.45]` / `leading-[1.55]` 等微调档与无单位 / px 混轨。
+- 语义类 `text-xs/sm/base/lg` → `text-<n>` 的机械统一:等值改写零收益,收编即可。
+- letter-spacing 与 font-family 治理。
 
 ## 4. Component Stylings
 
@@ -277,7 +319,7 @@ Three tiers — **these three only**:
 - Don't introduce any chromatic color outside the sanctioned semantic set in §2 — no brand blue, no accent green, no warm tones beyond the registered exceptions
 - Don't invent arbitrary radii — only three values exist: 8px (inner controls), 12px (containers), 9999px (pill). Nothing in between, nothing else.
 - Don't add shadows to any element — the flat aesthetic is intentional
-- Don't use font weights above 500 — no bold, no black weight
+- Don't use font weights above 600 in UI chrome — 700 only inside the exemption domains registered in §3 (markdown `<strong>`, hljs theme ports, login brand canvas); no 800+, no in-between values, anywhere
 - Don't add decorative illustrations — Cindy's working UI carries no mascots or artwork; brand imagery appears only on sanctioned brand surfaces (login, splash, new-session brand block — see §15.7 / §16)
 - Don't use gradients anywhere — flat blocks and borders only
 - Don't overcomplicate the layout — stick to the region structure in §5; no complex nested grids
@@ -327,7 +369,7 @@ Cindy Mobile (React Native) has its own device-class rules (phone / pad portrait
 2. Keep all values grayscale — "Stone (#737373)" not "use a light color"
 3. Always specify radius from the three tiers — pill (9999px) / container (12px) / inner control (8px, only for textareas & dropdown rows). Nothing else.
 4. Shadows are always zero — never add them
-5. Weight is always 400 or 500 — never bold
+5. Weight is 400/500 for everyday chrome, 600 for rationed emphasis — 700 never appears in new UI (registered exemption domains in §3 only)
 6. If something feels too decorated, remove it — less is always more
 
 ## 10. Theme System & Token Reference
