@@ -383,6 +383,13 @@ function buildOverlay(markerNumber: number): OverlayState {
       border-radius: 50%;
       background: ${ACCENT};
       color: #fff;
+      /* 原为 font: 600 12px/22px … shorthand。拆分成 longhand 后必须显式补回
+         shorthand 的隐式重置:本样式注入第三方页面的 Shadow DOM,font-style /
+         font-variant / font-stretch 可从宿主 host 继承(italic / small-caps 会
+         改变 marker 数字字形),shorthand 时代它们被隐式归位,拆分后需手动锁死。 */
+      font-style: normal;
+      font-variant: normal;
+      font-stretch: normal;
       font-weight: 600;
       font-size: 12px;
       line-height: 22px;
