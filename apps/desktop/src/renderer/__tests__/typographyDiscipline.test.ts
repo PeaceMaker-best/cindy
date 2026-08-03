@@ -38,6 +38,10 @@ import { describe, expect, it } from 'vitest';
  * ## 盲区清单(显式登记,不宣称全入口;新增写法先补扫描再用)
  *  - 动态拼接的 class / 样式字符串(`'text-[' + n + 'px]'`)、跨文件常量组装、
  *    数值经变量间接传入(`fontWeight: W` 且 W 定义在别处);
+ *  - 非常规数字字面量形态:数字分隔符(6_50)、进制字面量(0x28a)、科学计数
+ *    (5e2)不参与判定(非现实字重写法);函数调用表达式(toWeight(550))
+ *    与 && / || 逻辑表达式按动态值跳过,不按内部 token 误判;多行三元只覆盖
+ *    值首行;
  *  - fontSize 的相对比例值(em / rem / %,如编辑器标题系数)与算式派生值
  *    (`size * 0.86`、`17 / 1`,片段含 * 或 / 即跳过)—— 非静态可判;
  *  - .css 与字符串内嵌 CSS 的 font-size 值域(紧凑模式 -1px 派生、
@@ -174,10 +178,14 @@ function segmentsAfter(text: string, keyword: string): Hit[] {
   return segments;
 }
 
-/** 规则 3a:fontWeight 值片段全数落梯(任意数字字面量,含中间值/越界值)。 */
+/** 规则 3a:fontWeight 值片段全数落梯。口径 = **十进制裸/引号数字字面量**
+ *  (含中间值 550/650 与越界值);数字分隔符(6_50)、进制字面量(0x28a)、
+ *  科学计数(5e2)与函数调用表达式(toWeight(550))为登记盲区——前三者非
+ *  现实字重写法,后者为动态值不按内部参数误判(红队四轮)。 */
 export function findInlineWeightViolations(text: string): Hit[] {
   const hits: Hit[] = [];
   for (const seg of segmentsAfter(text, 'fontWeight')) {
+    if (/[()]/.test(seg.match)) continue;
     for (const m of seg.match.matchAll(/\b(\d+(?:\.\d+)?)\b|\bbold(?:er)?\b/g)) {
       if (m[1] && WEIGHT_SET.has(Number(m[1]))) continue;
       hits.push({ match: `fontWeight …${m[0]}`, index: seg.index });
@@ -227,19 +235,29 @@ export function findStringWeightViolations(text: string): Hit[] {
  *  天然放行。 */
 export function findFontShorthands(text: string): Hit[] {
   const hits: Hit[] = [];
+  // 裸值与引号值双通道:style 对象里的 font: 'bold 12px system-ui' 属引号值
+  // 形态(红队四轮),同样按六形态判;含 && / || 的 TS 逻辑表达式跳过
+  // (bold && medium 这类标识符运算不是 CSS 声明,防误报)。
+  const candidates: Hit[] = [];
+  for (const m of text.matchAll(/\bfont\s*:\s*(['"`])([^'"`\n]*)\1/g)) {
+    candidates.push({ match: m[2], index: m.index ?? 0 });
+  }
   for (const m of text.matchAll(/\bfont\s*:\s*([^;,}'"]*)/g)) {
-    const value = m[1].replace(/\s+/g, ' ').trim();
-    if (!value || value === 'inherit') continue;
+    candidates.push({ match: m[1], index: m.index ?? 0 });
+  }
+  for (const c of candidates) {
+    const value = c.match.replace(/\s+/g, ' ').trim();
+    if (!value || value === 'inherit' || /&&|\|\|/.test(value)) continue;
     const unitForm = /(?:\d+(?:\.\d+)?|\.\d+)(?:px|r?em|pt|pc|ch|ex|q|cm|mm|in|vw|vh|vmin|vmax)\b/i.test(value);
-    const systemKeyword = /^(?:caption|icon|menu|message-box|small-caption|status-bar)\b/.test(value);
+    const systemKeyword = /^(?:caption|icon|menu|message-box|small-caption|status-bar)\b/i.test(value);
     const sizeKeywordShorthand =
-      /^(?:xx-small|x-small|small|medium|large|x-large|xx-large|xxx-large|smaller|larger)\b\s+\S/.test(value);
+      /^(?:xx-small|x-small|small|medium|large|x-large|xx-large|xxx-large|smaller|larger)\b\s+\S/i.test(value);
     const styleKeywordShorthand =
-      /^(?:normal|italic|oblique|bold|bolder|lighter|small-caps|(?:ultra-|extra-|semi-)?(?:condensed|expanded)|[1-9]\d{2})\s+\S/.test(value);
-    const varForm = /^var\(/.test(value);
-    const globalKeyword = /^(?:initial|unset|revert(?:-layer)?)\b/.test(value);
+      /^(?:normal|italic|oblique|bold|bolder|lighter|small-caps|(?:ultra-|extra-|semi-)?(?:condensed|expanded)|[1-9]\d{2})\s+\S/i.test(value);
+    const varForm = /^var\(/i.test(value);
+    const globalKeyword = /^(?:initial|unset|revert(?:-layer)?)\b/i.test(value);
     if (unitForm || systemKeyword || sizeKeywordShorthand || styleKeywordShorthand || varForm || globalKeyword) {
-      hits.push({ match: `font: ${value}`.slice(0, 60), index: m.index ?? 0 });
+      hits.push({ match: `font: ${value}`.slice(0, 60), index: c.index });
     }
   }
   return hits;
@@ -427,6 +445,10 @@ describe('typography discipline (DESIGN.md §3, #1505)', () => {
       expect(findFontShorthands('font: initial;')).toHaveLength(1);
       expect(findFontShorthands('font: unset;')).toHaveLength(1);
       expect(findFontShorthands('font: revert;')).toHaveLength(1);
+      // 引号值与大小写(红队四轮:style 对象里的字符串 shorthand / CSS 大小写不敏感)
+      expect(findFontShorthands("style={{ font: 'bold 12px system-ui' }}")).toHaveLength(1);
+      expect(findFontShorthands('style={{ font: "caption" }}')).toHaveLength(1);
+      expect(findFontShorthands('font: CAPTION;')).toHaveLength(1);
     });
 
     it('passes green samples', () => {
@@ -456,6 +478,14 @@ describe('typography discipline (DESIGN.md §3, #1505)', () => {
       expect(findFontShorthands('font: inherit;')).toEqual([]);
       expect(findFontShorthands('font: 20,')).toEqual([]);
       expect(findFontShorthands('font: markerFont,')).toEqual([]);
+      // TS 逻辑表达式不是 CSS 声明(红队四轮误报面),跳过
+      expect(findFontShorthands('const x = { font: bold && medium };')).toEqual([]);
+      expect(findFontShorthands('font: caption || fallback,')).toEqual([]);
+      // 函数调用表达式按动态值跳过,不按内部参数误判(登记盲区)
+      expect(findInlineWeightViolations('fontWeight: toWeight(550),')).toEqual([]);
+      // 非常规数字字面量形态为登记盲区(现行为 = 不判,锚定防悄改)
+      expect(findInlineWeightViolations('fontWeight: 5e2,')).toEqual([]);
+      expect(findInlineWeightViolations('fontWeight: 6_50,')).toEqual([]);
       // 尾注释剥离:注释里的数字不进入 fontSize 片段
       expect(findInlineSizeViolations(prepareTsContent('fontSize: 13, // 对齐 xterm 2024 默认'))).toEqual([]);
       expect(prepareTsLine('  // font-weight: 700 in prose')).toBeNull();
