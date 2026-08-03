@@ -44,9 +44,10 @@ import { describe, expect, it } from 'vitest';
  *  - 动态拼接的 class / 样式字符串(`'text-[' + n + 'px]'`)、跨文件常量组装、
  *    数值经变量间接传入(`fontWeight: W` 且 W 定义在别处);
  *  - 非常规数字字面量形态:数字分隔符(6_50)、进制字面量(0x28a)、科学计数
- *    (5e2)不参与判定(非现实字重写法);函数调用表达式(toWeight(550))
- *    与 && / || 逻辑表达式按动态值跳过,不按内部 token 误判;多行三元只覆盖
- *    值首行;
+ *    (5e2)不参与判定(非现实字重写法);函数调用**子表达式**(toWeight(550),
+ *    含其参数域)逐层剔除后按动态值跳过——片段剩余部分的直接字面量(括号
+ *    包裹、混合三元的字面量臂)照判;shorthand 的 && / || 逻辑表达式按动态值
+ *    跳过,不按内部 token 误判;多行三元只覆盖值首行;
  *  - fontSize 的相对比例值(em / rem / %,如编辑器标题系数)与算式派生值
  *    (`size * 0.86`、`17 / 1`,片段含 * 或 / 即跳过)—— 非静态可判;
  *  - CSS font-weight 的动态值(var(...)、模板插值、calc())与
@@ -192,10 +193,18 @@ function segmentsAfter(text: string, keyword: string): Hit[] {
 export function findInlineWeightViolations(text: string): Hit[] {
   const hits: Hit[] = [];
   for (const seg of segmentsAfter(text, 'fontWeight')) {
-    if (/[()]/.test(seg.match)) continue;
+    // 只剔除**函数调用子表达式**本体(内层起逐层剥,参数域按动态值登记盲区),
+    // 剩余部分的直接字面量照判——`(700)` 括号包裹与「一臂函数、一臂字面量」的
+    // 混合三元不再整段跳过(gate-audit 五轮)。
+    let scannable = seg.match;
+    let prev: string;
+    do {
+      prev = scannable;
+      scannable = scannable.replace(/[A-Za-z_$][\w$]*\s*\([^()]*\)/g, ' ');
+    } while (scannable !== prev);
     // 关键字大小写不敏感(值最终进 CSS,'BOLD' 与 'bold' 等效):bold/bolder/
     // lighter 全红;normal(=400)放行。
-    for (const m of seg.match.matchAll(/\b(\d+(?:\.\d+)?)\b|\b(?:bold(?:er)?|lighter)\b/gi)) {
+    for (const m of scannable.matchAll(/\b(\d+(?:\.\d+)?)\b|\b(?:bold(?:er)?|lighter)\b/gi)) {
       if (m[1] && WEIGHT_SET.has(Number(m[1]))) continue;
       hits.push({ match: `fontWeight …${m[0]}`, index: seg.index });
     }
@@ -234,7 +243,7 @@ export function findStringWeightViolations(text: string): Hit[] {
   for (const m of text.matchAll(/font-weight\s*:\s*([^;}\n]+)/gi)) {
     const value = m[1].replace(/\s*!important\s*$/i, '').trim().toLowerCase();
     if (!value) continue;
-    if (/^\d+(?:\.\d+)?$/.test(value)) {
+    if (/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$/.test(value)) {
       if (WEIGHT_SET.has(Number(value))) continue;
     } else if (!/^(?:bold(?:er)?|lighter)$/.test(value)) {
       continue;
@@ -271,8 +280,10 @@ export function findFontShorthands(text: string): Hit[] {
     const systemKeyword = /^(?:caption|icon|menu|message-box|small-caption|status-bar)\b/i.test(value);
     const sizeKeywordShorthand =
       /^(?:xx-small|x-small|small|medium|large|x-large|xx-large|xxx-large|smaller|larger)\b\s+\S/i.test(value);
+    // numeric weight 起头按完整数值文法判(两位/四位/小数/带符号同样是
+    // shorthand 形态,50 / 1000 / 700.5 / +700 不得绕过——gate-audit 五轮)。
     const styleKeywordShorthand =
-      /^(?:normal|italic|oblique|bold|bolder|lighter|small-caps|(?:ultra-|extra-|semi-)?(?:condensed|expanded)|[1-9]\d{2})\s+\S/i.test(value);
+      /^(?:normal|italic|oblique|bold|bolder|lighter|small-caps|(?:ultra-|extra-|semi-)?(?:condensed|expanded)|[+-]?(?:\d+(?:\.\d+)?|\.\d+))\s+\S/i.test(value);
     const varForm = /^var\(/i.test(value);
     const globalKeyword = /^(?:initial|unset|revert(?:-layer)?)\b/i.test(value);
     if (unitForm || systemKeyword || sizeKeywordShorthand || styleKeywordShorthand || varForm || globalKeyword) {
@@ -481,6 +492,17 @@ describe('typography discipline (DESIGN.md §3, #1505)', () => {
       expect(findInlineWeightViolations("fontWeight: 'lighter' }")).toHaveLength(1);
       expect(findInlineWeightViolations("fontWeight: 'BOLD' }")).toHaveLength(1);
       expect(findInlineWeightViolations("fontWeight: 'Bolder' }")).toHaveLength(1);
+      // 括号包裹与混合三元:直接字面量臂不因片段含括号而整段漏判(gate-audit 五轮)
+      expect(findInlineWeightViolations('fontWeight: (700),')).toHaveLength(1);
+      expect(findInlineWeightViolations('fontWeight: active ? 700 : toWeight(500),')).toHaveLength(1);
+      expect(findInlineWeightViolations('fontWeight: active ? toWeight(500) : 800,')).toHaveLength(1);
+      // shorthand numeric weight 完整文法:两位/四位/小数/带符号不得绕过
+      expect(findFontShorthands('font: 50 medium serif;')).toHaveLength(1);
+      expect(findFontShorthands('font: 1000 medium serif;')).toHaveLength(1);
+      expect(findFontShorthands('font: 700.5 medium serif;')).toHaveLength(1);
+      expect(findFontShorthands('font: +700 medium serif;')).toHaveLength(1);
+      expect(findStringWeightViolations('font-weight: +700;')).toHaveLength(1);
+      expect(findStringWeightViolations('font-weight: .5;')).toHaveLength(1);
     });
 
     it('passes green samples', () => {
@@ -519,8 +541,13 @@ describe('typography discipline (DESIGN.md §3, #1505)', () => {
       // TS 逻辑表达式不是 CSS 声明(红队四轮误报面),跳过
       expect(findFontShorthands('const x = { font: bold && medium };')).toEqual([]);
       expect(findFontShorthands('font: caption || fallback,')).toEqual([]);
-      // 函数调用表达式按动态值跳过,不按内部参数误判(登记盲区)
+      // 函数调用子表达式按动态值剔除(参数域为登记盲区),不按内部参数误判;
+      // 嵌套调用逐层剥净
       expect(findInlineWeightViolations('fontWeight: toWeight(550),')).toEqual([]);
+      expect(findInlineWeightViolations('fontWeight: getWeight(active ? 700 : 500),')).toEqual([]);
+      expect(findInlineWeightViolations('fontWeight: f(g(550)),')).toEqual([]);
+      // 带符号合法值:+400 = 400,落梯放行
+      expect(findStringWeightViolations('font-weight: +400;')).toEqual([]);
       // 非常规数字字面量形态为登记盲区(现行为 = 不判,锚定防悄改)
       expect(findInlineWeightViolations('fontWeight: 5e2,')).toEqual([]);
       expect(findInlineWeightViolations('fontWeight: 6_50,')).toEqual([]);
