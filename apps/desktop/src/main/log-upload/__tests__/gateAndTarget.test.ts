@@ -83,6 +83,22 @@ describe('evaluateGate', () => {
     });
     expect(evaluateGate(deps, 'manual')).toEqual({ kind: 'unknown' });
   });
+
+  /**
+   * 2026-08-04 review P2 的回归锁：真实依赖（两个 `createOverrideSettingsFile` store）读到坏
+   * JSON 时会**吞掉异常返回默认值**，于是「文件损坏」与「用户明确没同意 / 明确关掉开关」在
+   * 返回值上无法区分。闸把前者判成 denied 的后果是 `runUpload` 清空待补传标记——一次设置文件
+   * 读取故障就永久丢掉崩溃现场。接线层（`index.ts` 的 `gateDeps`）因此必须在探到「文件在但
+   * 解析不出来」时抛出；这里锁住「抛出 ⇒ unknown ⇒ 标记保留」这条链的前半段。
+   */
+  it.each([
+    ['同意记录不可读', { readPrivacyConsentAccepted: () => { throw new Error('unreadable'); } }],
+    ['崩溃开关记录不可读', { readCrashAutoUploadEnabled: () => { throw new Error('unreadable'); } }],
+  ])('⚠️ %s ⇒ unknown，绝不能是 denied（denied 会清空崩溃标记）', (_case, override) => {
+    const verdict = evaluateGate(gate(override as Partial<ConsentGateDeps>), 'crash-backfill');
+    expect(verdict).toEqual({ kind: 'unknown' });
+    expect(verdict.kind).not.toBe('denied');
+  });
 });
 
 describe('isManualUploadAvailable', () => {

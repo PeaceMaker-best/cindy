@@ -206,11 +206,24 @@ async function firstRecordTimestampAt(
 }
 
 /**
- * 文件内**首个哨兵之前**是否已经结束（即窗口起点之后可以直接开始收集）。
+ * 文件内首个格式哨兵**记录**的结束字节偏移；找不到返回 null。
  *
  * 只读文件开头一小段：哨兵由 logger 在打开当天文件时立刻写入，正常情况下就在文件最前面
  * （同一天多次启动会有多个哨兵，认第一个）。读不到就按「未见过哨兵」处理，让窗口内自己
  * 去找——最坏结果是这一天采不到内容，而不是把旧格式内容放出去。
+ *
+ * ⚠️ 必须按**完整记录头 + 哨兵正文**校验整行，不能拿哨兵串去 `indexOf` 搜任意位置
+ * （2026-08-04 review 指出的隐私逃逸路径）：升级前的未转义正文里只要出现
+ * `[logger] #cindy-log-format:2` 这段文字（用户对话内容完全可以包含它），子串匹配就会把
+ * 那一行认成哨兵、置位 `sentinelAlreadySeen`，于是它后面被封禁来源里伪造的放行记录头
+ * 全部绕过「哨兵之前一律丢弃」这道闸被上传。
+ *
+ * 偏移必须按**字节**算：调用方拿它和 `startOffset`（字节）比较，而日志正文里有大量中文，
+ * 字符下标与字节偏移不是一回事——用 `text.indexOf` 的字符下标当字节偏移会偏小，
+ * 让「哨兵在窗口起点之前」的判断偏向误判为真。
+ *
+ * 只认**完整的**哨兵行（后面必须有换行符落在缓冲区内）：headBytes 边界可能把行截断，
+ * 半行不该被当成哨兵。
  */
 export async function sentinelOffset(
   file: RandomAccessFile,
@@ -219,9 +232,24 @@ export async function sentinelOffset(
   const buf = await file.read(0, headBytes);
   if (buf.length === 0) return null;
   const text = buf.toString('utf8');
-  const marker = `[${RECORD_FORMAT_SENTINEL_SCOPE}] ${RECORD_FORMAT_SENTINEL_MSG}`;
-  const at = text.indexOf(marker);
-  if (at < 0) return null;
-  const lineEnd = text.indexOf('\n', at);
-  return lineEnd < 0 ? buf.length : lineEnd + 1;
+  let byteOffset = 0;
+  const lines = text.split('\n');
+  for (let i = 0; i < lines.length; i += 1) {
+    const rawLine = lines[i];
+    // 该行连同它的 '\n' 占多少字节;最后一段没有 '\n'(split 的产物),不计。
+    const isLastSegment = i === lines.length - 1;
+    const lineBytes = Buffer.byteLength(rawLine, 'utf8') + (isLastSegment ? 0 : 1);
+    if (!isLastSegment && isSentinelLine(rawLine.replace(/\r$/, ''))) {
+      return byteOffset + lineBytes;
+    }
+    byteOffset += lineBytes;
+  }
+  return null;
+}
+
+/** 整行是否**就是**一条哨兵记录：合法记录头 + scope 为 logger + 正文恰好是哨兵串。 */
+function isSentinelLine(line: string): boolean {
+  const head = MAIN_LOG_RECORD_HEAD_RE.exec(line);
+  if (!head || head[3] !== RECORD_FORMAT_SENTINEL_SCOPE) return false;
+  return line.slice(head[0].length).trim() === RECORD_FORMAT_SENTINEL_MSG;
 }

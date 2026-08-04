@@ -69,11 +69,6 @@ const ALLOWED_ROOT_SCOPES: readonly string[] = [
   'auth-boundary', //        鉴权边界校验
   'safe-storage', //         safeStorage 可用性与钥匙串降级(不含密文本身)
 
-  // ── 设备互联：连接层 ──────────────────────────────────────────────────────
-  // 根放行 + 子来源逐条排除(见 DENIED_SUB_SCOPES)。连接/心跳/重连是排障需要的,
-  // 媒体抓取与镜像缓存会把本地文件路径打进日志,必须排掉。
-  'device-link',
-
   // ── 配置与存量迁移基础设施 ────────────────────────────────────────────────
   'legacyUserDataMigration', // userData 目录迁移
   'legacy-xdmaker-migration', // 旧品牌数据迁移
@@ -84,10 +79,34 @@ const ALLOWED_ROOT_SCOPES: readonly string[] = [
 ];
 
 /**
+ * **精确匹配**放行的 scope：只放行写出来的这一个，其子 scope（`<name>:x` / `<name>/x`）
+ * 一律不跟着放行。
+ *
+ * 设备互联走这条而不是根放行，是 2026-08-04 review 的直接结论：`device-link` 作为根放行时，
+ * `device-link:ipc` 会跟着进来，而它在镜像缓存清理失败时把 `MirrorCachePurgeError` 整个写进
+ * 日志（`device-link/ipc.ts` 的 `queuePurgeRetry`），其中 `root` / `remaining` 是**本地缓存
+ * 文件路径**。当时靠一张排除表挡住了 media / mirror 那几个，却漏了 `ipc`——而这正是「根放行 +
+ * 逐条排除」的结构性问题：**新增的子 scope 默认是放行的**，与 deny-by-default 的方向相反。
+ * 改成精确匹配后，将来 device-link 下新增任何子 scope 都默认不上报，需要时显式加进来。
+ *
+ * 连接层要更细的诊断时，照 `renderer-console` 的做法把那部分拆成独立 scope 再加进本表，
+ * 不要把一个混着路径的 scope 整体放行。
+ */
+const ALLOWED_EXACT_SCOPES: readonly string[] = [
+  'device-link', //                     服务初始化、relay 连接/断开/重连、心跳
+  'device-link:cross-process-lock', //   跨进程锁的获取与释放(只有锁状态,无路径)
+];
+
+/**
  * 放行根下必须**逐条排除**的子来源：它们隶属放行的根，但会把用户路径 / 媒体内容
  * 打进日志（需求 §4.2 明确点了这类）。排除表优先于放行表。
+ *
+ * device-link 系已改为精确匹配（见 `ALLOWED_EXACT_SCOPES`），因此这里的 device-link 条目
+ * 现在是**纵深防御**：万一将来有人把 `device-link` 重新加回 `ALLOWED_ROOT_SCOPES`，
+ * 这张表仍然挡得住已知会打路径的那几个。
  */
 const DENIED_SUB_SCOPES: readonly string[] = [
+  'device-link:ipc', //                    镜像缓存清理失败时把 root / remaining 缓存路径写进日志
   'device-link:mediaFetch', //             抓取本地媒体,日志带绝对路径
   'device-link:mediaTransfer', //          传输进度,带文件名
   'device-link:outboundMedia', //          出站媒体,带文件名
@@ -149,10 +168,17 @@ export function isAllowedScope(scope: string): boolean {
   for (const denied of DENIED_SUB_SCOPES) {
     if (isUnderRoot(scope, denied)) return false;
   }
+  // 精确匹配优先于根匹配:这些 scope 的子 scope 不跟着放行(见 ALLOWED_EXACT_SCOPES)。
+  if (ALLOWED_EXACT_SCOPES.includes(scope)) return true;
   for (const root of ALLOWED_ROOT_SCOPES) {
     if (isUnderRoot(scope, root)) return true;
   }
   return false;
 }
 
-export const __testing = { ALLOWED_ROOT_SCOPES, DENIED_SUB_SCOPES, NOTABLE_DENIED_ROOTS };
+export const __testing = {
+  ALLOWED_ROOT_SCOPES,
+  ALLOWED_EXACT_SCOPES,
+  DENIED_SUB_SCOPES,
+  NOTABLE_DENIED_ROOTS,
+};

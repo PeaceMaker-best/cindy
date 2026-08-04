@@ -107,9 +107,13 @@ const CASES: Array<{ name: string; input: string; mustVanish: string[] }> = [
     mustVanish: ['my+private+question'],
   },
   {
+    // 头部刻意写成 `BEGIN FAKE PRIVATE KEY`(仓库安全门要求的显式假占位形态),
+    // `FAKE ` 仍落在正则的 `[A-Z ]*` 里,覆盖不受影响;正文也用一眼假的串而非 base64 样的
+    // 密钥材料,免得被 secret scanning 判成真私钥。
     name: 'PEM 私钥块',
-    input: '-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----',
-    mustVanish: ['MIIEowIBAAKCAQEA'],
+    input:
+      '-----BEGIN FAKE PRIVATE KEY-----\nNOT-A-REAL-KEY-body-for-tests\n-----END FAKE PRIVATE KEY-----',
+    mustVanish: ['NOT-A-REAL-KEY-body-for-tests'],
   },
 ];
 
@@ -163,11 +167,10 @@ describe('redact', () => {
   });
 
   it('同一段文本里的多个秘密都被抹掉（规则之间不互相遮挡）', () => {
-    const out = redact(
-      'Authorization: Bearer tok_aaaaaaaaaaaa | key=sk-proj-BBBBBBBBBBBBBBBBBB | user=dave@x.io',
-    );
-    expect(out).not.toContain('tok_aaaaaaaaaaaa');
-    expect(out).not.toContain('sk-proj-BBBBBBBBBBBBBBBBBB');
+    const bearer = 'tok_aaaaaaaaaaaa';
+    const out = redact(`Authorization: Bearer ${bearer} | key=${FAKE.skAnt} | user=dave@x.io`);
+    expect(out).not.toContain(bearer);
+    expect(out).not.toContain(FAKE.skAnt);
     expect(out).not.toContain('dave@x.io');
   });
 

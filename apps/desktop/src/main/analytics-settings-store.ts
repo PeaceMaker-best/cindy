@@ -124,6 +124,33 @@ function probeRecordOnce(): RecordProbe {
   return probed;
 }
 
+/**
+ * 盘上的同意记录**现在是否可读**。
+ *
+ * 「文件不存在」算可读:那是「从未同意」这个合法状态,不是读取故障。只有「文件在、但内容
+ * 解析不出来」才算不可读。
+ *
+ * 为什么需要它(2026-08-04 review P2):`createOverrideSettingsFile` 读到坏 JSON 会**吞掉
+ * 异常并返回默认值**,于是 `privacyConsentAccepted` 变成 `false`——与「用户明确没同意」
+ * 无法区分。日志上报的授权闸据此会判成「明确拒绝」并**清空待补传标记**,一次设置文件
+ * 读取故障就永久丢掉一个崩溃现场。有了这个探针,闸才能把它判成 `unknown`(不传、也不清)。
+ *
+ * 两道判据取交集:一是**现读**盘上的文件(捕捉此刻仍在盘上的损坏),二是进程启动期那次
+ * `probeRecordOnce()` 的结论(store 读到坏文件时会把它**删掉**,现读就再也看不到了,
+ * 而那次探针的结论是删除之前抓到的)。任一判为损坏即返回 false。
+ */
+export function isAnalyticsConsentRecordReadable(): boolean {
+  if (recordProbe === 'invalid') return false;
+  try {
+    const file = settingsFilePath();
+    if (!fs.existsSync(file)) return true;
+    const parsed: unknown = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    return Boolean(parsed) && typeof parsed === 'object' && !Array.isArray(parsed);
+  } catch {
+    return false;
+  }
+}
+
 export function readAnalyticsSettings(): AnalyticsSettings {
   probeRecordOnce();
   return store.read();

@@ -15,7 +15,7 @@ import {
   MAIN_LOG_RECORD_HEAD_RE,
   RECORD_FORMAT_SENTINEL_MSG,
 } from '../../../shared/mainLogRecordFormat';
-import { parseMainLogText } from '../mainLogReader';
+import { parseMainLogText, sentinelOffset, type RandomAccessFile } from '../mainLogReader';
 
 /** 造一条 main 日志行，格式与 logger.emit 的输出逐字符一致。 */
 function line(ts: string, level: string, scope: string, msg: string): string {
@@ -149,6 +149,61 @@ describe('读侧：伪造记录头无法把被封禁来源的内容送出去', (
     ].join('\n');
     const result = parseMainLogText(text, { fromFileStart: true, sentinelAlreadySeen: false });
     expect(result.records).toHaveLength(0);
+  });
+
+  /**
+   * 2026-08-04 review 指出的隐私逃逸路径：`sentinelOffset` 原先拿哨兵串去 `indexOf` 搜任意
+   * 位置，于是升级前未转义的正文里只要**出现过**这段文字（用户对话内容完全可以包含它），
+   * 那一行就被认成哨兵、置位 `sentinelAlreadySeen`，它后面伪造的放行记录头就全部绕过
+   * 「哨兵之前一律丢弃」这道闸。必须按完整记录头 + 哨兵正文校验整行。
+   */
+  describe('sentinelOffset：只认完整的哨兵记录行', () => {
+    function fileOf(text: string): RandomAccessFile {
+      const buf = Buffer.from(text, 'utf8');
+      return {
+        size: async () => buf.length,
+        read: async (offset: number, length: number) =>
+          buf.subarray(offset, Math.min(offset + length, buf.length)),
+      };
+    }
+
+    it('正常情况：哨兵在第一行，返回其行尾字节偏移', async () => {
+      const text = `${SENTINEL}\n${line(TS2, 'INFO ', 'lifecycle', 'after')}\n`;
+      const at = await sentinelOffset(fileOf(text));
+      expect(at).toBe(Buffer.byteLength(`${SENTINEL}\n`, 'utf8'));
+    });
+
+    it('⚠️ 正文里出现哨兵串但不是完整记录行 ⇒ 不认（这是原来的逃逸口）', async () => {
+      const text = [
+        line(TS1, 'DEBUG', 'voice-input:recorder', `用户说: ${RECORD_FORMAT_SENTINEL_MSG} 你看`),
+        line(TS2, 'DEBUG', 'voice-input:recorder', `[logger] ${RECORD_FORMAT_SENTINEL_MSG}`),
+      ].join('\n');
+      expect(await sentinelOffset(fileOf(text))).toBeNull();
+    });
+
+    it('scope 不是 logger 的同名正文 ⇒ 不认', async () => {
+      const text = `${line(TS1, 'INFO ', 'lifecycle', RECORD_FORMAT_SENTINEL_MSG)}\n`;
+      expect(await sentinelOffset(fileOf(text))).toBeNull();
+    });
+
+    it('偏移按字节算：哨兵前有中文内容时不会偏小（字符下标 ≠ 字节偏移）', async () => {
+      const cjk = line(TS1, 'INFO ', 'lifecycle', '中文日志内容占多字节');
+      const text = `${cjk}\n${SENTINEL}\n`;
+      const at = await sentinelOffset(fileOf(text));
+      expect(at).toBe(Buffer.byteLength(`${cjk}\n${SENTINEL}\n`, 'utf8'));
+      // 字符长度会明显小于字节长度,用它当偏移就会偏小。
+      expect(at).toBeGreaterThan(`${cjk}\n${SENTINEL}\n`.length);
+    });
+
+    it('被 headBytes 截断的半行哨兵 ⇒ 不认（宁可这一天采不到，也不放旧格式内容）', async () => {
+      const text = `${SENTINEL}\n`;
+      const truncated = Buffer.byteLength(SENTINEL, 'utf8') - 5;
+      expect(await sentinelOffset(fileOf(text), truncated)).toBeNull();
+    });
+
+    it('空文件 ⇒ null', async () => {
+      expect(await sentinelOffset(fileOf(''))).toBeNull();
+    });
   });
 
   it('产出的记录只有五个白名单字段（第四层）', () => {

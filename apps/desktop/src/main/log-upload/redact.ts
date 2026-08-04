@@ -44,7 +44,10 @@ const RULES: readonly RedactRule[] = [
   // ── 整头 / 整值 ────────────────────────────────────────────────────────────
   {
     // header 形态：`Authorization: Bearer xxx` / `Cookie: a=b; c=d`
-    // 值取到行尾或到明显的分隔符为止（日志行内常见 ` | ` / `, ` 拼接）。
+    // 值**一直取到行尾**（`[^\n]*`），不在 ` | ` / `, ` 这类分隔符处停。
+    // 这是有意的 over-redact：日志行常把多个字段拼在一行，若在分隔符处收手，
+    // 「Authorization 后面紧跟的那半截令牌」就会留在正文里。多抹掉同行后面的无关字段
+    // 只影响排障效率，漏抹是隐私事故。
     name: 'auth-header',
     pattern: new RegExp(`\\b(${AUTH_HEADER_NAMES})\\s*:\\s*[^\\n]*`, 'gi'),
     replace: (_m, name: string) => `${name}: ${tag('auth-header')}`,

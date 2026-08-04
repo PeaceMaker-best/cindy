@@ -17,6 +17,7 @@
  */
 
 import { app } from 'electron';
+import fs from 'node:fs';
 import path from 'node:path';
 
 import { desktopMakerLogger } from '../maker-host/logger-adapter.js';
@@ -63,6 +64,24 @@ const store = createOverrideSettingsFile<LogUploadSettings>({
  */
 export function refreshLogUploadSettingsFromDisk(): void {
   store.invalidateIfChanged();
+}
+
+/**
+ * 盘上的开关记录**现在是否可读**。语义与 `isAnalyticsConsentRecordReadable()` 一致：
+ * 文件不存在算可读（= 从未自定义，跟随默认值关闭），只有「在、但解析不出来」算不可读。
+ *
+ * 同样是为了让授权闸能把「读取故障」判成 `unknown` 而不是「用户把开关关了」——后者会
+ * 清空待补传标记，一次坏文件就永久丢掉崩溃现场（2026-08-04 review P2）。
+ */
+export function isLogUploadSettingsReadable(): boolean {
+  try {
+    const file = settingsFilePath();
+    if (!fs.existsSync(file)) return true;
+    const parsed: unknown = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    return Boolean(parsed) && typeof parsed === 'object' && !Array.isArray(parsed);
+  } catch {
+    return false;
+  }
 }
 
 export function readLogUploadSettings(): LogUploadSettings {

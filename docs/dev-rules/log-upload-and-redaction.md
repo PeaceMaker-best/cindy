@@ -63,8 +63,14 @@ override 语义见 [`configuration-and-overrides.md`](configuration-and-override
 - **新增诊断来源需要显式加入名单**，这是有意为之的代价，不是待优化项。
 - 名单**只增不减**方向上的「增」也要过 review：每条都要写明理由，理由写不出来的不该加。
 - `console` 永远不进名单：它是第三方库与任何漏网 `console.log` 的兜底落点，内容不可控。
-- 放行根下携带用户路径／媒体内容的子来源必须逐条排除（`DENIED_SUB_SCOPES`），排除表优先于
-  放行表。
+- **一个 root 只要有任何子 scope 会打用户内容，这个 root 就不该做根放行**，改用
+  `ALLOWED_EXACT_SCOPES` 精确匹配。根放行 + 逐条排除是个陷阱：**新增的子 scope 默认是放行
+  的**，方向与 deny-by-default 相反。设备互联就是这么漏的——`device-link` 曾作为根放行，
+  排除表挡住了 media / mirror 那几个，却漏了 `device-link:ipc`（它在镜像缓存清理失败时把本地
+  缓存文件路径写进日志）。`DENIED_SUB_SCOPES` 现在只作为纵深防御保留。
+- 需要某个 scope 里的一部分诊断信息、而它整体又混着用户内容时，**拆 scope**，不要整体放行。
+  已有两个先例：`renderer-console` 从 `renderer-guard` 拆出（前者是渲染进程任意 console 正文，
+  后者只有加载失败信号）；device-link 的连接层与 IPC 层分开对待。
 - 渲染进程转发的日志整类不放行——`writeFromRenderer()` 强制 `r:` 前缀，而匹配是根锚定的。
   不要把匹配改成裸 `startsWith`。
 
@@ -105,6 +111,13 @@ override 语义见 [`configuration-and-overrides.md`](configuration-and-override
   判定前调 `refreshFromDisk()`（mtime 守卫，文件没变时零开销）。
 - 授权状态**读不出来时是 `unknown`，不是 `denied`**：不上传，但保留标记，把最终判定留给下次
   启动的可靠读取。用一次读取失败永久丢掉一个崩溃现场是不可接受的。
+  ⚠️ 这条有个反直觉的实现要求：`createOverrideSettingsFile` 读到坏 JSON **会吞掉异常并返回
+  默认值**，所以「文件损坏」与「用户明确没同意 / 明确关掉开关」在返回值上一模一样。闸的
+  `readPrivacyConsentAccepted` / `readCrashAutoUploadEnabled` 因此必须先用
+  `isAnalyticsConsentRecordReadable()` / `isLogUploadSettingsReadable()` 探一次，探到「文件在但
+  解析不出来」时**抛异常**——只返回 `false` 会让闸判成 denied 并清空待补传标记。
+  这两个探针取「现读盘」与「启动期 probe 结论」的交集：store 读到坏文件时会把它删掉，
+  只现读就看不到了。
 - 不做「上传前逐次弹窗确认」：手动路径本身就是用户点的；崩溃路径弹窗在崩溃时刻不可能可靠展示。
 
 ## 4. 上报目标与区域

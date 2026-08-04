@@ -128,8 +128,9 @@ export function loadLogUploadTargets({ repoRoot = REPO_ROOT, configPath } = {}) 
       throw new Error(
         `日志上报配置缺少必填区域 ${region}: ${file}\n` +
           '发行区域的上报目标缺失属发版事故(功能会静默关闭、发版后才发现观测真空),' +
-          '因此这里硬失败。确实要临时关掉某区域时,显式在配置里写 null 之外的手段都不接受——' +
-          '请改需求或改本模块的 OPTIONAL_REGIONS 并说明理由。',
+          '因此这里硬失败。注意**缺 key 和显式写 null 都不接受**,两者都会走到这里——' +
+          '想临时关掉某个发行区域的上报,只能把它加进本模块的 OPTIONAL_REGIONS 并在 PR 里' +
+          '说明理由,不存在「在配置里写个 null 就静默关掉」这条路。',
       );
     }
     targets[region] = target;

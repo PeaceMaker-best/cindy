@@ -29,6 +29,7 @@ import {
 } from '../../shared/logUpload';
 import * as authManager from '../authManager';
 import {
+  isAnalyticsConsentRecordReadable,
   readAnalyticsSettings,
   refreshAnalyticsSettingsFromDisk,
 } from '../analytics-settings-store';
@@ -48,6 +49,7 @@ import {
   clearCrashAutoUploadOverride,
   isCrashAutoUploadCustomized,
   isCrashAutoUploadEnabled,
+  isLogUploadSettingsReadable,
   refreshLogUploadSettingsFromDisk,
   setCrashAutoUploadEnabled,
 } from './logUploadSettingsStore';
@@ -121,8 +123,23 @@ const gateDeps: ConsentGateDeps = {
     refreshAnalyticsSettingsFromDisk();
     refreshLogUploadSettingsFromDisk();
   },
-  readPrivacyConsentAccepted: () => readAnalyticsSettings().privacyConsentAccepted,
-  readCrashAutoUploadEnabled: () => isCrashAutoUploadEnabled(),
+  // ⚠️ 读不出来必须**抛**,不能返回 false(2026-08-04 review P2)。
+  // 两个 store 都基于 createOverrideSettingsFile,它读到坏 JSON 会吞掉异常并返回默认值
+  // ——于是「文件损坏」和「用户明确没同意 / 明确关掉开关」在返回值上完全一样。闸把前者
+  // 判成「明确拒绝」的后果是 runUpload 走 denied 分支**清空待补传标记**:一次设置文件
+  // 读取故障就永久丢掉一个崩溃现场。抛出来才能让闸判 `unknown`(不传、也不清、留给下次启动)。
+  readPrivacyConsentAccepted: () => {
+    if (!isAnalyticsConsentRecordReadable()) {
+      throw new Error('analytics settings record is present but unreadable');
+    }
+    return readAnalyticsSettings().privacyConsentAccepted;
+  },
+  readCrashAutoUploadEnabled: () => {
+    if (!isLogUploadSettingsReadable()) {
+      throw new Error('log-upload settings record is present but unreadable');
+    }
+    return isCrashAutoUploadEnabled();
+  },
 };
 
 /** 打开一个只能随机读的文件句柄。不存在 / 不可读返回 null（跳过，不算失败）。 */

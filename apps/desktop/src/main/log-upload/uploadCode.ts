@@ -21,7 +21,8 @@ export function generateUploadCode(randomBytes: RandomBytes): string {
   const limit = Math.floor(256 / alphabet.length) * alphabet.length;
   const chars: string[] = [];
   while (chars.length < UPLOAD_CODE_LENGTH) {
-    // 一次多取一些,减少系统调用;丢弃率 < 3%,一轮基本够。
+    // 一次多取一些,减少系统调用。字符集 30 个字符 ⇒ limit = 240,落在 [240, 256) 的
+    // 16 个字节被丢弃,丢弃率 16/256 = 6.25%;取 2× 长度一轮基本够。
     const bytes = randomBytes(UPLOAD_CODE_LENGTH * 2);
     for (const byte of bytes) {
       if (byte >= limit) continue;
