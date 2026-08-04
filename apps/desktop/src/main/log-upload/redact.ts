@@ -87,7 +87,22 @@ const RULES: readonly RedactRule[] = [
     replace: (_m, name: string) => `${name}=${tag('sensitive-field')}`,
   },
   {
-    // k=v / k: v（非 JSON）。值取到空白、`&`、`;`、`,`、`"`、`'` 为止。
+    // util.format 渲染对象时值**带引号**：`{ token: 'opaqueSecret' }` 在 main 日志里就是
+    // `token: 'opaqueSecret'`（键无引号、值单引号；含单引号时 Node 会换双引号或反引号）。
+    // 这形态两头不着：`sensitive-field-json` 要求键带双引号，不命中；`sensitive-field-kv`
+    // 的值类 `[^\s&;,"']` 把引号排除在外，遇到引号开头一个字符都匹配不到 —— 于是这个**最
+    // 常见的对象渲染形态**反而漏网（2026-08-04 review P1）。这条专吃「引号包起来的值」，
+    // 连引号带内容整段抹掉，匹配到成对的闭合引号（`\\.` 吃转义，`(?!\\2)` 防止跨过闭合引号）。
+    // 放在 kv 之前（kv 是无引号兜底）、auth-scheme 之后（后者管无引号的 `=Bearer xxx`）。
+    name: 'sensitive-field-quoted',
+    pattern: new RegExp(
+      `\\b(${SENSITIVE_FIELD_NAMES})\\s*[:=]\\s*(['"\`])(?:\\\\.|(?!\\2)[^\\n])*\\2`,
+      'gi',
+    ),
+    replace: (_m, name: string) => `${name}=${tag('sensitive-field')}`,
+  },
+  {
+    // k=v / k: v（非 JSON、值不带引号）。值取到空白、`&`、`;`、`,`、`"`、`'` 为止。
     name: 'sensitive-field-kv',
     pattern: new RegExp(`\\b(${SENSITIVE_FIELD_NAMES})\\s*[:=]\\s*([^\\s&;,"']+)`, 'gi'),
     replace: (_m, name: string) => `${name}=${tag('sensitive-field')}`,

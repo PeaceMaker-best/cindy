@@ -102,21 +102,57 @@ const store = createOverrideSettingsFile<AnalyticsSettings>({
 type RecordProbe = 'none' | 'valid' | 'invalid';
 let recordProbe: RecordProbe | null = null;
 
-function probeRecordOnce(): RecordProbe {
-  if (recordProbe !== null) return recordProbe;
-  let probed: RecordProbe;
+/** 本 store 会落盘的 boolean 字段。盘上若带这些键却不是 boolean,一定不是本 writer 写的。 */
+const BOOLEAN_FIELDS = [
+  'privacyConsentAccepted',
+  'analyticsEnabled',
+  'legacyConsentMigrationClosed',
+] as const;
+
+/**
+ * 纯分类：给定盘上内容（`null` = 文件不存在）判 none / valid / invalid。抽出来是为了不碰 fs
+ * 也能单测。
+ *
+ * 「能解析成 object」还不够（2026-08-04 review copilot）：`createOverrideSettingsFile` 的 writer
+ * 在 override 清空时**删文件**、从不落 `{}`，写入时 `normalize` 保证已知字段都是 boolean。
+ * 所以盘上出现空对象、或已知字段存在却非 boolean，都不可能来自本 writer —— 是外部手改或半截
+ * 写入。当成 valid 会让 `isAnalyticsConsentRecordReadable()` 误判「可读但未同意」，闸走 denied
+ * 清空待补传标记；判 invalid 让闸走 `unknown`（不传也不清）。
+ *
+ * 迁移不受影响：`migrateExistingLoginAsConsented` 只在 `=== 'none'` 时迁移，而 `{}` 无论算
+ * valid 还是 invalid 都 `!== 'none'`，结论一致（都不迁移）。
+ */
+function classifyAnalyticsContent(fileContent: string | null): RecordProbe {
+  if (fileContent === null) return 'none';
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fileContent);
+  } catch {
+    return 'invalid';
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return 'invalid';
+  const obj = parsed as Record<string, unknown>;
+  if (Object.keys(obj).length === 0) return 'invalid';
+  for (const field of BOOLEAN_FIELDS) {
+    if (field in obj && typeof obj[field] !== 'boolean') return 'invalid';
+  }
+  return 'valid';
+}
+
+/** 现读盘一次并分类（文件不存在 ⇒ none；读盘本身失败 ⇒ invalid，绝不当「没有记录」）。 */
+function probeSettingsFileNow(): RecordProbe {
   try {
     const file = settingsFilePath();
-    if (!fs.existsSync(file)) {
-      probed = 'none';
-    } else {
-      const parsed: unknown = JSON.parse(fs.readFileSync(file, 'utf-8'));
-      probed = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? 'valid' : 'invalid';
-    }
+    if (!fs.existsSync(file)) return 'none';
+    return classifyAnalyticsContent(fs.readFileSync(file, 'utf-8'));
   } catch {
-    // 读不出来 / 解析失败都算「存在但非法」,绝不当成「没有记录」。
-    probed = 'invalid';
+    return 'invalid';
   }
+}
+
+function probeRecordOnce(): RecordProbe {
+  if (recordProbe !== null) return recordProbe;
+  const probed = probeSettingsFileNow();
   recordProbe = probed;
   if (probed !== 'none') {
     log.info('analytics settings record probed', { probe: probed });
@@ -135,20 +171,18 @@ function probeRecordOnce(): RecordProbe {
  * 无法区分。日志上报的授权闸据此会判成「明确拒绝」并**清空待补传标记**,一次设置文件
  * 读取故障就永久丢掉一个崩溃现场。有了这个探针,闸才能把它判成 `unknown`(不传、也不清)。
  *
- * 两道判据取交集:一是**现读**盘上的文件(捕捉此刻仍在盘上的损坏),二是进程启动期那次
- * `probeRecordOnce()` 的结论(store 读到坏文件时会把它**删掉**,现读就再也看不到了,
- * 而那次探针的结论是删除之前抓到的)。任一判为损坏即返回 false。
+ * 两道判据取交集:一是进程启动期那次 `probeRecordOnce()` 的结论(store 读到坏文件时会把它
+ * **删掉**,现读就再也看不到了,而那次探针的结论是删除之前抓到的),二是**现读**盘上的文件
+ * (捕捉此刻仍在盘上的损坏)。任一判为损坏即返回 false。
+ *
+ * ⚠️ 先跑一次 `probeRecordOnce()`(2026-08-04 review copilot):本函数原先只读 `recordProbe`
+ * 的现值,若从没有别的入口触发过探针,那次「删除之前」的启动快照就丢了,损坏文件被删后现读
+ * 看到「文件不存在 ⇒ 可读」,闸误判「可读但未同意」清空标记。probeRecordOnce 幂等,首次调用
+ * 抓快照,之后是零成本读缓存。
  */
 export function isAnalyticsConsentRecordReadable(): boolean {
-  if (recordProbe === 'invalid') return false;
-  try {
-    const file = settingsFilePath();
-    if (!fs.existsSync(file)) return true;
-    const parsed: unknown = JSON.parse(fs.readFileSync(file, 'utf-8'));
-    return Boolean(parsed) && typeof parsed === 'object' && !Array.isArray(parsed);
-  } catch {
-    return false;
-  }
+  if (probeRecordOnce() === 'invalid') return false;
+  return probeSettingsFileNow() !== 'invalid';
 }
 
 export function readAnalyticsSettings(): AnalyticsSettings {
@@ -332,6 +366,7 @@ export const __testing = {
   DEFAULTS,
   isReportingBuild,
   DEV_REPORTING_ENV,
+  classifyAnalyticsContent,
   resetProbe(): void {
     recordProbe = null;
   },

@@ -57,7 +57,8 @@ const ALLOWED_ROOT_SCOPES: readonly string[] = [
   'heartbeat', //            在线心跳(网络可达性的连续信号)
 
   // ── 数据库 ────────────────────────────────────────────────────────────────
-  'localDb', //              主库打开、migration、完整性
+  // 注意:`localDb` **不在这里**,它是精确放行(见 ALLOWED_EXACT_SCOPES)——它的子 scope
+  // `localDb/messages` 会打消息导入/媒体附件路径,根放行会把它一起带出去。
   'DbClient', //             连接与语句层错误
   'db-worker', //            worker 进程存活与崩溃
   'schema-drift-detector', // schema 漂移检测
@@ -95,6 +96,10 @@ const ALLOWED_ROOT_SCOPES: readonly string[] = [
 const ALLOWED_EXACT_SCOPES: readonly string[] = [
   'device-link', //                     服务初始化、relay 连接/断开/重连、心跳
   'device-link:cross-process-lock', //   跨进程锁的获取与释放(只有锁状态,无路径)
+  // 主库打开 / migration / schema 漂移 / 完整性 / fatal —— bare `localDb` 只打这些基础设施
+  // 事件(dbPath 会经家目录脱敏,userId 本就是上报身份)。精确放行而非根放行:子 scope
+  // `localDb/messages` 打消息导入与媒体附件路径,`localDb/*` 一律不跟着放行(2026-08-04 review)。
+  'localDb',
 ];
 
 /**
@@ -106,6 +111,9 @@ const ALLOWED_EXACT_SCOPES: readonly string[] = [
  * 这张表仍然挡得住已知会打路径的那几个。
  */
 const DENIED_SUB_SCOPES: readonly string[] = [
+  // localDb 已改精确放行(见 ALLOWED_EXACT_SCOPES),这条是纵深防御:万一有人把 `localDb`
+  // 重新加回根放行,消息导入 / 媒体附件路径这条仍然挡得住。
+  'localDb/messages', //                   外部消息导入、附件/媒体清理,带文件路径与 session 投影
   'device-link:ipc', //                    镜像缓存清理失败时把 root / remaining 缓存路径写进日志
   'device-link:mediaFetch', //             抓取本地媒体,日志带绝对路径
   'device-link:mediaTransfer', //          传输进度,带文件名

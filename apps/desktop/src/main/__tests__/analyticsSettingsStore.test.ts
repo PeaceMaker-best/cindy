@@ -371,3 +371,47 @@ describe('analytics build gate', () => {
     expect(store.isAnalyticsAllowed()).toBe(false);
   });
 });
+
+/**
+ * `classifyAnalyticsContent` 是「盘上记录是否可信」判据里不碰 fs 的纯核心
+ * （2026-08-04 review copilot：`{}` 与非 boolean 已知字段都不该当 valid）。
+ */
+describe('classifyAnalyticsContent', () => {
+  let classify: (c: string | null) => 'none' | 'valid' | 'invalid';
+
+  beforeEach(async () => {
+    classify = (await importStore()).__testing.classifyAnalyticsContent;
+  });
+
+  it('文件不存在 ⇒ none', () => {
+    expect(classify(null)).toBe('none');
+  });
+
+  it('本 writer 会产出的形状 ⇒ valid', () => {
+    expect(classify(JSON.stringify({ privacyConsentAccepted: true, analyticsEnabled: false }))).toBe(
+      'valid',
+    );
+  });
+
+  it('⚠️ 空对象 `{}` ⇒ invalid（writer 清空 override 时删文件，从不落 `{}`）', () => {
+    expect(classify('{}')).toBe('invalid');
+  });
+
+  it('⚠️ 已知字段存在却不是 boolean ⇒ invalid', () => {
+    expect(classify(JSON.stringify({ privacyConsentAccepted: 'yes' }))).toBe('invalid');
+    expect(classify(JSON.stringify({ analyticsEnabled: 1 }))).toBe('invalid');
+    expect(classify(JSON.stringify({ legacyConsentMigrationClosed: null }))).toBe('invalid');
+  });
+
+  it('坏 JSON / 非对象 / 数组 ⇒ invalid', () => {
+    expect(classify('{ not json')).toBe('invalid');
+    expect(classify('"str"')).toBe('invalid');
+    expect(classify('[]')).toBe('invalid');
+    expect(classify('null')).toBe('invalid');
+  });
+
+  it('含未知键但已知字段合法（前向兼容）⇒ valid', () => {
+    expect(classify(JSON.stringify({ privacyConsentAccepted: true, futureKey: 1 }))).toBe('valid');
+    expect(classify(JSON.stringify({ futureKey: 1 }))).toBe('valid');
+  });
+});

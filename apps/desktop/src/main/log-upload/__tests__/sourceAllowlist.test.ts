@@ -18,7 +18,7 @@ describe('放行：基础设施来源', () => {
     ['startup-diagnostics', '退出尸检结论'],
     ['updateService', '更新链路'],
     ['clientEndpoints', '端点清单拉取'],
-    ['localDb', '数据库'],
+    ['DbClient', '数据库连接与语句层错误'],
     ['authManager', '鉴权'],
     ['logger', '格式哨兵'],
   ])('%s 放行（%s）', (scope) => {
@@ -26,19 +26,16 @@ describe('放行：基础设施来源', () => {
   });
 
   it.each([
-    'localDb/messages',
-    'localDb/betterSqliteFactory',
-    'git-context/ipc', // ← 不在名单里,见下面的 deny 用例
-  ])('子 scope 跟随根的判定：%s', (scope) => {
-    const root = scope.split(/[/:]/)[0];
-    expect(isAllowedScope(scope)).toBe(isAllowedScope(root));
+    'authManager/refresh',
+    'updateService:download',
+    'clientEndpoints/resolve',
+  ])('根放行的子 scope 跟随根：%s', (scope) => {
+    expect(isAllowedScope(scope)).toBe(true);
   });
 
   it('两种子 scope 分隔符都认（仓库里 / 与 : 都在用）', () => {
-    // 用 localDb 举例:它是根放行,子 scope 跟随。device-link 反过来是精确匹配,
-    // 见下方「device-link：精确匹配」那组。
-    expect(isAllowedScope('localDb/messages')).toBe(true);
-    expect(isAllowedScope('localDb:messages')).toBe(true);
+    expect(isAllowedScope('authManager/refresh')).toBe(true);
+    expect(isAllowedScope('authManager:refresh')).toBe(true);
   });
 });
 
@@ -153,6 +150,32 @@ describe('device-link：精确匹配，子 scope 不跟着放行', () => {
   it('精确表里的条目不得同时出现在根表里（否则又退回根放行）', () => {
     for (const exact of __testing.ALLOWED_EXACT_SCOPES) {
       expect(__testing.ALLOWED_ROOT_SCOPES).not.toContain(exact);
+    }
+  });
+});
+
+/**
+ * localDb 同理走**精确匹配**（2026-08-04 review）：根放行会把 `localDb/messages`（消息导入 /
+ * 媒体附件路径）一起带出去。bare `localDb` 只打库打开 / migration / 完整性这些基础设施事件。
+ */
+describe('localDb：精确匹配，子 scope 不跟着放行', () => {
+  it('bare localDb 放行', () => {
+    expect(isAllowedScope('localDb')).toBe(true);
+  });
+
+  it('⚠️ localDb/messages 不放行（消息导入与媒体附件路径）', () => {
+    expect(isAllowedScope('localDb/messages')).toBe(false);
+    expect(isAllowedScope('localDb:messages')).toBe(false);
+  });
+
+  it('localDb 下任何未列出的子 scope 默认不放行（含将来新增的）', () => {
+    for (const scope of [
+      'localDb/betterSqliteFactory',
+      'localDb/sqliteVec',
+      'localDb/dailySpend',
+      'localDb/some-future-sub-scope',
+    ]) {
+      expect(isAllowedScope(scope)).toBe(false);
     }
   });
 });

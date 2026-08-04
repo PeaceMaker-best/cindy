@@ -231,6 +231,48 @@ describe('redact', () => {
       expect(out).toContain('elapsed=812ms');
     });
   });
+
+  /**
+   * 2026-08-04 review P1 的回归锁：main logger 用 `util.format` 渲染对象参数，敏感字段的值
+   * 会**带引号**（`{ token: 'x' }` → `token: 'x'`）。JSON 规则要求键带双引号、kv 规则的值类
+   * 排除引号，于是这个最常见的对象渲染形态两头漏网。
+   */
+  describe('⚠️ util.format 渲染的带引号敏感值：连引号带内容一起抹掉', () => {
+    const SECRET = 'opaqueSecretValue0123456789';
+    const FORMS = [
+      `metadata { token: '${SECRET}' }`, // 单引号（Node 默认）
+      `ctx { password: "${SECRET}" }`, // 双引号
+      `probe { refresh_token: '${SECRET}' }`, // 下划线字段
+      `hdr { client_secret: '${SECRET}' }`,
+      `obj { api_key: '${SECRET}', ok: true }`, // 后面还有别的字段
+      `cookie { session_key: 'Bearer ${SECRET} extra' }`, // 值里带空格/scheme
+    ];
+
+    it.each(FORMS)('%s', (input) => {
+      expect(redact(input)).not.toContain(SECRET);
+    });
+
+    it('值里含转义引号也吃到正确的闭合引号', () => {
+      // util.inspect 对含单引号的串会改用双引号或转义;这里验证 \\' 不会被当成闭合。
+      expect(redact(`{ token: 'ab\\'cd${SECRET}' }`)).not.toContain(SECRET);
+    });
+
+    it('规则顺序：quoted 在 kv 之前、auth-scheme 之后', () => {
+      const names = __testing.RULES.map((r) => r.name);
+      expect(names.indexOf('sensitive-field-auth-scheme')).toBeLessThan(
+        names.indexOf('sensitive-field-quoted'),
+      );
+      expect(names.indexOf('sensitive-field-quoted')).toBeLessThan(
+        names.indexOf('sensitive-field-kv'),
+      );
+    });
+
+    it('不误伤非敏感字段的带引号值', () => {
+      const out = redact(`{ channel: 'stable', mode: 'fast' }`);
+      expect(out).toContain("channel: 'stable'");
+      expect(out).toContain("mode: 'fast'");
+    });
+  });
 });
 
 describe('homeUserName', () => {
