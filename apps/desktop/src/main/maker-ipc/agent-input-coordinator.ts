@@ -41,6 +41,7 @@ import type {
   AgentInputRecovery,
   AgentInputSessionReferenceContext,
   AutoResumeInfo,
+  RecoveryCheckpoint,
 } from '../../shared/agentInputQueue.js';
 import {
   buildMakerUserMessage,
@@ -56,6 +57,11 @@ import {
   syntheticTriggerKind,
 } from '../../shared/interruptedTurn.js';
 import { attachSessionReferenceMetadata } from '../../shared/sessionReferenceMetadata.js';
+import {
+  appendRecoveryCheckpointPrompt,
+  buildRecoveryCheckpoint,
+  type RecoveryContextSnapshot,
+} from './recoveryCoordinator.js';
 
 const log = createLogger('maker-input-coordinator');
 const SESSION_RUNNING_RETRY_DELAY_MS = 250;
@@ -194,6 +200,7 @@ export interface AgentInputSendOpts {
      */
     autoResume?: boolean;
     autoResumeInfo?: AutoResumeInfo;
+    recoveryCheckpoint?: RecoveryCheckpoint;
     /**
      * 仅写入 user 行的 agentMeta,不传给 maker-core。Orca 等自动队列来源没有
      * 对应的 SendOrigin 变体,但仍不能被 host 当成真人输入来给 episode 充值。
@@ -253,6 +260,11 @@ export interface AgentInputCoordinatorDeps {
   hasPendingInteraction: (sessionId: string) => boolean;
   getAgentKind: (sessionId: string) => AgentInputCreateOpts['agentKind'] | null;
   getSdkSessionId: (sessionId: string) => Promise<string | undefined>;
+  /** Read a bounded, durable progress snapshot before a retry is re-enqueued. */
+  getRecoveryContextSnapshot?: (
+    sessionId: string,
+    userClientId: string,
+  ) => Promise<RecoveryContextSnapshot>;
   /**
    * interrupted-turn-resume:判断某条已派发 user 消息之后 agent 是否已产出内容
    * (assistant / tool_use / thinking 持久化行)。retryLastError 用它决定语义:
@@ -1811,7 +1823,8 @@ export class AgentInputCoordinator {
     let progressKnown = false;
     const previousAutoResumeInfo = opts?.auto ? state.autoResumePending : null;
     const attemptToken = opts?.auto ? opts.attemptToken ?? null : null;
-    const continueText = CONTINUE_AFTER_ERROR_PROMPT;
+    let continueText = CONTINUE_AFTER_ERROR_PROMPT;
+    let recoveryCheckpoint: RecoveryCheckpoint | undefined;
     if (recovery.kind === 'active-turn' && this.deps.hasAssistantProgressAfter) {
       let hasProgress = false;
       try {
@@ -1838,6 +1851,29 @@ export class AgentInputCoordinator {
         return { projection: this.getProjection(sessionId), outcome: 'superseded' };
       }
       if (hasProgress) {
+        if (this.deps.getRecoveryContextSnapshot) {
+          try {
+            const snapshot = await this.deps.getRecoveryContextSnapshot(
+              sessionId,
+              recovery.item.clientId,
+            );
+            recoveryCheckpoint = buildRecoveryCheckpoint(
+              opts?.auto ? 'automatic' : 'manual',
+              recovery.item.clientId,
+              recovery.item.recoveryCheckpoint,
+              snapshot,
+              opts?.auto ? previousAutoResumeInfo?.attempt : undefined,
+            );
+            continueText = appendRecoveryCheckpointPrompt(continueText, recoveryCheckpoint);
+          } catch (err) {
+            // Recovery must remain available if the optional read races DB
+            // shutdown. The generic continuation is the safe fallback.
+            log.warn('recovery checkpoint read failed; using generic continuation', {
+              sessionId,
+              error: errorMessage(err),
+            });
+          }
+        }
         const clientId = crypto.randomUUID();
         continueItem = {
           ...recovery.item,
@@ -1846,6 +1882,7 @@ export class AgentInputCoordinator {
           originalSyntheticTrigger: 'continue',
           persistedContent: continueText,
           autoResume: opts?.auto ? true : undefined,
+          recoveryCheckpoint,
           // 人工 Retry 是新的真人介入周期，不能继承上一轮隐藏自动消息的标记；自动路径
           // 则把展示信息随消息落库，成为「已重新连接」活动行的 param 位与展开详情。
           autoResumeInfo: opts?.auto ? previousAutoResumeInfo ?? undefined : undefined,
@@ -2537,6 +2574,10 @@ export class AgentInputCoordinator {
     const projected = { ...item };
     delete projected.trustedSessionReferenceContexts;
     delete projected.sessionReferencesRequireTrustedSnapshot;
+    // Recovery hints are main-owned evidence for the next vendor turn, not
+    // renderer/device-link payload. Keep the projection minimal and avoid
+    // echoing transcript-derived summaries to remote controllers.
+    delete projected.recoveryCheckpoint;
     return projected;
   }
 
@@ -2745,6 +2786,7 @@ export class AgentInputCoordinator {
             // host 靠它跳过额度充值(见 AgentInputQueuedMessage.autoResume)。
             ...(head.autoResume ? { autoResume: true } : {}),
             ...(head.autoResumeInfo ? { autoResumeInfo: head.autoResumeInfo } : {}),
+            ...(head.recoveryCheckpoint ? { recoveryCheckpoint: head.recoveryCheckpoint } : {}),
             ...(head.origin ? { origin: head.origin } : {}),
             shouldBroadcast: () => this.isTurnGenerationCurrent(sessionId, active),
             onPersisting: () => {
