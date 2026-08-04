@@ -293,7 +293,52 @@ describe('ModelSelector provider groups', () => {
     expect(fallbackRow.getAttribute('aria-selected')).toBe('true');
 
     fireEvent.click(fallbackRow);
-    expect(onProviderChange).toHaveBeenCalledWith('xd', modelId);
+    expect(onProviderChange).toHaveBeenCalledWith('xd', modelId, 'high');
+  });
+
+  it('returns the target provider effort for the same model id', async () => {
+    const modelId = 'shared-model';
+    const anthropicModel = {
+      id: modelId,
+      name: 'Shared Model',
+      contextWindow: 200000,
+      efforts: ['low', 'high'],
+      defaultEffort: 'high',
+    };
+    const xdModel = {
+      ...anthropicModel,
+      efforts: ['low'],
+      defaultEffort: 'low',
+    };
+    providersRef.providers = [
+      {
+        ...(providersRef.DEFAULT_PROVIDERS[0] as Record<string, unknown>),
+        models: { 'claude-code': [anthropicModel] },
+      },
+      {
+        id: 'xd',
+        name: 'Cindy AI',
+        source: 'builtin',
+        agents: ['claude-code'],
+        auth: { method: 'api-key' },
+        routing: { 'claude-code': {} },
+        connected: true,
+        models: { 'claude-code': [xdModel] },
+      },
+    ] as unknown[];
+    const onProviderChange = vi.fn();
+
+    try {
+      renderSelector({ modelId, effort: 'high', currentProviderId: 'anthropic', onProviderChange });
+      await openDropdown();
+      const xdGroup = within(screen.getByTestId('model-options-popover')).getByRole('group', {
+        name: 'Cindy AI',
+      });
+      fireEvent.click(within(xdGroup).getByRole('option', { name: /Shared Model/ }));
+      expect(onProviderChange).toHaveBeenCalledWith('xd', modelId, 'low');
+    } finally {
+      providersRef.providers = providersRef.DEFAULT_PROVIDERS;
+    }
   });
 
   it('does not render group headings in flat mode (no onProviderChange)', async () => {

@@ -11,7 +11,11 @@ import { extractIpcError } from '@/utils/ipcError';
 import { Tip } from '@/components/ui/tooltip';
 import { useAgentCapabilities } from '@/hooks/useAgentCapabilities';
 import { useProviders } from '@/hooks/useProviders';
-import { sessionModelSupportsFastMode } from '@cindy/model-providers';
+import {
+  effectiveSourceIdForModel,
+  getModel,
+  sessionModelSupportsFastMode,
+} from '@cindy/model-providers';
 import type { UtilityTextAttemptReason, UtilityTextFailure } from '../../../../shared/utilityTextResult';
 import { useFeishuBot } from '@/hooks/useFeishuBot';
 import { useProjectPickerOptions } from '@/hooks/useProjectPickerOptions';
@@ -414,9 +418,22 @@ export function ScheduleFormDialog({
 
   const currentModel = useMemo(() => {
     const list = caps.capabilities?.availableModels ?? [];
-    if (form.model) return list.find((m) => m.id === form.model);
-    return list[0];
+    return form.model ? list.find((m) => m.id === form.model) : undefined;
   }, [caps.capabilities, form.model]);
+
+  const currentModelEfforts = useMemo(() => {
+    if (!form.model) return undefined;
+    const sourceId = effectiveSourceIdForModel(
+      providers,
+      form.providerId || null,
+      form.model,
+      form.agentKind,
+    );
+    const source = sourceId ? providers.find((provider) => provider.id === sourceId) : undefined;
+    return source
+      ? getModel(source, form.model, form.agentKind)?.efforts
+      : currentModel?.efforts;
+  }, [currentModel, form.agentKind, form.model, form.providerId, providers]);
 
   // form.model 为空时回填默认模型（三级回退,所见即所存）。
   // 覆盖历史遗留的空 model 任务（编辑打开时回填）；若不回填,提交后落库是
@@ -431,10 +448,10 @@ export function ScheduleFormDialog({
   }, [form.model, form.agentKind, form.targetSessionId, setField]);
 
   useEffect(() => {
-    if (!currentModel || !form.effort) return;
-    const allowed = currentModel.efforts as readonly string[];
+    if (!currentModelEfforts || !form.effort) return;
+    const allowed = currentModelEfforts as readonly string[];
     if (!allowed.includes(form.effort)) setField('effort', '');
-  }, [currentModel, form.effort, setField]);
+  }, [currentModelEfforts, form.effort, setField]);
 
   // Fast 模式门控：agent 级 hasFastMode × 该 (生效来源, 模型) 的 supportsFastMode（per-provider，
   // 唯一真相）。生效来源按 form.providerId 解析（空则该模型的默认来源）。Claude 当前 hasFastMode

@@ -152,6 +152,25 @@ export function hasRealBinding(form: Pick<ScheduleFormState, 'targetSessionId'>)
   return !!tgt && tgt !== PENDING_SESSION_ID;
 }
 
+/**
+ * A bound schedule follows its session only when model, provider and effort are
+ * all inherited.  Keeping this predicate in the pure form layer prevents the
+ * chip, dialog and generation paths from disagreeing about mixed overrides.
+ */
+export function isFollowingSessionSelection(input: {
+  followSession?: boolean;
+  model: string;
+  providerId: string;
+  effort: string;
+}): boolean {
+  return Boolean(
+    input.followSession &&
+      !input.model.trim() &&
+      !input.providerId.trim() &&
+      !input.effort.trim(),
+  );
+}
+
 /** True only for a bound schedule that intentionally follows its session route. */
 export function shouldFollowBoundSessionGenerationRoute(
   form: Pick<ScheduleFormState, 'persistentSession' | 'targetSessionId' | 'providerId' | 'model'>,

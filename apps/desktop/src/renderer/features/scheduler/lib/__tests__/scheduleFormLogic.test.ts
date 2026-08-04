@@ -30,6 +30,7 @@ import {
   deriveRunMode,
   hasRealBinding,
   isExplicitScheduleModelUnavailable,
+  isFollowingSessionSelection,
   resolveScheduleGenerationProviderId,
   resolveTemplateAgentFields,
   sessionAgentKindToScheduleAgentKind,
@@ -108,6 +109,26 @@ describe('shouldFollowBoundSessionGenerationRoute', () => {
       providerId: 'tapsvc',
       model: 'gpt-5.5',
     })).toBe(false);
+  });
+});
+
+describe('isFollowingSessionSelection', () => {
+  const base = {
+    followSession: true,
+    model: '',
+    providerId: '',
+    effort: '',
+  };
+
+  it('requires model, provider and effort to all remain inherited', () => {
+    expect(isFollowingSessionSelection(base)).toBe(true);
+    expect(isFollowingSessionSelection({ ...base, model: 'gpt-5.5' })).toBe(false);
+    expect(isFollowingSessionSelection({ ...base, providerId: 'openai' })).toBe(false);
+    expect(isFollowingSessionSelection({ ...base, effort: 'high' })).toBe(false);
+  });
+
+  it('does not treat an unbound empty selection as follow-session', () => {
+    expect(isFollowingSessionSelection({ ...base, followSession: false })).toBe(false);
   });
 });
 
