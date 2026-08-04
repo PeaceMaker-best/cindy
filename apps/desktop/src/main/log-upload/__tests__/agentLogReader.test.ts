@@ -11,8 +11,13 @@
 import { describe, expect, it } from 'vitest';
 
 import { __testing, parseAgentLogText } from '../agentLogReader';
+import {
+  findOffsetAtOrBefore,
+  parseMainHeadTimestamp,
+  type RandomAccessFile,
+} from '../mainLogReader';
 
-const { rebuildProxyMsg, isProxyScope, MAX_MARKER_CHARS } = __testing;
+const { rebuildProxyMsg, isProxyScope, parseNdjsonTimestamp, MAX_MARKER_CHARS } = __testing;
 
 const TS = new Date(2026, 7, 4, 10, 0, 0).getTime();
 
@@ -156,6 +161,73 @@ describe('双闸：source 与 scope', () => {
     // 前缀相同但不是同一个 scope —— 不能被 startsWith 蒙过去。
     expect(isProxyScope('cc-proxyish')).toBe(false);
     expect(isProxyScope('not-cc-proxy')).toBe(false);
+  });
+});
+
+describe('parseNdjsonTimestamp', () => {
+  it('取 ts（epoch ms）', () => {
+    expect(parseNdjsonTimestamp(JSON.stringify({ ts: 1775_000_000_000, msg: 'x' }))).toBe(
+      1775_000_000_000,
+    );
+  });
+  it('坏行 / 半行 / 缺 ts / ts 非数 ⇒ null', () => {
+    expect(parseNdjsonTimestamp('{ half line')).toBeNull();
+    expect(parseNdjsonTimestamp('')).toBeNull();
+    expect(parseNdjsonTimestamp(JSON.stringify({ level: 'info' }))).toBeNull();
+    expect(parseNdjsonTimestamp(JSON.stringify({ ts: 'nope' }))).toBeNull();
+  });
+});
+
+/**
+ * 2026-08-04 review P2 的回归锁：崩溃补传读超大 `agent-*.ndjson` 时用 `findOffsetAtOrBefore`
+ * 定位，但它原先只认 main 记录头。喂 NDJSON 会一条时间戳都解不出 ⇒ 二分恒收敛到 0 ⇒ 读窗口
+ * 错定在最旧记录、彻底错过崩溃现场。这里锁「NDJSON 解析器能定位、main 解析器不能」这对。
+ */
+describe('findOffsetAtOrBefore：NDJSON 需要 NDJSON 时间戳解析器', () => {
+  /** 造一个 ~200KB 的 NDJSON 文件，时间戳从 base 起每行 +1s。 */
+  function ndjsonFile(base: number, count: number): { file: RandomAccessFile; buf: Buffer } {
+    const lines: string[] = [];
+    for (let i = 0; i < count; i += 1) {
+      lines.push(
+        JSON.stringify({
+          ts: base + i * 1000,
+          level: 'info',
+          source: 'proxy',
+          scope: 'cc-proxy/req',
+          msg: `noise ${'x'.repeat(200)}`,
+        }),
+      );
+    }
+    const buf = Buffer.from(`${lines.join('\n')}\n`, 'utf8');
+    return {
+      buf,
+      file: {
+        size: async () => buf.length,
+        read: async (offset: number, length: number) =>
+          buf.subarray(offset, Math.min(offset + length, buf.length)),
+      },
+    };
+  }
+
+  const BASE = new Date(2026, 7, 4, 0, 0, 0).getTime();
+
+  it('NDJSON 解析器：定位到目标时刻附近，而不是文件开头', async () => {
+    const { file, buf } = ndjsonFile(BASE, 1000); // ~220KB
+    const target = BASE + 800 * 1000; // 第 800 行附近
+    const offset = await findOffsetAtOrBefore(file, target, parseNdjsonTimestamp);
+
+    // 落在文件中后段(不是 0),且该偏移处之后第一条记录的时间戳不晚于目标。
+    expect(offset).toBeGreaterThan(buf.length / 2);
+    const tail = buf.subarray(offset).toString('utf8');
+    const firstFull = tail.slice(tail.indexOf('\n') + 1).split('\n')[0];
+    expect(parseNdjsonTimestamp(firstFull)!).toBeLessThanOrEqual(target);
+  });
+
+  it('⚠️ 用 main 记录头解析器喂 NDJSON ⇒ 恒收敛到 0（这就是修复前的行为）', async () => {
+    const { file } = ndjsonFile(BASE, 1000);
+    const target = BASE + 800 * 1000;
+    const offset = await findOffsetAtOrBefore(file, target, parseMainHeadTimestamp);
+    expect(offset).toBe(0);
   });
 });
 

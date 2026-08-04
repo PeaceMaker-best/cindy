@@ -183,6 +183,29 @@ describe('sendLogs', () => {
     expect(body.__source__).toBe('darwin-arm64');
   });
 
+  /**
+   * 2026-08-04 review P1 的回归锁：PutWebtracking 的两个必选头之一是 `x-log-bodyrawsize`
+   * （未压缩正文的字节数），缺它部分区域直接 400。且必须按 **UTF-8 字节**（不是 body.length
+   * 的 UTF-16 码元），否则中文正文会报小、和真实 body 对不上。
+   */
+  it('⚠️ 带 x-log-bodyrawsize，且值 = body 的 UTF-8 字节数', async () => {
+    const fetchImpl = vi.fn<(input: string, init?: RequestInit) => Promise<Response>>(
+      async () => okResponse(),
+    );
+    // 中文正文:UTF-8 字节数明显大于 UTF-16 码元数(body.length)。
+    await sendLogs({ fetchImpl }, TARGET, META, [record(1, '中文日志正文占多字节')]);
+
+    const init = fetchImpl.mock.calls[0][1]!;
+    const headers = init.headers as Record<string, string>;
+    const body = init.body as string;
+    expect(headers['x-log-bodyrawsize']).toBe(String(Buffer.byteLength(body, 'utf8')));
+    // 不压缩就不发 compresstype(发了服务端会按压缩解,反而坏)。
+    expect(headers['x-log-compresstype']).toBeUndefined();
+    // 证明确实按字节而非码元:两者对中文正文不相等。
+    expect(Buffer.byteLength(body, 'utf8')).toBeGreaterThan(body.length);
+    expect(headers['x-log-bodyrawsize']).not.toBe(String(body.length));
+  });
+
   it('某一批非 2xx ⇒ 整次判失败，且停止后续批次', async () => {
     const fetchImpl = vi
       .fn<(input: string, init?: RequestInit) => Promise<Response>>()

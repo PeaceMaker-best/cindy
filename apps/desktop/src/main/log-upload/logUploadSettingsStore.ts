@@ -65,21 +65,48 @@ const store = createOverrideSettingsFile<LogUploadSettings>({
  *
  * 所以在任何 store 读写之前先做一次只读探针，把结论钉在内存里：
  *   none    = 没有记录（从未自定义，跟随默认值关闭）
- *   valid   = 有一份能解析的记录
- *   invalid = 有记录但解析不出来 —— 授权闸必须据此判 `unknown`，否则会当成「用户把开关
- *             关了」并清空待补传标记，一次坏文件永久丢掉崩溃现场
+ *   valid   = 有一份**本 writer 可能产出**的记录（object + 非空 + crashAutoUploadEnabled 若在则为 boolean）
+ *   invalid = 有记录但解析不出来、或形状不可能来自本 writer（空对象 / 非 boolean 值）——
+ *             授权闸据此判 `unknown`，否则会当成「用户把开关关了」并清空待补传标记，
+ *             一次坏文件永久丢掉崩溃现场
  */
 type RecordProbe = 'none' | 'valid' | 'invalid';
 let recordProbe: RecordProbe | null = null;
+
+/**
+ * 纯分类：给定盘上内容（`null` = 文件不存在），判成 none / valid / invalid。抽出来是为了
+ * 不拉 electron 也能单测——fs 访问留在 `probeSettingsFile`。
+ *
+ * 「能解析成 object」还不够（2026-08-04 review copilot）：本 store 的 writer 在 override 清空时
+ * **删文件**、从不落 `{}`，写入时 `normalize` 保证 `crashAutoUploadEnabled` 一定是 boolean。
+ * 所以盘上出现空对象、或该键存在却不是 boolean，都不可能来自本 writer —— 是外部手改或半截
+ * 写入。当成 valid 会让 `isCrashAutoUploadEnabled()` 回落默认 false、闸判 crash-auto-off 并
+ * 清空待补传标记；判 invalid 走 `unknown`（不传也不清），与坏 JSON 同款保守处理。
+ */
+function classifyProbe(fileContent: string | null): RecordProbe {
+  if (fileContent === null) return 'none';
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fileContent);
+  } catch {
+    return 'invalid';
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return 'invalid';
+  const obj = parsed as Record<string, unknown>;
+  if (Object.keys(obj).length === 0) return 'invalid';
+  if ('crashAutoUploadEnabled' in obj && typeof obj.crashAutoUploadEnabled !== 'boolean') {
+    return 'invalid';
+  }
+  return 'valid';
+}
 
 function probeSettingsFile(): RecordProbe {
   try {
     const file = settingsFilePath();
     if (!fs.existsSync(file)) return 'none';
-    const parsed: unknown = JSON.parse(fs.readFileSync(file, 'utf-8'));
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? 'valid' : 'invalid';
+    return classifyProbe(fs.readFileSync(file, 'utf-8'));
   } catch {
-    // 读不出来 / 解析失败都算「在、但非法」，绝不当成「没有记录」。
+    // 读盘本身失败(权限等):当「在、但非法」,绝不当成「没有记录」。
     return 'invalid';
   }
 }
@@ -154,6 +181,7 @@ export const __testing = {
   DEFAULTS,
   normalize,
   settingsFilePath,
+  classifyProbe,
   resetProbe: (): void => {
     recordProbe = null;
   },

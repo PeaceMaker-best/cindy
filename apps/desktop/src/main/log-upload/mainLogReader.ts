@@ -153,20 +153,41 @@ export function parseMainLogText(
 }
 
 /**
+ * 从一整行里解出 epoch ms 时间戳；解不出返回 null。
+ *
+ * 定位读取对 main（纯文本）与 agent（NDJSON）两种流用不同的解析器 —— 早先只有一个写死的
+ * main-header 版本，被用到 NDJSON 上会**一条都解不出**，二分于是恒收敛到文件开头，把超大
+ * `agent-*.ndjson` 的读窗口错定在最旧的记录、彻底错过崩溃现场（2026-08-04 review P2）。
+ */
+export type LineTimestampParser = (line: string) => number | null;
+
+/** main 流：`[<ISO>] [LEVEL] [scope] ` 记录头里的时间戳。 */
+export const parseMainHeadTimestamp: LineTimestampParser = (line) => {
+  const head = MAIN_LOG_RECORD_HEAD_RE.exec(line);
+  if (!head) return null;
+  const tsMs = Date.parse(head[1]);
+  return Number.isFinite(tsMs) ? tsMs : null;
+};
+
+/**
  * 二分查找：返回一个**不晚于 `targetMs` 的读取起点**（字节偏移）。
  *
  * 精确到 `probeBytes`：循环收敛到 `hi - lo <= probeBytes` 就返回 `lo`，所以结果通常落在
  * 目标时刻**之前**最多 `probeBytes` 字节处，而不是「第一条 ≥ targetMs 的记录行首」。这是
  * 有意的——多读一点只是多几条早于锚点的记录，少读会把锚点本身切掉。
  *
+ * `parseTimestamp` 决定按哪种行格式解时间戳（main 记录头 / NDJSON）。**必须**与被读文件的
+ * 格式匹配：用错解析器会让每次探测都返回 null，二分恒收敛到 0（见 `parseTimestamp` 上的注释）。
+ *
  * 全文都早于 targetMs 时返回文件末尾附近；文件为空返回 0。
  *
- * 前提：单个 main 日志文件内记录时间**单调不减**（logger 按天 rotate + 追加写，
- * 同一进程内 emit 顺序即时间顺序；多实例并发追加可能出现极小的乱序，对定位无实质影响）。
+ * 前提：单个日志文件内记录时间**单调不减**（logger 按天 rotate + 追加写，同一进程内 emit
+ * 顺序即时间顺序；多实例并发追加可能出现极小的乱序，对定位无实质影响）。
  */
 export async function findOffsetAtOrBefore(
   file: RandomAccessFile,
   targetMs: number,
+  parseTimestamp: LineTimestampParser = parseMainHeadTimestamp,
   probeBytes = 8 * 1024,
 ): Promise<number> {
   const size = await file.size();
@@ -176,24 +197,25 @@ export async function findOffsetAtOrBefore(
   // 循环不变量:[lo, hi) 内包含答案。每轮把区间砍半,probeBytes 的读取只用于定位行首。
   while (hi - lo > probeBytes) {
     const mid = lo + Math.floor((hi - lo) / 2);
-    const found = await firstRecordTimestampAt(file, mid, probeBytes);
+    const found = await firstRecordTimestampAt(file, mid, probeBytes, parseTimestamp);
     if (found === null) {
-      // 该探测点附近读不到完整记录头(超长续行等),保守往左收,宁可多读。
+      // 该探测点附近读不到完整记录(超长行等),保守往左收,宁可多读。
       hi = mid;
       continue;
     }
-    if (found.tsMs >= targetMs) hi = mid;
+    if (found >= targetMs) hi = mid;
     else lo = mid;
   }
   return lo;
 }
 
-/** 从 offset 起找到第一个完整行,解析其记录头时间戳。找不到返回 null。 */
+/** 从 offset 起找到第一个完整行,用 `parseTimestamp` 解其时间戳。找不到返回 null。 */
 async function firstRecordTimestampAt(
   file: RandomAccessFile,
   offset: number,
   probeBytes: number,
-): Promise<{ tsMs: number } | null> {
+  parseTimestamp: LineTimestampParser,
+): Promise<number | null> {
   const buf = await file.read(offset, probeBytes);
   if (buf.length === 0) return null;
   const text = buf.toString('utf8');
@@ -201,10 +223,8 @@ async function firstRecordTimestampAt(
   // offset 落在行中间:从下一行开始看。offset === 0 时当前行就是完整行。
   const body = offset === 0 ? text : nl >= 0 ? text.slice(nl + 1) : '';
   for (const line of body.split('\n')) {
-    const head = MAIN_LOG_RECORD_HEAD_RE.exec(line);
-    if (!head) continue;
-    const tsMs = Date.parse(head[1]);
-    if (Number.isFinite(tsMs)) return { tsMs };
+    const tsMs = parseTimestamp(line.replace(/\r$/, ''));
+    if (tsMs !== null) return tsMs;
   }
   return null;
 }

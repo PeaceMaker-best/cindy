@@ -125,8 +125,12 @@ async function postBatch(
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        // web tracking 的 API 版本头。缺它部分区域会 400。
+        // PutWebtracking 的两个必选头(见阿里云 SLS API 文档):缺任一部分区域直接 400。
+        //   x-log-apiversion：接口版本;
+        //   x-log-bodyrawsize：**未压缩**正文的字节数。我们不压缩(不发 x-log-compresstype),
+        //     所以就是 body 的 UTF-8 字节数。必须按字节数,不能用 body.length(UTF-16 码元)。
         'x-log-apiversion': '0.6.0',
+        'x-log-bodyrawsize': String(Buffer.byteLength(body, 'utf8')),
       },
       body,
       signal: controller.signal,

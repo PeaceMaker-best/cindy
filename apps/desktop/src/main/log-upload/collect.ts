@@ -18,9 +18,10 @@ import {
   MAX_RECORDS,
   YIELD_EVERY_LINES,
 } from './limits';
-import { parseAgentLogText } from './agentLogReader';
+import { parseAgentLogText, parseNdjsonTimestamp } from './agentLogReader';
 import {
   findOffsetAtOrBefore,
+  parseMainHeadTimestamp,
   parseMainLogText,
   startsWithFormatSentinel,
   type RandomAccessFile,
@@ -192,7 +193,10 @@ export async function collectLogs(
         fromFileStart = true;
       } else if (anchors.length > 0) {
         const earliest = Math.min(...anchors) - ANCHOR_PRE_ROLL_MS;
-        startOffset = await findOffsetAtOrBefore(file, earliest);
+        // 按流格式选时间戳解析器:main 是记录头,agent 是 NDJSON。用错的话每次探测都解不出
+        // 时间戳,二分恒收敛到 0,超大 agent 文件的读窗口会错定在最旧记录(review P2)。
+        const parseTs = plan.kind === 'main' ? parseMainHeadTimestamp : parseNdjsonTimestamp;
+        startOffset = await findOffsetAtOrBefore(file, earliest, parseTs);
         fromFileStart = startOffset === 0;
       } else {
         startOffset = size - perFileBudget;

@@ -26,6 +26,7 @@
  * 记录边界不需要哨兵：NDJSON 一行一条，边界由 JSON 行本身保证，不存在伪造记录头的问题。
  */
 
+import type { LineTimestampParser } from './mainLogReader';
 import { redact } from './redact';
 import type { ParsedRecord } from './types';
 
@@ -33,6 +34,25 @@ export interface ParseAgentLogOptions {
   fromFileStart: boolean;
   homeDir?: string;
 }
+
+/**
+ * NDJSON 流的时间戳解析器（供 `findOffsetAtOrBefore` 定位读取用）。
+ *
+ * 只取 `ts`（epoch ms），不做 JSON.parse 之外的解释：定位阶段只需要时间戳，字段白名单与
+ * 脱敏在真正解析记录时（`parseAgentLogText`）才做。坏行 / 半行返回 null，让二分跳过它。
+ */
+export const parseNdjsonTimestamp: LineTimestampParser = (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return null;
+  try {
+    const raw: unknown = JSON.parse(trimmed);
+    if (!raw || typeof raw !== 'object') return null;
+    const ts = (raw as Record<string, unknown>).ts;
+    return typeof ts === 'number' && Number.isFinite(ts) ? ts : null;
+  } catch {
+    return null;
+  }
+};
 
 export interface ParseAgentLogResult {
   records: ParsedRecord[];
@@ -193,5 +213,6 @@ export const __testing = {
   MAX_MARKER_CHARS,
   isProxyScope,
   rebuildProxyMsg,
+  parseNdjsonTimestamp,
   localIsoWithOffset,
 };
