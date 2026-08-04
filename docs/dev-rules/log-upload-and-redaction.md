@@ -1,0 +1,189 @@
+# 客户端日志上报：采集、脱敏与崩溃补传
+
+> **状态**：权威开发规则（authoritative）
+> **读取时机**：修改客户端日志采集／脱敏／上报链路，修改 `main/logger.ts` 的 main 日志行
+> 格式，或修改崩溃判定与待补传标记之前
+
+本文管**日志怎么离开用户的机器**。日志模块本身的约定（统一 logger、不裸 `console.log`）见
+[`engineering-conventions.md`](engineering-conventions.md) §1；凭证不落盘见
+[`credentials-and-local-storage.md`](credentials-and-local-storage.md)；开关的默认值与
+override 语义见 [`configuration-and-overrides.md`](configuration-and-overrides.md)。
+
+需求与设计正文：[`../client-log-upload-requirements.md`](../client-log-upload-requirements.md)、
+[`../client-log-upload-implementation-plan.md`](../client-log-upload-implementation-plan.md)。
+
+## 事实来源
+
+| 内容 | 权威来源 |
+|---|---|
+| 记录边界格式（写侧＋读侧共用） | `apps/desktop/src/shared/mainLogRecordFormat.ts` |
+| 本地日志保留天数 | `apps/desktop/src/shared/logRetention.ts` |
+| 跨进程契约与上传编号形态 | `apps/desktop/src/shared/logUpload.ts` |
+| 来源白名单 | `apps/desktop/src/main/log-upload/sourceAllowlist.ts` |
+| 脱敏规则 | `apps/desktop/src/main/log-upload/redact.ts` |
+| 体量上限 | `apps/desktop/src/main/log-upload/limits.ts` |
+| 上报目标（构建期注入的解析侧） | `apps/desktop/src/main/log-upload/logUploadTarget.ts` |
+| 上报目标（构建期注入的校验侧） | `scripts/shared/log-upload-build-env.mjs`、配置骨架 `config/log-upload.json.example` |
+| 待补传标记 | `apps/desktop/src/main/log-upload/pendingMarkers.ts` |
+| 崩溃判定 | `apps/desktop/src/main/lifecycle.ts`（`isFatalShutdownReason` / `onFatalShutdown`） |
+
+## 1. 三条不变量
+
+这套东西的正确性依赖三条不变量。破坏任一条的后果都不是「功能不好用」，而是隐私事故或崩溃
+现场静默丢失。
+
+### 1.1 记录边界是安全不变量，不是排版
+
+`main-<date>.log` 是纯文本按行解析的。上报侧按行首特征
+（`MAIN_LOG_RECORD_HEAD_RE`）识别一条记录的起点，并据此判断该记录的来源 scope 是否在放行
+名单内。
+
+因此**写侧必须保证：除记录首行外，没有任何行以边界特征开头**。做法是 `emit()` 对 `msg` 调
+`escapeMainLogContinuationLines()`（每个续行前置一个空格）。
+
+不做这件事的后果：一条被封禁来源（例如把用户输入写进 debug 日志的功能模块）的多行内容里，
+可以嵌入一个伪造的「放行来源」记录头，把对话正文伪装成基础设施日志送出去。
+
+**这两侧是同一条不变量的两半，必须同时满足。** 改动 `logger.ts` 的行格式、改动读侧的切分
+逻辑、或者「优化」掉那个前置空格，都必须同时确认另一侧。
+
+存量文件的过渡由**格式哨兵**闭合：logger 每次打开 main 当天文件后写一行
+`#cindy-log-format:2`，读侧跳过首个哨兵之前的全部内容。升级前写下的未转义内容因此不会被
+采集。不要为了「多采一点历史」去掉哨兵判定。
+
+### 1.2 白名单方向不可反转（deny-by-default）
+
+来源名单是**白名单**：只放行确定与用户内容无关的基础设施来源，未知来源一律丢弃。
+
+不能改成黑名单。功能模块会在 debug 级别把用户输入写进日志——语音听写草稿、命令行、搜索
+关键词、界面上最后一条用户消息……黑名单逐个封禁不收敛，永远有下一个。
+
+推论：
+
+- **新增诊断来源需要显式加入名单**，这是有意为之的代价，不是待优化项。
+- 名单**只增不减**方向上的「增」也要过 review：每条都要写明理由，理由写不出来的不该加。
+- `console` 永远不进名单：它是第三方库与任何漏网 `console.log` 的兜底落点，内容不可控。
+- 放行根下携带用户路径／媒体内容的子来源必须逐条排除（`DENIED_SUB_SCOPES`），排除表优先于
+  放行表。
+- 渲染进程转发的日志整类不放行——`writeFromRenderer()` 强制 `r:` 前缀，而匹配是根锚定的。
+  不要把匹配改成裸 `startsWith`。
+
+### 1.3 待补传标记：代次令牌 + 原子清除
+
+开发版与正式版共享同一份 userData，两个实例可能并发读写同一批标记。因此：
+
+- 每条标记带**唯一代次令牌**，且令牌进文件名。仅靠时间戳在同毫秒的并发写下会误判成同一条。
+- 认领靠**同目录 rename**（原子替换），抢输的实例拿到 ENOENT 直接跳过。
+- 清除只删**自己那个 claim 文件名**，绝不会把另一个实例刚写的新崩溃标记误删。
+- **仅在「确实传成功且非空」时才清除**。上传失败、采到 0 条、授权读不出来，一律还原标记。
+- 授权被关闭时**清空全部**标记（含 claim 文件）——用户关掉授权后不得在下次启动补传。
+
+## 2. 四层收窄（改任一层前先读这一节）
+
+上报内容的边界靠四层，**不是单层过滤**。日志由客户端直接送到日志服务，中间没有服务端环节可
+以再过一遍——客户端这套就是唯一防线。
+
+| 层 | 决定什么 | 实现 |
+|---|---|---|
+| 1 源白名单 | 读哪些文件 | `collect.ts`：只构造 `main-<date>.log` 与 logs 根的 `agent-<date>.ndjson`。`sessions/**` 与 `*cc-debug.raw.log` **永不构造路径** |
+| 2 记录白名单 | 放行哪些记录 | `sourceAllowlist.ts`（deny-by-default，见 §1.2） |
+| 3 正则红线 | 抹除敏感片段 | `redact.ts`（宁可多抹，不可漏） |
+| 4 字段白名单 + 截断 | 带出哪些字段 | 只有 `ts` / `level` / `src` / `scope` / `msg` 五个字段离开本机 |
+
+`agent-<date>.ndjson` 只在崩溃路径附带，且**只取 `source === 'proxy'` 且 scope 落在 proxy 根下
+的记录**（双闸）。同一文件里还有 `maker` 源的日志，那些可能带 agent 提示词与用户内容。
+
+脱敏规则**只增不减**：放宽任何一条（缩小匹配范围、提高最小长度、去掉某个形态）都视为隐私
+变更，需要重新评审。按**形态**写规则而不是按厂商——厂商清单永远滞后于新出现的 key 形态。
+
+## 3. 授权
+
+- 手动上传：要求已配置上报目标 **且** 已明示同意《隐私政策》。点击按钮本身即用户对这一次
+  上传的意图，**不看「使用统计」开关**——那是行为埋点的偏好，与排障上传不是一件事。
+- 自动上传（崩溃）：额外要求用户显式开启「崩溃时自动上传」，该开关**默认关闭**。
+- **授权判定必须现读盘**：开发版与正式版共享 userData，用户可能在另一个实例里刚刚撤回授权。
+  判定前调 `refreshFromDisk()`（mtime 守卫，文件没变时零开销）。
+- 授权状态**读不出来时是 `unknown`，不是 `denied`**：不上传，但保留标记，把最终判定留给下次
+  启动的可靠读取。用一次读取失败永久丢掉一个崩溃现场是不可接受的。
+- 不做「上传前逐次弹窗确认」：手动路径本身就是用户点的；崩溃路径弹窗在崩溃时刻不可能可靠展示。
+
+## 4. 上报目标与区域
+
+目标 = 日志服务的 project + logstore + 服务区域接入域名，**构建期注入、运行期只读**。
+
+链路（与 `config/endpoint.dev.json` / `release-regions.json` 同款约定）：
+
+```
+config/log-upload.json                     ← 真值,主仓 gitignore;唯一事实源在 cindy-build-scripts
+  ↓ 打包机 sync-desktop-release-kit.sh 拷回
+scripts/shared/log-upload-build-env.mjs    ← 全量校验 + 挑出「本构建区域那一个」目标
+  ↓ apps/desktop/scripts/package-desktop.mjs 塞进 forge env
+apps/desktop/vite.main.config.ts           ← define 成 main-only process.env.XDT_LOG_UPLOAD_TARGET
+  ↓
+main/log-upload/logUploadTarget.ts         ← 解析 + 区域交叉校验;不合法一律 null
+```
+
+- **仍然不进端点清单**（改成注入没有放松这一条）。两条独立理由：① 第三方域名不在
+  `REGION_ENDPOINT_DOMAIN` 内，加进去会让整份离线缓存被判不可信、连带影响离线启动出口；
+  ② 免签写入地址一旦可被**远程**改写，等于允许把用户日志改投他人的 logstore。构建期注入保留
+  了「信任锚点不可远程改」这条性质，运行期配置不行。
+- **只烘焙一个区域的目标**：cn 包里物理上不含 global 的 logstore 地址，反之亦然。这比「包里带
+  两份、运行时按 region 选」更强——后者只要选错一次就写到另一区去了，而那正是有先例的事故
+  （埋点曾因 global 构建报进国内采集端，导致国际项目缺失全部客户端数据）。
+- **区域交叉校验**：注入串里带 `region`，运行时必须与烘焙的 `VITE_CINDY_AUTH_REGION` 一致，
+  不一致视为未配置。不要删掉这一步——它是「注入链路串了」（打包机 env 残留、本地 `.env` 放了
+  另一区的目标）唯一的运行期防线，宁可不上报也不能往可能错误的 logstore 写。
+- ⚠️ **fail-closed 的位置从 typecheck 搬到了构建脚本**。值写在 TS 的
+  `Record<CindyRegion, …>` 里时，「新增区域忘了做选择」会直接编译失败。值搬进 gitignore 的
+  JSON 后那条保证没了，由 `log-upload-build-env.mjs` 的硬校验替代：**除 `dev` 外每个区域都是
+  必填**，缺失或非法一律抛错让打包失败；两个区域共用同一 project 或 logstore 同样抛错。
+  **不要把这些改成「缺失就返回空、静默关闭」**——那样一次漏配就是发版后才发现的观测能力真空。
+  新增发行区域时不需要改校验代码（`OPTIONAL_REGIONS` 只含 `dev`，其余自动必填）。
+- 配错的表现是**静默失败**（请求发出去拿个 404，日志里一行 warn，没人会注意），所以校验要严：
+  project / logstore 走 SLS 命名规则，`slsRegion` 只写区域代号（写成完整域名会被拼成
+  `<那一串>.log.aliyuncs.com`），`endpointHost` 不含协议 / 路径 / project 前缀。
+  解析侧对后三条**再校验一遍**——注入是文本替换，链路上任何一环出错都该被判成「未配置」。
+- 缺失配置时功能**整体关闭**（等同未启用）：不报错、不降级到别的目标、不产生任何字节、也不
+  写标记。dev server 与本地 `pnpm dev` 拿不到注入值 ⇒ 天然关闭；开发者显式设
+  `XDT_LOG_UPLOAD_TARGET`（且 region 一致）才会联调上报，那是一次明确动作。
+- 客户端**不得持有任何 AccessKey / 密钥**，只用免签写入。
+- 真值不进仓 ⇒ CI 与本地看不到它 ⇒ desktop 侧单测只能锁**形状**（解析、区域校验、URL 模板），
+  真值的正确性由 `scripts/__tests__/log-upload-build-env.test.mjs` 对 `.example` 与临时 fixture
+  校验，加上打包时的硬失败兜底。
+
+## 5. 时序
+
+- **不阻塞启动**：启动补传排在主窗口 `ready-to-show` 之后再延迟执行；采集是流式读 + 定期
+  `setImmediate` 让出事件循环。
+- **不拖慢退出**：崩溃即时路径只同步写一个 <400B 的标记，随后 fire-and-forget。它注册在
+  `lifecycle.onFatalShutdown`（**不是** `onQuit`），因此不占 disposer 超时预算、也不推迟其
+  起点。新增崩溃时刻要做的事都必须遵守这条——想 `await` 什么就说明放错了地方。
+- **崩溃当时的即时上传成功也不清标记**：它拿不到崩溃后的收尾日志，完整现场靠下次启动补传。
+  两次上报共享同一 `crashToken`，后台按它归组。
+- **崩溃判定复用 `lifecycle`**：自挂 `process` 事件会漏掉渲染进程崩溃（白屏），并把可恢复的
+  悬空 promise 误报成崩溃。未知 reason 一律不算崩溃。
+- **补传窗口按最早一次未传崩溃放宽**，上限对齐本地日志保留天数；**条数裁剪以「离任一崩溃时刻
+  最近」为锚点**。取「最新 N 条」会让崩溃后堆积的新日志把崩溃现场整段挤掉——重试传了一堆无关
+  新日志却「成功」，现场永久丢失。
+- **全链路失败静默**：任何异常收敛成一个 outcome，不弹错误、不影响业务。
+
+## 6. Review 清单
+
+1. 改了 `logger.ts` 的行格式或 `mainLogRecordFormat.ts` 吗？读侧与写侧是否同时确认？哨兵判定
+   是否还在？
+2. 给来源白名单加了条目吗？理由写清楚了吗？该来源在 debug 级别会不会打用户输入？
+3. 脱敏规则有没有被放宽（范围缩小 / 长度门槛提高 / 形态删除）？放宽属隐私变更，需重新评审。
+4. 新增了从本地日志读取的路径吗？会不会碰到 `sessions/**` 或 `*cc-debug.raw.log`？
+5. 第四层字段白名单是否仍然只带出那五个字段？新增字段有没有论证过安全性？
+6. 标记的清除是否仍然「只在成功且非空时」且「只清自己那一代」？授权关闭是否清空全部（含
+   claim 文件）？
+7. 崩溃时刻新增的动作是否仍然同步且极短、没有进 `onQuit`？
+8. 改了上报目标的注入链路吗？除 `dev` 外每个区域仍然必填（缺失即打包失败）？跨区域共用
+   project / logstore 仍然被拒？运行期的区域交叉校验还在？
+9. 新增发行区域时，`config/log-upload.json`（cindy-build-scripts 侧的真值）是否也补了对应条目？
+   ——不补的话打包会失败，这是有意的。
+
+验证：`pnpm --filter desktop run typecheck` +
+`npx vitest run src/main/log-upload src/main/__tests__/loggerRecordFormat.test.ts`，
+改 UI 文案再跑 `pnpm check:i18n` 与 `pnpm check:i18n-glossary`。隐私性用例是**行为锁**，
+不允许为了让改动通过而放宽断言。

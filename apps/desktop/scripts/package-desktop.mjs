@@ -47,6 +47,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureBinary } from '../../../scripts/ensure-agent-binaries.mjs';
 import { desktopClientBuildEnv } from '../../../scripts/shared/client-endpoint-build-env.mjs';
+import { desktopLogUploadBuildEnv } from '../../../scripts/shared/log-upload-build-env.mjs';
 import {
   DESKTOP_ROOT,
   RELEASE_DIR,
@@ -151,6 +152,12 @@ function runForgeMake({ platform, arch, region, version, noSign }) {
     NODE_ENV: 'production',
     // 烘焙面只含 region + 端点清单自举基址,按 region 二选一。
     ...desktopClientBuildEnv({ allowEnvOverride: false, authRegion: region }),
+    // 日志上报目标(SLS project/logstore/区域)。真值不进仓,读 config/log-upload.json
+    // (打包机由 cindy-build-scripts 的 sync-desktop-release-kit.sh 拷回)。
+    // 只烘焙**本区域那一个**目标 —— cn 包里物理上不含 global 的 logstore 地址。
+    // 缺失 / 非法会在这里抛错让打包失败(除 dev 外每个区域都是必填):这是「必须被强制
+    // 要求做出选择」那条约束从 typecheck 搬过来的落点,不要改成静默跳过。
+    ...desktopLogUploadBuildEnv({ authRegion: region }),
     // forge.config.ts 的 NSIS appId / AUMID 优先读这个(与 VITE_ 同源,双保险)。
     CINDY_AUTH_REGION: region,
     // forge.config.ts 注入 packagerConfig.appVersion;版本无关时为占位 0.0.0。

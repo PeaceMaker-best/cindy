@@ -1,0 +1,158 @@
+/**
+ * 第二层：**记录来源白名单**（决定 `main-*.log` 里放行哪些记录）。
+ *
+ * ⚠️ 方向不可反转：这是 **deny-by-default** 白名单，未知来源一律丢弃。
+ *
+ * 为什么不能用黑名单：功能模块会在 debug 级别把用户输入写进日志——语音听写草稿、
+ * 命令行、搜索关键词、界面上最后一条用户消息……黑名单逐个封禁不收敛，永远有下一个。
+ * 反过来只放行基础设施记录（生命周期 / 崩溃 / 网络 / 更新 / 数据库 / 鉴权 / 设备互联的
+ * 连接层），恰好覆盖「排查 App 本身出错」这个诉求。代价是**新增诊断来源需要显式加入
+ * 名单**——这是有意为之，可收敛。
+ *
+ * 名单只增不减；新增条目必须在 PR 里写明理由并过 review（需求 §8）。
+ *
+ * 渲染进程转发的日志整类落空：`writeFromRenderer()` 强制 `r:` 前缀，而匹配是**根锚定**的，
+ * `r:lifecycle` 不会命中 `lifecycle`。同理 `maker*` / `cc-proxy*` / `codex-proxy*` 也不会
+ * 命中（它们本就不写 main 流）。
+ */
+
+/**
+ * 放行的根 scope。匹配规则见 `isAllowedScope`：精确相等，或以 `<root>/` / `<root>:` 开头
+ * （仓库里两种子 scope 分隔符都在用）。
+ *
+ * 每条都带理由。理由写不出来的条目不该在名单里。
+ */
+const ALLOWED_ROOT_SCOPES: readonly string[] = [
+  // ── 生命周期 / 崩溃 / 进程 ────────────────────────────────────────────────
+  'lifecycle', //            退出编排、disposer 超时、render-process-gone、watchdog 布防
+  'startup-diagnostics', //  退出尸检结论、crash dump 清单
+  'logger', //               日志自身的初始化与格式哨兵
+  'process', //              uncaughtException / unhandledRejection 的全栈落点 —— 崩溃排查的主要证据
+  'power-diagnostics', //    睡眠/唤醒前后的异常(「合盖再打开就卡住」类问题)
+  'power-blocker', //        阻止休眠的持有与释放
+  'idleManager', //          空闲判定(自动更新重启时机依赖它)
+  'app-presence', //         前后台/可见性状态机
+  'appSessionState', //      应用级会话状态机(只记状态转换,不记内容)
+  // 渲染进程启动守卫 —— 白屏排查必需(preload-error / 加载失败 / boot guard 重试)。
+  // ⚠️ 只含这些无用户内容的加载失败信号:渲染进程 console 的转发**不在**这个 scope 下,
+  // 它单独走 `renderer-console`(见下方 NOTABLE_DENIED_ROOTS)。两者曾共用同一个 scope,
+  // 于是整类渲染进程 console 正文跟着被放行 —— 2026-08-04 用真实 dev 日志跑采集时发现。
+  'renderer-guard',
+  'csp', //                  CSP 违规上报(注入/加载异常)
+  'secondary-windows', //    子窗口创建与销毁
+  'windows-tray', //         Windows 托盘生命周期
+  'dock-icon', //            macOS Dock 图标状态
+  'relaunch-activity', //    重启前的忙碎判定
+
+  // ── 更新链路（需求 U6 明确要求覆盖）────────────────────────────────────────
+  'updateService', //        下载/校验/安装/重启各环节
+  'update-presentation', //  更新提示的展示决策
+  'releaseNotesService', //  更新说明拉取
+
+  // ── 网络与端点清单（需求 U6：端点清单拉取失败率）──────────────────────────
+  'clientEndpoints', //      运行期端点清单解析、缓存可信性判定、离线出口
+  'manifestService', //      清单拉取
+  'manifestIO', //           清单落盘/读盘
+  'serverApiClient', //      平台 API 调用的状态码与耗时
+  'heartbeat', //            在线心跳(网络可达性的连续信号)
+
+  // ── 数据库 ────────────────────────────────────────────────────────────────
+  'localDb', //              主库打开、migration、完整性
+  'DbClient', //             连接与语句层错误
+  'db-worker', //            worker 进程存活与崩溃
+  'schema-drift-detector', // schema 漂移检测
+  'schema-drift-repair', //  漂移修复
+
+  // ── 鉴权 ──────────────────────────────────────────────────────────────────
+  'authManager', //          登录/续期/失效/realm 切换
+  'auth-adapters', //        各登录方式适配层
+  'auth-boundary', //        鉴权边界校验
+  'safe-storage', //         safeStorage 可用性与钥匙串降级(不含密文本身)
+
+  // ── 设备互联：连接层 ──────────────────────────────────────────────────────
+  // 根放行 + 子来源逐条排除(见 DENIED_SUB_SCOPES)。连接/心跳/重连是排障需要的,
+  // 媒体抓取与镜像缓存会把本地文件路径打进日志,必须排掉。
+  'device-link',
+
+  // ── 配置与存量迁移基础设施 ────────────────────────────────────────────────
+  'legacyUserDataMigration', // userData 目录迁移
+  'legacy-xdmaker-migration', // 旧品牌数据迁移
+  'ownerNamespaceMigration', //  归属命名空间迁移
+  'analytics-settings', //       同意状态与开关的读写(不含用户内容)
+  'sidebar-settings', //         侧栏偏好读写
+  'canaryFlagStore', //          灰度开关
+];
+
+/**
+ * 放行根下必须**逐条排除**的子来源：它们隶属放行的根，但会把用户路径 / 媒体内容
+ * 打进日志（需求 §4.2 明确点了这类）。排除表优先于放行表。
+ */
+const DENIED_SUB_SCOPES: readonly string[] = [
+  'device-link:mediaFetch', //             抓取本地媒体,日志带绝对路径
+  'device-link:mediaTransfer', //          传输进度,带文件名
+  'device-link:outboundMedia', //          出站媒体,带文件名
+  'device-link:outboundImageCompress', //  压缩前后尺寸,带路径
+  'device-link:mirror-cache', //           远程会话镜像缓存 = 对话内容
+  'device-link:mirror-cache-purge', //     同上,带缓存文件路径
+  'device-link:remoteMediaProtocol', //    远程媒体协议解析,带路径
+  'device-link:session-reference', //       会话引用,带 session 级信息
+  'device-link:telegram', //               IM 侧消息内容
+];
+
+/**
+ * 明确**不**放行、且值得点名的来源（不需要写进代码逻辑，写在这里防止后人误加）：
+ *
+ *  - `console`：第三方库与任何漏网 `console.log` 的兜底落点，内容完全不可控。
+ *  - `renderer-console`：main 侧把**渲染进程任意 console 正文**转发进 main 流的落点。
+ *    它是「渲染进程转发的日志整类丢弃」这条约束的一个**绕过 `r:` 前缀机制**的通道——
+ *    功能代码 `console.error` 里的消息文本、搜索词、第三方库 payload、React 错误边界的
+ *    props 都会经它落盘。与 `renderer-guard`（加载失败信号，无用户内容，放行）严格分开。
+ *  - `secrets:*` / `providerSecretStore`：凭证相关，deny-by-default 的意义就在这里。
+ *  - `voice-input*`：听写草稿 = 用户语音内容。
+ *  - `desktop-commands*` / `terminal*`：命令行 = 用户输入。
+ *  - `file-browser*` / `fs:*`：文件路径与内容。
+ *  - `session-search` / `chat-history-search`：搜索关键词 = 用户输入。
+ *  - `skillhub*` / `plugin-*` / `brain*` / `mcp/*`：用户内容与第三方响应。
+ *  - `im*` / `git-*` / `worktree*` / `learn-host*` / `goal-host`：同上。
+ */
+const NOTABLE_DENIED_ROOTS: readonly string[] = [
+  'console',
+  'renderer-console',
+  'secrets',
+  'providerSecretStore',
+  'voice-input',
+  'desktop-commands',
+  'terminal',
+  'file-browser',
+  'session-search',
+  'chat-history-search',
+  'skillhub',
+  'brain',
+  'goal-host',
+  'learn-host',
+];
+
+/** scope 是否落在某个根下（精确相等，或 `<root>/` / `<root>:` 前缀）。 */
+function isUnderRoot(scope: string, root: string): boolean {
+  if (scope === root) return true;
+  return scope.startsWith(`${root}/`) || scope.startsWith(`${root}:`);
+}
+
+/**
+ * 判定一条记录的 scope 是否放行。
+ *
+ * 顺序有意义：先看排除表（放行根下的危险子来源），再看放行表。反过来会让
+ * `device-link:mediaFetch` 因为落在 `device-link` 根下而被放行。
+ */
+export function isAllowedScope(scope: string): boolean {
+  if (!scope) return false;
+  for (const denied of DENIED_SUB_SCOPES) {
+    if (isUnderRoot(scope, denied)) return false;
+  }
+  for (const root of ALLOWED_ROOT_SCOPES) {
+    if (isUnderRoot(scope, root)) return true;
+  }
+  return false;
+}
+
+export const __testing = { ALLOWED_ROOT_SCOPES, DENIED_SUB_SCOPES, NOTABLE_DENIED_ROOTS };

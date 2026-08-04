@@ -1,0 +1,187 @@
+/**
+ * 免签写入客户端的锁。
+ *
+ * 重点两条：
+ *  - **URL / 载荷形状**：project 走子域、logstore 走路径、原始时间戳作为普通字段携带
+ *    （不依赖服务端的 `__time__`，否则崩溃时间线会被上报时刻覆盖）。
+ *  - **部分成功算失败**：调用方靠「确实传成功且非空」才清除待补传标记，部分成功当成功会让
+ *    剩下的记录永远补不上。
+ */
+import { describe, expect, it, vi } from 'vitest';
+
+import { MAX_LOGS_PER_BATCH } from '../limits';
+import { buildTrackUrl, sendLogs, splitBatches, toWireTags } from '../logSink';
+import type { LogUploadMeta, LogUploadTarget, UploadRecord } from '../types';
+
+const TARGET: LogUploadTarget = {
+  project: 'cindy-client',
+  logstore: 'client-log',
+  endpointHost: 'cn-hangzhou.log.example.com',
+};
+
+const META: LogUploadMeta = {
+  uploadCode: 'ABCD-2345',
+  userId: 'user-1',
+  deviceId: 'device-1',
+  appVersion: '1.2.3',
+  region: 'cn',
+  platform: 'darwin',
+  arch: 'arm64',
+  osVersion: '24.6.0',
+  uiLanguage: 'zh-CN',
+  reason: 'manual',
+};
+
+function record(i: number, msg = `line ${i}`): UploadRecord {
+  return {
+    ts: `2026-08-04T10:00:${String(i % 60).padStart(2, '0')}.000+08:00`,
+    level: 'info',
+    src: 'main',
+    scope: 'lifecycle',
+    msg,
+  };
+}
+
+function okResponse(status = 200): Response {
+  return { status } as Response;
+}
+
+describe('buildTrackUrl', () => {
+  it('project 走子域、logstore 走路径', () => {
+    expect(buildTrackUrl(TARGET)).toBe(
+      'https://cindy-client.cn-hangzhou.log.example.com/logstores/client-log/track',
+    );
+  });
+});
+
+describe('toWireTags', () => {
+  it('带上后台检索需要的全部维度', () => {
+    expect(toWireTags(META)).toMatchObject({
+      uploadCode: 'ABCD-2345',
+      userId: 'user-1',
+      deviceId: 'device-1',
+      appVersion: '1.2.3',
+      region: 'cn',
+      platform: 'darwin',
+      arch: 'arm64',
+      osVersion: '24.6.0',
+      uiLanguage: 'zh-CN',
+      reason: 'manual',
+    });
+  });
+
+  it('未登录时不写 userId（显式空串会让后台的有值/无值判断变复杂）', () => {
+    expect(toWireTags({ ...META, userId: '' })).not.toHaveProperty('userId');
+  });
+
+  it('崩溃路径带 crashToken 与 crashAtMs（把即时与补传两次归组）', () => {
+    const tags = toWireTags({
+      ...META,
+      reason: 'crash-backfill',
+      crashToken: 'deadbeef',
+      crashAtMs: 1_775_000_000_000,
+    });
+    expect(tags.crashToken).toBe('deadbeef');
+    expect(tags.crashAtMs).toBe('1775000000000');
+  });
+
+  it('全部值都是字符串（web tracking 只接受字符串字段）', () => {
+    for (const value of Object.values(toWireTags({ ...META, crashAtMs: 1 }))) {
+      expect(typeof value).toBe('string');
+    }
+  });
+});
+
+describe('splitBatches', () => {
+  it('条数上限切批', () => {
+    const records = Array.from({ length: MAX_LOGS_PER_BATCH * 2 + 3 }, (_, i) => record(i));
+    const batches = splitBatches(records, META.uploadCode);
+    expect(batches).toHaveLength(3);
+    expect(batches[0]).toHaveLength(MAX_LOGS_PER_BATCH);
+    expect(batches[2]).toHaveLength(3);
+  });
+
+  it('字节上限切批（单条很大时批变小）', () => {
+    const big = 'x'.repeat(400 * 1024);
+    const records = [record(1, big), record(2, big), record(3, big), record(4, big)];
+    const batches = splitBatches(records, META.uploadCode);
+    expect(batches.length).toBeGreaterThan(1);
+  });
+
+  it('每条记录都带 uploadCode（不依赖 __tags__ 的服务端索引配置）', () => {
+    const batches = splitBatches([record(1)], META.uploadCode);
+    expect(batches[0][0].uploadCode).toBe(META.uploadCode);
+  });
+
+  it('原始时间戳作为普通字段携带，不被上报时刻覆盖', () => {
+    const batches = splitBatches([record(7)], META.uploadCode);
+    expect(batches[0][0].ts).toBe('2026-08-04T10:00:07.000+08:00');
+  });
+
+  it('空输入 ⇒ 空批次列表', () => {
+    expect(splitBatches([], META.uploadCode)).toEqual([]);
+  });
+});
+
+describe('sendLogs', () => {
+  it('全部批次 2xx ⇒ ok', async () => {
+    const fetchImpl = vi.fn(async () => okResponse());
+    const records = Array.from({ length: MAX_LOGS_PER_BATCH + 1 }, (_, i) => record(i));
+
+    const result = await sendLogs({ fetchImpl }, TARGET, META, records);
+
+    expect(result).toEqual({ ok: true, batches: 2, records: MAX_LOGS_PER_BATCH + 1 });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('POST 到 track 端点，带 JSON content-type 与 API 版本头', async () => {
+    // 显式标注签名:否则 vi.fn 从无参实现推出 `[]` 参数元组,读 mock.calls 时无法断言。
+    const fetchImpl = vi.fn<(input: string, init?: RequestInit) => Promise<Response>>(
+      async () => okResponse(),
+    );
+    await sendLogs({ fetchImpl }, TARGET, META, [record(1)]);
+
+    const [url, init] = fetchImpl.mock.calls[0];
+    expect(url).toBe(buildTrackUrl(TARGET));
+    expect(init).toBeDefined();
+    const request = init!;
+    expect(request.method).toBe('POST');
+    const headers = request.headers as Record<string, string>;
+    expect(headers['Content-Type']).toBe('application/json');
+    expect(headers['x-log-apiversion']).toBe('0.6.0');
+    const body = JSON.parse(request.body as string);
+    expect(body.__logs__).toHaveLength(1);
+    expect(body.__tags__.uploadCode).toBe(META.uploadCode);
+    expect(body.__source__).toBe('darwin-arm64');
+  });
+
+  it('某一批非 2xx ⇒ 整次判失败，且停止后续批次', async () => {
+    const fetchImpl = vi
+      .fn<(input: string, init?: RequestInit) => Promise<Response>>()
+      .mockResolvedValueOnce(okResponse())
+      .mockResolvedValueOnce(okResponse(403))
+      .mockResolvedValue(okResponse());
+    const records = Array.from({ length: MAX_LOGS_PER_BATCH * 3 }, (_, i) => record(i));
+
+    const result = await sendLogs({ fetchImpl }, TARGET, META, records);
+
+    expect(result).toEqual({
+      ok: false,
+      batches: 1,
+      sentRecords: MAX_LOGS_PER_BATCH,
+      status: 403,
+    });
+    // 第三批不该被发出去。
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('网络层失败 ⇒ status 0（调用方据此保留待补传标记）', async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('getaddrinfo ENOTFOUND');
+    });
+
+    const result = await sendLogs({ fetchImpl }, TARGET, META, [record(1)]);
+
+    expect(result).toEqual({ ok: false, batches: 0, sentRecords: 0, status: 0 });
+  });
+});

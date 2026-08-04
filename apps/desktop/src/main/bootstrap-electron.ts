@@ -297,6 +297,7 @@ import { isIpcError } from '../shared/ipc-errors';
 import { readFileBytesForPreview } from './fileReadBytes.js';
 import { initHeartbeatService } from './heartbeatService';
 import { initAnalyticsSettingsService, noteAuthColdStartState } from './analyticsSettingsService';
+import { initLogUploadService, scheduleStartupBackfill } from './log-upload';
 import { WindowManualDragController } from './windowManualDrag';
 // 设备互联(跨设备远程控制): relay 连接 host + 开关/设备列表 IPC
 import {
@@ -913,6 +914,10 @@ const authBoundaryLog = createLogger('auth-boundary');
 // 主窗 renderer 加载失败可观测性 + dev 启动看门狗(见 renderer-boot-guard.ts 顶部注释)。
 const rendererGuardLog = createLogger('renderer-guard');
 const safeStorageReadLog = createLogger('safe-storage:read');
+// 渲染进程 console 转发**单独一个 scope**:内容是渲染进程的任意 console 正文,可能带用户
+// 内容,因此不进日志上报的来源白名单;而 renderer-guard 的加载失败信号无用户内容、白屏排查
+// 必需,是放行的。两者不能共用 scope,详见 console-message 监听处的注释。
+const rendererConsoleLog = createLogger('renderer-console');
 const updatePresentationLog = createLogger('update-presentation');
 const voicePowerBroadcastLog = createLogger('voice-input-power');
 let rendererBootGuard: RendererBootGuard | null = null;
@@ -2419,6 +2424,9 @@ const createWindow = () => {
   mainWindow.once('ready-to-show', () => {
     mainWindow.show();
     if (!app.isPackaged) markDesktopDevWindowReady();
+    // 日志上报的启动补传:采集 + 脱敏是同步的重活,必须让主窗口先出来(内部再延迟 15s,
+    // 避开首帧的 IO 争用)。没有待补传标记时是零成本 no-op。
+    scheduleStartupBackfill();
     // `open` may successfully start the updated process while macOS refuses
     // frontmost activation at the lock/login window. Presentation is not an
     // installation-health signal; retain a one-shot focus grant for unlock.
@@ -2529,13 +2537,20 @@ const createWindow = () => {
   });
   mainWindow.webContents.on('console-message', (details) => {
     // error 恒记;warning 仅 dev(react dev 告警等噪音不进生产日志)。截断防超长堆栈刷屏。
+    //
+    // ⚠️ 这里刻意用 `renderer-console` 而不是 `renderer-guard`:转发的是**渲染进程任意
+    // console 正文**,可能带用户内容(功能代码的 console.error 里的消息文本、搜索词、
+    // 第三方库打出的 payload、React 错误边界里的 props)。日志上报的来源白名单只放行
+    // `renderer-guard`(preload-error / 加载失败 / boot guard —— 白屏排查必需且无用户内容),
+    // `renderer-console` 不在名单内。两者混用同一个 scope 会让整类渲染进程内容跟着放行,
+    // 违反「渲染进程转发的日志整类丢弃」(docs/dev-rules/log-upload-and-redaction.md §1.2)。
     const { level, message, lineNumber, sourceId } = details;
     if (level === 'error') {
-      rendererGuardLog.error(
+      rendererConsoleLog.error(
         `renderer console.error ${sourceId}:${lineNumber} ${message.slice(0, 2000)}`,
       );
     } else if (level === 'warning' && !app.isPackaged) {
-      rendererGuardLog.warn(
+      rendererConsoleLog.warn(
         `renderer console.warn ${sourceId}:${lineNumber} ${message.slice(0, 2000)}`,
       );
     }
@@ -6300,6 +6315,10 @@ app.on('ready', async () => {
   // handler 还没注册的话那次 invoke 会 reject,而它是 fail closed 的 —— 已同意
   // 的用户会一直不上报,直到手动去设置里拨一下开关。
   initAnalyticsSettingsService();
+  // 日志上报:同样必须在 createWindow 之前注册 —— 设置页一挂载就 invoke
+  // log-upload:settings-get 决定入口可用性;更重要的是崩溃即时路径要在
+  // onFatalShutdown 上就位,否则 createWindow 之后立刻崩的那一次拿不到标记。
+  initLogUploadService();
   startupWindowCreationAllowed = true;
   createWindow();
   // 预热仅服务 dev macOS，延迟执行避免和启动关键路径争用 CPU；失败由入口内部吞掉。

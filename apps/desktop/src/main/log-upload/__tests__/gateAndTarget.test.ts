@@ -1,0 +1,198 @@
+/**
+ * 授权闸与上报目标的锁（需求 §4.3 / §4.4 / §6）。
+ *
+ * 「未配置目标时不去读用户授权状态」「读取失败是 unknown 而不是 denied」这两条容易被后人
+ * 顺手改掉，所以各有一条独立用例钉住。
+ */
+import { describe, expect, it, vi } from 'vitest';
+
+import { evaluateGate, isManualUploadAvailable, type ConsentGateDeps } from '../consentGate';
+import { buildTrackUrl } from '../logSink';
+import { isTargetConfigured, resolveLogUploadTarget } from '../logUploadTarget';
+import type { LogUploadTarget } from '../types';
+
+function gate(overrides: Partial<ConsentGateDeps> = {}): ConsentGateDeps {
+  return {
+    isTargetConfigured: () => true,
+    refreshFromDisk: () => undefined,
+    readPrivacyConsentAccepted: () => true,
+    readCrashAutoUploadEnabled: () => true,
+    ...overrides,
+  };
+}
+
+describe('evaluateGate', () => {
+  it('手动上传：已配置 + 已同意 ⇒ 放行', () => {
+    expect(evaluateGate(gate(), 'manual')).toEqual({ kind: 'allowed' });
+  });
+
+  it('手动上传不看崩溃开关（点击本身即这一次的意图）', () => {
+    const deps = gate({ readCrashAutoUploadEnabled: () => false });
+    expect(evaluateGate(deps, 'manual')).toEqual({ kind: 'allowed' });
+  });
+
+  it('未配置目标 ⇒ denied(not-configured)，且不去读授权状态', () => {
+    const readConsent = vi.fn(() => true);
+    const deps = gate({ isTargetConfigured: () => false, readPrivacyConsentAccepted: readConsent });
+    expect(evaluateGate(deps, 'manual')).toEqual({ kind: 'denied', reason: 'not-configured' });
+    // 功能整体关闭时不该去碰用户的持久状态。
+    expect(readConsent).not.toHaveBeenCalled();
+  });
+
+  it('未同意隐私政策 ⇒ denied(no-consent)，三条路径都拦', () => {
+    const deps = gate({ readPrivacyConsentAccepted: () => false });
+    for (const reason of ['manual', 'crash-immediate', 'crash-backfill'] as const) {
+      expect(evaluateGate(deps, reason)).toEqual({ kind: 'denied', reason: 'no-consent' });
+    }
+  });
+
+  it('自动路径：崩溃开关关闭 ⇒ denied(crash-auto-off)', () => {
+    const deps = gate({ readCrashAutoUploadEnabled: () => false });
+    expect(evaluateGate(deps, 'crash-immediate')).toEqual({
+      kind: 'denied',
+      reason: 'crash-auto-off',
+    });
+    expect(evaluateGate(deps, 'crash-backfill')).toEqual({
+      kind: 'denied',
+      reason: 'crash-auto-off',
+    });
+  });
+
+  it('每次判定都先现读盘（跨实例撤回授权必须立刻生效）', () => {
+    const refresh = vi.fn();
+    const deps = gate({ refreshFromDisk: refresh });
+    evaluateGate(deps, 'manual');
+    evaluateGate(deps, 'crash-backfill');
+    expect(refresh).toHaveBeenCalledTimes(2);
+  });
+
+  it('读取抛异常 ⇒ unknown（不是 denied：不能用一次读取失败永久丢掉崩溃现场）', () => {
+    const deps = gate({
+      readPrivacyConsentAccepted: () => {
+        throw new Error('userData not ready');
+      },
+    });
+    expect(evaluateGate(deps, 'crash-backfill')).toEqual({ kind: 'unknown' });
+  });
+
+  it('现读盘本身抛异常 ⇒ unknown', () => {
+    const deps = gate({
+      refreshFromDisk: () => {
+        throw new Error('EPERM');
+      },
+    });
+    expect(evaluateGate(deps, 'manual')).toEqual({ kind: 'unknown' });
+  });
+});
+
+describe('isManualUploadAvailable', () => {
+  it('已配置 + 已同意 ⇒ true', () => {
+    expect(isManualUploadAvailable(gate())).toBe(true);
+  });
+
+  it('任一不满足 ⇒ false', () => {
+    expect(isManualUploadAvailable(gate({ isTargetConfigured: () => false }))).toBe(false);
+    expect(isManualUploadAvailable(gate({ readPrivacyConsentAccepted: () => false }))).toBe(false);
+  });
+});
+
+describe('isTargetConfigured', () => {
+  const full: LogUploadTarget = { project: 'p', logstore: 'l', endpointHost: 'h.example.com' };
+
+  it('有目标 ⇒ true', () => {
+    expect(isTargetConfigured(full)).toBe(true);
+  });
+
+  it('null ⇒ false（未配置 = 功能整体关闭）', () => {
+    expect(isTargetConfigured(null)).toBe(false);
+  });
+});
+
+/**
+ * 构建期注入的解析与区域交叉校验。
+ *
+ * 注入是文本替换（`vite.main.config.ts` 的 define），链路上任何一环出错的表现都是**静默**的
+ * ——包发出去、功能悄悄关掉，或者更糟：往另一个区域的 logstore 写。所以这一层的每种坏形态都
+ * 必须落在「返回 null」而不是「照用」。
+ */
+describe('resolveLogUploadTarget（构建期注入）', () => {
+  const raw = JSON.stringify({
+    region: 'cn',
+    project: 'cindy-sh-prod',
+    logstore: 'cindy-sh-prod-client-log',
+    endpointHost: 'cn-shanghai.log.aliyuncs.com',
+  });
+
+  it('注入串与本构建区域一致 ⇒ 取用', () => {
+    expect(resolveLogUploadTarget({ region: 'cn', raw })).toEqual({
+      project: 'cindy-sh-prod',
+      logstore: 'cindy-sh-prod-client-log',
+      endpointHost: 'cn-shanghai.log.aliyuncs.com',
+    });
+  });
+
+  it('拼出的写入地址逐字符正确（host 形态写错是静默失败，值得钉死）', () => {
+    expect(buildTrackUrl(resolveLogUploadTarget({ region: 'cn', raw })!)).toBe(
+      'https://cindy-sh-prod.cn-shanghai.log.aliyuncs.com/logstores/cindy-sh-prod-client-log/track',
+    );
+  });
+
+  it('产出对象只有三个字段（region 只用于校验，不进上报目标）', () => {
+    expect(Object.keys(resolveLogUploadTarget({ region: 'cn', raw })!).sort()).toEqual([
+      'endpointHost',
+      'logstore',
+      'project',
+    ]);
+  });
+
+  it('⚠️ 注入的 region 与本构建区域不一致 ⇒ null（宁可不上报，也不往可能错误的 logstore 写）', () => {
+    expect(resolveLogUploadTarget({ region: 'global', raw })).toBeNull();
+    expect(resolveLogUploadTarget({ region: 'dev', raw })).toBeNull();
+  });
+
+  it.each([
+    ['未注入（空串）', ''],
+    ['纯空白', '   '],
+    ['不是 JSON', 'not-json'],
+    ['JSON 数组', '[]'],
+    ['JSON 标量', '"x"'],
+    ['null', 'null'],
+  ])('%s ⇒ null（功能整体关闭，不抛）', (_case, value) => {
+    expect(resolveLogUploadTarget({ region: 'cn', raw: value })).toBeNull();
+  });
+
+  it.each([
+    ['缺 region', { project: 'p', logstore: 'l', endpointHost: 'h.example.com' }],
+    ['缺 project', { region: 'cn', logstore: 'l', endpointHost: 'h.example.com' }],
+    ['缺 logstore', { region: 'cn', project: 'p', endpointHost: 'h.example.com' }],
+    ['缺 endpointHost', { region: 'cn', project: 'p', logstore: 'l' }],
+    ['project 空串', { region: 'cn', project: '', logstore: 'l', endpointHost: 'h.example.com' }],
+    ['字段类型不对', { region: 'cn', project: 1, logstore: 'l', endpointHost: 'h.example.com' }],
+  ])('%s ⇒ null', (_case, payload) => {
+    expect(resolveLogUploadTarget({ region: 'cn', raw: JSON.stringify(payload) })).toBeNull();
+  });
+
+  it.each([
+    ['带协议', 'https://cn-shanghai.log.aliyuncs.com'],
+    ['带路径', 'cn-shanghai.log.aliyuncs.com/logstores'],
+    ['带 project 前缀', 'cindy-sh-prod.cn-shanghai.log.aliyuncs.com'],
+  ])('endpointHost %s ⇒ null（会让 logSink 拼出错误 URL，而那种错误是静默的）', (_case, host) => {
+    const payload = JSON.stringify({
+      region: 'cn',
+      project: 'cindy-sh-prod',
+      logstore: 'cindy-sh-prod-client-log',
+      endpointHost: host,
+    });
+    expect(resolveLogUploadTarget({ region: 'cn', raw: payload })).toBeNull();
+  });
+
+  it('未注入时（vitest / dev server 的真实情形）默认读环境变量并判未配置', () => {
+    const saved = process.env.XDT_LOG_UPLOAD_TARGET;
+    delete process.env.XDT_LOG_UPLOAD_TARGET;
+    try {
+      expect(resolveLogUploadTarget({ region: 'cn' })).toBeNull();
+    } finally {
+      if (saved !== undefined) process.env.XDT_LOG_UPLOAD_TARGET = saved;
+    }
+  });
+});

@@ -129,6 +129,22 @@ export function readAnalyticsSettings(): AnalyticsSettings {
   return store.read();
 }
 
+/**
+ * 现读盘一次(mtime 守卫,文件没变时零开销)。
+ *
+ * 消费方是日志上报的授权闸:开发版与正式版共享同一份 userData,用户可能在另一个实例里
+ * 刚刚撤回同意,而崩溃 / 启动这类自动路径在判定前必须看到最新值,不能用进程内的旧缓存
+ * 继续上传(需求 §4.3)。
+ *
+ * 刻意做成**显式入口**而不是在 readAnalyticsSettings 里默认现读:既有的
+ * `analytics:settings-get` 是 renderer 挂载即调的高频路径,给它加一次 stat 没有必要,
+ * 而且会改变现有缓存语义。
+ */
+export function refreshAnalyticsSettingsFromDisk(): void {
+  probeRecordOnce();
+  store.invalidateIfChanged();
+}
+
 export function readAnalyticsSettingsState(): OverrideSettingsState<AnalyticsSettings> {
   probeRecordOnce();
   return store.readState();
