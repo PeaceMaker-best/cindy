@@ -113,6 +113,32 @@ function dayAnchorDistance(dateKey: string, anchors: readonly number[]): number 
   return best;
 }
 
+/**
+ * 某一天文件的**定位锚点**：落在这一天 [00:00, 次日 00:00) 内的**最早**崩溃锚点；这一天没有
+ * 崩溃则返回 null。
+ *
+ * 超大文件必须按**自己这天**的崩溃定位,不能用全局最早锚点(2026-08-04 review P1):多个崩溃
+ * 标记跨天时,全局 `min(anchors)` 对晚一天的文件来说落在文件开头之前,二分收敛到 0 → 读到那天
+ * 最旧的 8MB、错过当天靠后的崩溃;而上报里仍有更早那天的记录,`runUpload` 会把**所有**认领的
+ * 标记一起清掉 → 漏掉的崩溃现场永久丢失。按当天最早锚点定位后,当天的崩溃现场落进窗口,清标记
+ * 才是安全的。
+ *
+ * 取当天**最早**而非最近:一天内可能多次崩溃,从最早那次的预卷开始才能覆盖到全部。
+ */
+export function earliestAnchorOnDay(dateKey: string, anchors: readonly number[]): number | null {
+  const dayStart = Date.parse(`${dateKey}T00:00:00`);
+  if (!Number.isFinite(dayStart)) return null;
+  const dayEnd = dayStart + DAY_MS;
+  let earliest: number | null = null;
+  for (const anchor of anchors) {
+    if (!Number.isFinite(anchor)) continue;
+    if (anchor >= dayStart && anchor < dayEnd && (earliest === null || anchor < earliest)) {
+      earliest = anchor;
+    }
+  }
+  return earliest;
+}
+
 export async function collectLogs(
   deps: CollectDeps,
   request: CollectRequest,
@@ -185,18 +211,21 @@ export async function collectLogs(
       const perFileBudget = Math.min(MAX_BYTES_PER_FILE, budget);
 
       // ── 定位读取 ──────────────────────────────────────────────────────────
-      // 有锚点时二分到「最早锚点 - 预卷」;否则读尾部(手动上报关心最近发生的事)。
+      // 定位锚点按**本文件这一天**取,不是全局最早锚点(review P1):跨天多崩溃时全局最早锚点
+      // 对晚一天的文件落在文件头之前,会读到那天最旧的一段、错过当天靠后的崩溃。
+      // 这一天没有崩溃锚点(或手动上报无锚点)则读尾部——关心的是最近发生的事。
+      const dayAnchor = earliestAnchorOnDay(plan.dateKey, anchors);
       let startOffset: number;
       let fromFileStart: boolean;
       if (size <= perFileBudget) {
         startOffset = 0;
         fromFileStart = true;
-      } else if (anchors.length > 0) {
-        const earliest = Math.min(...anchors) - ANCHOR_PRE_ROLL_MS;
+      } else if (dayAnchor !== null) {
+        const target = dayAnchor - ANCHOR_PRE_ROLL_MS;
         // 按流格式选时间戳解析器:main 是记录头,agent 是 NDJSON。用错的话每次探测都解不出
         // 时间戳,二分恒收敛到 0,超大 agent 文件的读窗口会错定在最旧记录(review P2)。
         const parseTs = plan.kind === 'main' ? parseMainHeadTimestamp : parseNdjsonTimestamp;
-        startOffset = await findOffsetAtOrBefore(file, earliest, parseTs);
+        startOffset = await findOffsetAtOrBefore(file, target, parseTs);
         fromFileStart = startOffset === 0;
       } else {
         startOffset = size - perFileBudget;

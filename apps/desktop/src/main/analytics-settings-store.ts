@@ -161,6 +161,18 @@ function probeRecordOnce(): RecordProbe {
 }
 
 /**
+ * 一次成功写入之后刷新探针结论（2026-08-04 review P2）。
+ *
+ * 若首次分类是 `invalid`，`probeRecordOnce()` 会一直返回 `invalid`，于是本会话里
+ * `isAnalyticsConsentRecordReadable()` 一直判「不可读」—— 用户即便重新同意、日志上报的授权闸
+ * 也仍然把它当读取故障，手动上报走 consent-required、崩溃补传卡到重启。写入成功后盘上内容
+ * 就是本 writer 刚写的(合法),或 override 清空后被删(= none),据此把陈旧的 `invalid` 结论作废。
+ */
+function refreshProbeAfterWrite(): void {
+  recordProbe = store.readState().isCustomized ? 'valid' : 'none';
+}
+
+/**
  * 盘上的同意记录**现在是否可读**。
  *
  * 「文件不存在」算可读:那是「从未同意」这个合法状态,不是读取故障。只有「文件在、但内容
@@ -277,6 +289,7 @@ export function acceptPrivacyConsent(): AnalyticsSettings {
   if (current.privacyConsentAccepted) return current;
   // preserveDefaults 无关:true ≠ 默认值 false,override 会被保留。
   store.writePatch({ privacyConsentAccepted: true });
+  refreshProbeAfterWrite();
   log.info('privacy consent accepted');
   return store.read();
 }
@@ -287,6 +300,7 @@ export function setAnalyticsEnabled(analyticsEnabled: boolean): AnalyticsSetting
   // 会被当成「未自定义」而删除 override。这里要留痕,否则无法区分「没碰过」和
   // 「关掉后又打开」——后者在合规问询时是需要能自证的。
   store.writePatch({ analyticsEnabled }, { preserveDefaults: true });
+  refreshProbeAfterWrite();
   log.info('analytics setting written', { analyticsEnabled });
   return store.read();
 }
@@ -312,6 +326,7 @@ export function migrateExistingLoginAsConsented(isSignedIn: boolean): boolean {
   // 再判一次,免得将来有人改动探针/override 语义时静默失守)。
   if (state.value.legacyConsentMigrationClosed) return false;
   store.writePatch({ privacyConsentAccepted: true });
+  refreshProbeAfterWrite();
   log.info('existing signed-in user migrated as consented');
   return true;
 }
@@ -330,6 +345,7 @@ export function closeLegacyConsentMigration(): boolean {
   if (current.legacyConsentMigrationClosed) return false;
   // true ≠ 默认值 false,override 会被保留(无需 preserveDefaults)。
   store.writePatch({ legacyConsentMigrationClosed: true });
+  refreshProbeAfterWrite();
   log.info('legacy consent migration window closed for this machine');
   return true;
 }
@@ -350,6 +366,9 @@ export function isAnalyticsEnabledCustomized(): boolean {
 export function clearAnalyticsEnabledOverride(): AnalyticsSettings {
   probeRecordOnce();
   store.writePatch({ analyticsEnabled: DEFAULTS.analyticsEnabled });
+  // 这条可能把最后一个 override 删掉(文件随之删除)⇒ 结论应为 none 而非 valid;
+  // refreshProbeAfterWrite 按 isCustomized 区分,不会误标 valid。
+  refreshProbeAfterWrite();
   log.info('analytics enabled override cleared');
   return store.read();
 }

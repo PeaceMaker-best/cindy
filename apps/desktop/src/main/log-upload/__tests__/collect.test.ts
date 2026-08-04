@@ -13,7 +13,13 @@ import {
   escapeMainLogContinuationLines,
   RECORD_FORMAT_SENTINEL_MSG,
 } from '../../../shared/mainLogRecordFormat';
-import { collectLogs, resolveLookbackDays, trimByAnchors, type CollectDeps } from '../collect';
+import {
+  collectLogs,
+  earliestAnchorOnDay,
+  resolveLookbackDays,
+  trimByAnchors,
+  type CollectDeps,
+} from '../collect';
 import { MAX_LOOKBACK_DAYS_CAP, MAX_RECORDS } from '../limits';
 import type { ParsedRecord } from '../types';
 
@@ -269,6 +275,52 @@ describe('第四层：上报记录只有五个白名单字段', () => {
     const result = await collectLogs(deps, { reason: 'manual', anchors: [] });
 
     expect(Object.keys(result.records[0]).sort()).toEqual(['level', 'msg', 'scope', 'src', 'ts']);
+  });
+});
+
+/**
+ * 2026-08-04 review P1 的回归锁：超大崩溃日志按**本文件这一天**的锚点定位,不能用全局最早
+ * 锚点。跨天多崩溃时全局 min 对晚一天的文件落在文件头之前,二分收敛到 0,读到那天最旧的一段、
+ * 错过当天靠后的崩溃,而所有认领标记又会被一起清掉 → 漏掉的崩溃现场永久丢失。
+ */
+describe('earliestAnchorOnDay：按天取定位锚点', () => {
+  const day = (y: number, m: number, d: number, h = 0, min = 0): number =>
+    new Date(y, m - 1, d, h, min, 0).getTime();
+
+  it('锚点落在当天 ⇒ 返回它', () => {
+    expect(earliestAnchorOnDay('2026-08-04', [day(2026, 8, 4, 10)])).toBe(day(2026, 8, 4, 10));
+  });
+
+  it('当天有多个崩溃 ⇒ 返回最早的（从最早那次的预卷开始才能覆盖全部）', () => {
+    const early = day(2026, 8, 4, 2);
+    const late = day(2026, 8, 4, 20);
+    expect(earliestAnchorOnDay('2026-08-04', [late, early])).toBe(early);
+  });
+
+  it('⚠️ 锚点在别的天 ⇒ null（不会用别天的崩溃去定位本文件）', () => {
+    // 崩溃在 08-06,查 08-04 那天的文件:早先用全局 min 会把 08-06 之前的目标算到 08-04
+    // 文件头之前 → 收敛到 0；现在按天取,08-04 没有崩溃 ⇒ null ⇒ 调用方读尾部。
+    expect(earliestAnchorOnDay('2026-08-04', [day(2026, 8, 6, 9)])).toBeNull();
+    expect(earliestAnchorOnDay('2026-08-04', [day(2026, 8, 2, 9)])).toBeNull();
+  });
+
+  it('多天崩溃：各天只认自己那天的锚点', () => {
+    const anchors = [day(2026, 8, 4, 3), day(2026, 8, 6, 21)];
+    expect(earliestAnchorOnDay('2026-08-04', anchors)).toBe(day(2026, 8, 4, 3));
+    expect(earliestAnchorOnDay('2026-08-06', anchors)).toBe(day(2026, 8, 6, 21));
+    expect(earliestAnchorOnDay('2026-08-05', anchors)).toBeNull();
+  });
+
+  it('日界:次日 00:00 归次日、不算前一天', () => {
+    const midnight = day(2026, 8, 5, 0, 0);
+    expect(earliestAnchorOnDay('2026-08-05', [midnight])).toBe(midnight);
+    expect(earliestAnchorOnDay('2026-08-04', [midnight])).toBeNull();
+  });
+
+  it('dateKey 非法 / 无有限锚点 ⇒ null', () => {
+    expect(earliestAnchorOnDay('not-a-date', [day(2026, 8, 4, 10)])).toBeNull();
+    expect(earliestAnchorOnDay('2026-08-04', [Number.NaN])).toBeNull();
+    expect(earliestAnchorOnDay('2026-08-04', [])).toBeNull();
   });
 });
 

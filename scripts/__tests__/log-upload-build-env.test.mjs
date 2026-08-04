@@ -105,6 +105,48 @@ test('文件不存在 ⇒ 抛错并说明真值来源', () => {
   );
 });
 
+/**
+ * 2026-08-04 review P1：版本无关 / 开源打包用 allowMissing，配置文件缺失时不抛、返回 null
+ * （功能整体关闭），拉仓即可打包。但只放宽「缺失」——文件在但内容损坏仍硬失败。
+ */
+test('allowMissing: 文件不存在 ⇒ 返回 null（不抛）', () => {
+  const dir = makeTempDir('cindy-log-upload-allowmissing-');
+  assert.equal(
+    loadLogUploadTargets({ configPath: path.join(dir, 'log-upload.json'), allowMissing: true }),
+    null,
+  );
+});
+
+test('allowMissing 只放宽「缺失」：文件在但坏 JSON 仍抛', () => {
+  const badPath = writeConfig('{ not json');
+  assert.throws(
+    () => loadLogUploadTargets({ configPath: badPath, allowMissing: true }),
+    /不是合法 JSON/,
+  );
+});
+
+test('desktopLogUploadBuildEnv: allowMissing + 文件缺失 ⇒ 注入空串（版本无关/开源打包）', () => {
+  const dir = makeTempDir('cindy-log-upload-buildenv-missing-');
+  const env = desktopLogUploadBuildEnv({
+    authRegion: 'global',
+    configPath: path.join(dir, 'log-upload.json'),
+    allowMissing: true,
+  });
+  assert.equal(env[LOG_UPLOAD_TARGET_ENV], '');
+});
+
+test('desktopLogUploadBuildEnv: 默认(发行打包)文件缺失仍抛 —— 不静默关掉发行观测', () => {
+  const dir = makeTempDir('cindy-log-upload-buildenv-required-');
+  assert.throws(
+    () =>
+      desktopLogUploadBuildEnv({
+        authRegion: 'global',
+        configPath: path.join(dir, 'log-upload.json'),
+      }),
+    /缺少日志上报配置/,
+  );
+});
+
 test('坏 JSON / 非 object / schemaVersion 非法 ⇒ 抛错', () => {
   assertThrowsMatching('{ not json', /不是合法 JSON/);
   assertThrowsMatching('[]', /必须是 JSON object/);

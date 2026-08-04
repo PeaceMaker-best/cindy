@@ -96,13 +96,20 @@ function normalizeRegionTarget(raw, region) {
  * 全量校验（而不是只看当前构建区域）是有意的：跨区域隔离这条不变量只有同时看到两份配置才能
  * 验证，而打包一次只构建一个区域。任一区域配错都让打包失败，早于发布。
  */
-export function loadLogUploadTargets({ repoRoot = REPO_ROOT, configPath } = {}) {
+/**
+ * `allowMissing`：**文件缺失**（ENOENT）时不抛错，返回 `null`（= 全区域无目标 ⇒ 功能整体
+ * 关闭）。给版本无关 / 开源打包用：默认 checkout 里 `config/log-upload.json` 是 gitignore 的、
+ * 不存在,不该因此打不出包(2026-08-04 review P1)。注意**只对「缺失」放宽** —— 文件在但内容
+ * 损坏 / 非法仍然硬失败(半截配置比没有更危险),发行(有版本)打包也仍然要求文件必须在。
+ */
+export function loadLogUploadTargets({ repoRoot = REPO_ROOT, configPath, allowMissing = false } = {}) {
   const file = configPath ?? logUploadConfigPath(repoRoot);
   let parsed;
   try {
     parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
   } catch (error) {
     if (error && typeof error === 'object' && error.code === 'ENOENT') {
+      if (allowMissing) return null;
       throw new Error(
         `缺少日志上报配置: ${file}\n` +
           '真值不进仓,唯一事实源在 cindy-build-scripts 仓根;打包机由 sync-desktop-release-kit.sh ' +
@@ -175,13 +182,17 @@ function assertRegionsIsolated(targets, file) {
  *
  * 注入串里带 `region`，运行时会与烘焙的 `VITE_CINDY_AUTH_REGION` 交叉校验，不一致即视为
  * 未配置。这样"cn 包误带 global 目标"这类错配在运行时也拦得住，而不是只靠打包脚本正确。
+ *
+ * `allowMissing`（版本无关 / 开源打包传 true）：配置文件缺失时注入空串而不是抛错，让功能整体
+ * 关闭。发行(有版本)打包传 false（默认），缺失即硬失败。
  */
-export function desktopLogUploadBuildEnv({ authRegion, repoRoot, configPath } = {}) {
+export function desktopLogUploadBuildEnv({ authRegion, repoRoot, configPath, allowMissing = false } = {}) {
   const region = resolveClientBuildRegion(
     authRegion || process.env.CINDY_AUTH_REGION?.trim(),
   );
-  const targets = loadLogUploadTargets({ repoRoot, configPath });
-  const target = targets[region];
+  const targets = loadLogUploadTargets({ repoRoot, configPath, allowMissing });
+  // targets === null 只在 allowMissing 且文件缺失时发生 ⇒ 无目标,功能整体关闭。
+  const target = targets?.[region] ?? null;
   return {
     [LOG_UPLOAD_TARGET_ENV]: target ? JSON.stringify(target) : '',
   };
