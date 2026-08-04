@@ -201,6 +201,7 @@ export function wechatCommitPollBatch(
         throw invalidArgs(`messages.${index}.overloadReply is required when queue is full`);
       }
       insertOutboxChunk(
+        db,
         insertOutbox,
         bindingEpoch,
         message.id,
@@ -416,7 +417,7 @@ export function wechatCommitInterrupted(db: Database.Database, args: unknown): b
     if (outbox.length > 0) {
       const insertOutbox = prepareOutboxInsert(db);
       for (const chunk of outbox) {
-        insertOutboxChunk(insertOutbox, bindingEpoch, taskId, chunk, now);
+        insertOutboxChunk(db, insertOutbox, bindingEpoch, taskId, chunk, now);
       }
       db.prepare(
         `UPDATE wechat_inbox
@@ -462,7 +463,7 @@ export function wechatCommitPreDispatchFailure(db: Database.Database, args: unkn
     if (row?.status !== 'dispatching') return false;
     const insertOutbox = prepareOutboxInsert(db);
     for (const chunk of outbox) {
-      insertOutboxChunk(insertOutbox, bindingEpoch, taskId, chunk, now);
+      insertOutboxChunk(db, insertOutbox, bindingEpoch, taskId, chunk, now);
     }
     const updated = db
       .prepare(
@@ -578,7 +579,7 @@ export function wechatCommitTerminal(
 
     const insertOutbox = prepareOutboxInsert(db);
     for (const chunk of outbox) {
-      insertOutboxChunk(insertOutbox, bindingEpoch, taskId, chunk, now);
+      insertOutboxChunk(db, insertOutbox, bindingEpoch, taskId, chunk, now);
     }
     const updated = db
       .prepare(
@@ -619,6 +620,7 @@ export function wechatMarkOutboxDelivered(
          WHERE id = ? AND binding_epoch = ? AND status IN ('pending', 'sending')`,
         )
         .run(deliveredAt, outboxId, bindingEpoch).changes === 1;
+    if (changed) releaseOutboxMediaRefsByOutboxId(db, outboxId);
     const remaining = Number(
       db
         .prepare(
@@ -686,6 +688,7 @@ export function wechatRecordOutboxFailure(
        SET status = 'failed_terminal'
        WHERE task_id = ? AND binding_epoch = ? AND status != 'delivered'`,
     ).run(row.taskId, bindingEpoch);
+    releaseOutboxMediaRefsByTask(db, bindingEpoch, row.taskId);
     const taskFailed =
       db
         .prepare(
@@ -772,6 +775,7 @@ export function wechatCloseBindingEpoch(db: Database.Database, args: unknown): {
        WHERE binding_epoch = ? AND status IN ('accepted_running', 'waiting_desktop')`,
     ).run(bindingEpoch);
     releaseTerminalMediaRefs(db, bindingEpoch);
+    releaseOutboxMediaRefsByBinding(db, bindingEpoch);
     return { closed: true };
   })();
 }
@@ -919,15 +923,20 @@ export function wechatUnbindCleanup(
         )
         .all(bindingEpoch) as Array<{ absPath: string }>
     ).map(({ absPath }) => absPath);
-    const deletedMediaRefs = db
+    const deletedInboxMediaRefs = db
       .prepare(
         `DELETE FROM media_refs
          WHERE ref_kind IN ('im-inbox', 'wechat-inbox')
            AND ref_id IN (SELECT id FROM wechat_inbox WHERE binding_epoch = ?)`,
       )
       .run(bindingEpoch).changes;
+    const deletedOutboxMediaRefs = releaseOutboxMediaRefsByBinding(db, bindingEpoch);
     db.prepare('DELETE FROM wechat_sync_state WHERE binding_epoch = ?').run(bindingEpoch);
-    return { deletedTasks, deletedMediaRefs, filePaths };
+    return {
+      deletedTasks,
+      deletedMediaRefs: deletedInboxMediaRefs + deletedOutboxMediaRefs,
+      filePaths,
+    };
   })();
 }
 
@@ -1116,12 +1125,20 @@ function prepareOutboxInsert(db: Database.Database): Database.Statement {
 }
 
 function insertOutboxChunk(
+  db: Database.Database,
   statement: Database.Statement,
   bindingEpoch: string,
   taskId: string,
   chunk: WechatOutboxChunkInput,
   now: number,
 ): void {
+  const mediaJson = JSON.stringify(
+    (chunk.media ?? []).map(({ absPath, fileName, clientId }) => ({
+      absPath,
+      fileName,
+      clientId,
+    })),
+  );
   statement.run(
     chunk.id,
     bindingEpoch,
@@ -1130,16 +1147,26 @@ function insertOutboxChunk(
     chunk.kind,
     chunk.chunkIndex,
     chunk.text,
-    chunk.mediaJson ?? '[]',
+    mediaJson,
     now,
     now,
   );
+  const insertMediaRef = db.prepare(
+    `INSERT INTO media_refs
+      (id, hash, ref_kind, ref_id, origin_session_id, origin_kind, origin_id, label, created_at)
+     VALUES (lower(hex(randomblob(16))), ?, 'wechat-outbox', ?, NULL,
+             'integration', 'wechat', ?, ?)`,
+  );
+  for (const media of chunk.media ?? []) {
+    insertMediaRef.run(media.hash, chunk.id, media.fileName, now);
+  }
 }
 
 function parseOutbox(value: unknown, label: string): WechatOutboxChunkInput[] {
   const rows = expectArray(value, label);
   enforceArrayLimit(rows, label, MAX_OUTBOX_CHUNKS);
   const seenChunks = new Set<number>();
+  let totalMedia = 0;
   return rows.map((raw, index) => {
     const itemLabel = `${label}.${index}`;
     const item = asRecord(raw, itemLabel);
@@ -1152,19 +1179,66 @@ function parseOutbox(value: unknown, label: string): WechatOutboxChunkInput[] {
       'interrupted',
       'overload',
     ] as const);
-    const mediaJson =
-      item.mediaJson === undefined
-        ? undefined
-        : expectString(item.mediaJson, `${itemLabel}.mediaJson`, 256 * 1024);
+    const media = item.media === undefined ? [] : expectArray(item.media, `${itemLabel}.media`);
+    enforceArrayLimit(media, `${itemLabel}.media`, 4);
+    totalMedia += media.length;
+    if (totalMedia > 4) throw invalidArgs(`${label} exceeds 4 media items`);
     return {
       id: expectId(item.id, `${itemLabel}.id`),
       clientId: expectId(item.clientId, `${itemLabel}.clientId`),
       kind,
       chunkIndex,
       text: expectString(item.text, `${itemLabel}.text`, 16_384),
-      mediaJson,
+      media: media.map((rawMedia, mediaIndex) => {
+        const mediaLabel = `${itemLabel}.media.${mediaIndex}`;
+        const mediaItem = asRecord(rawMedia, mediaLabel);
+        return {
+          hash: expectHash(mediaItem.hash, `${mediaLabel}.hash`),
+          absPath: expectString(mediaItem.absPath, `${mediaLabel}.absPath`, 32_768),
+          fileName: expectString(mediaItem.fileName, `${mediaLabel}.fileName`, 1_024),
+          clientId: expectId(mediaItem.clientId, `${mediaLabel}.clientId`),
+        };
+      }),
     };
   });
+}
+
+function releaseOutboxMediaRefsByOutboxId(
+  db: Database.Database,
+  outboxId: string,
+): number {
+  return db
+    .prepare("DELETE FROM media_refs WHERE ref_kind = 'wechat-outbox' AND ref_id = ?")
+    .run(outboxId).changes;
+}
+
+function releaseOutboxMediaRefsByTask(
+  db: Database.Database,
+  bindingEpoch: string,
+  taskId: string,
+): number {
+  return db
+    .prepare(
+      `DELETE FROM media_refs
+       WHERE ref_kind = 'wechat-outbox'
+         AND ref_id IN (
+           SELECT id FROM wechat_outbox WHERE binding_epoch = ? AND task_id = ?
+         )`,
+    )
+    .run(bindingEpoch, taskId).changes;
+}
+
+function releaseOutboxMediaRefsByBinding(
+  db: Database.Database,
+  bindingEpoch: string,
+): number {
+  return db
+    .prepare(
+      `DELETE FROM media_refs
+       WHERE ref_kind = 'wechat-outbox'
+         AND ref_id IN (SELECT id FROM wechat_outbox WHERE binding_epoch = ?)`,
+    )
+    .run(bindingEpoch).changes;
 }
 
 function expirePendingTasks(db: Database.Database, bindingEpoch: string, now: number): number {

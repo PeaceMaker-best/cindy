@@ -1045,6 +1045,16 @@ export class GoalController {
    * 这样重开会话能让 active 目标自己跑下去,而不是卡死等用户重发 /goal。
    */
   async resumeOnOpen(sessionId: string): Promise<void> {
+    const withLifecycle = this.deps.withActiveSessionLifecycle;
+    if (withLifecycle) {
+      const result = await withLifecycle(sessionId, () => this.resumeOnOpenUnlocked(sessionId));
+      if (!result.admitted) return;
+      return;
+    }
+    await this.resumeOnOpenUnlocked(sessionId);
+  }
+
+  private async resumeOnOpenUnlocked(sessionId: string): Promise<void> {
     if (this.unsubscribers.has(sessionId) || this.turns.has(sessionId)) return; // 已在管或正在 Stop
     const lifecycleBoundary = freshTurn();
     this.turns.set(sessionId, lifecycleBoundary);
@@ -1086,7 +1096,8 @@ export class GoalController {
     if (this.turns.get(sessionId) !== lifecycleBoundary) return;
     this.emit(state);
     if (!this.isBusy(sessionId)) {
-      await this.fireTurn(sessionId);
+      // resumeOnOpen 已持有 session lifecycle lock；直接调用无锁执行体，避免递归抢同一把锁。
+      await this.fireTurnUnlocked(sessionId);
     }
   }
 
@@ -1675,6 +1686,16 @@ export class GoalController {
   }
 
   private async fireTurn(sessionId: string): Promise<void> {
+    const withLifecycle = this.deps.withActiveSessionLifecycle;
+    if (withLifecycle) {
+      const result = await withLifecycle(sessionId, () => this.fireTurnUnlocked(sessionId));
+      if (!result.admitted) return;
+      return;
+    }
+    await this.fireTurnUnlocked(sessionId);
+  }
+
+  private async fireTurnUnlocked(sessionId: string): Promise<void> {
     const lifecycleBoundary = this.turns.get(sessionId);
     if (!lifecycleBoundary || lifecycleBoundary.cancelled) return;
     const lifecycleGeneration = lifecycleBoundary.generation;

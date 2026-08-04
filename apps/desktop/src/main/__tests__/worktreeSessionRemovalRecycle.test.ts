@@ -2,7 +2,7 @@
  * sessionRemovalRecycle 回归(P0 重构:回收唯一驱动点):
  *   - ephemeral worktree 跳过(池生命周期)
  *   - 非 ephemeral → removeWorktreeForSession
- *   - 启动对账:只补收 deleted / 行缺失的孤儿,active / archived 保留;DB 失败零删除
+ *   - 启动对账:只补收明确 deleted 的孤儿,active / archived / 缺失行保留;DB 失败零删除
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import path from 'node:path';
@@ -138,7 +138,7 @@ describe('sessionRemovalRecycle', () => {
   });
 
   describe('reconcileWorktreesForDeletedSessions', () => {
-    it('recycles only deleted / missing owners; active and archived preserved', async () => {
+    it('recycles only explicit deleted owners; active, archived, and missing rows preserved', async () => {
       storeMap.set('active', makeMeta('active'));
       storeMap.set('archived', makeMeta('archived'));
       storeMap.set('deleted', makeMeta('deleted'));
@@ -148,13 +148,28 @@ describe('sessionRemovalRecycle', () => {
         { id: 'active', status: 'active' },
         { id: 'archived', status: 'archived' },
         { id: 'deleted', status: 'deleted' },
-        // 'missing' 无行 → 视为孤儿; 'eph' 是 ephemeral 不进候选
+        // 'missing' 无行 → 多账号场景下身份不明,保留; 'eph' 是 ephemeral 不进候选
       );
 
       await mod.reconcileWorktreesForDeletedSessions();
 
       const removed = removeMock.mock.calls.map((c) => c[0]).sort();
-      expect(removed).toEqual(['deleted', 'missing']);
+      expect(removed).toEqual(['deleted']);
+    });
+
+    it('stops before a candidate when the captured owner is no longer current', async () => {
+      storeMap.set('deleted', makeMeta('deleted'));
+      sessionRows.push({ id: 'deleted', status: 'deleted' });
+      let checks = 0;
+
+      await mod.reconcileWorktreesForDeletedSessions({
+        canContinue: () => {
+          checks += 1;
+          return checks === 1;
+        },
+      });
+
+      expect(removeMock).not.toHaveBeenCalled();
     });
 
     it('empty store → no db query, no removals', async () => {
@@ -175,6 +190,7 @@ describe('sessionRemovalRecycle', () => {
     it('single remove failure does not abort the rest', async () => {
       storeMap.set('d1', makeMeta('d1'));
       storeMap.set('d2', makeMeta('d2'));
+      sessionRows.push({ id: 'd1', status: 'deleted' }, { id: 'd2', status: 'deleted' });
       removeMock.mockRejectedValueOnce(new Error('locked'));
 
       await mod.reconcileWorktreesForDeletedSessions();

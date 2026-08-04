@@ -23,6 +23,7 @@ vi.mock('electron', () => ({
 
 const schema = await import('../../localDb/schema');
 const chatAttachments = await import('../chatAttachments');
+const ledger = await import('../ledger');
 
 const MIGRATION_0070 = path.resolve(__dirname, '../../../../drizzle/0070_woozy_harpoon.sql');
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -145,6 +146,29 @@ describe('commitChatImageUrls(发送时挂引用)', () => {
     );
     expect(other.committed).toBe(1);
     expect(db.select().from(schema.mediaRefs).all()).toHaveLength(2);
+  });
+
+  it('父子任务共享 blob 时删除父任务仍保留子任务引用', async () => {
+    await chatAttachments.ingestChatImageBuffer({ buffer: PNG_BYTES, mimeType: 'image/png' }, db);
+    await chatAttachments.commitMessageMediaRefs(
+      { sessionId: 'parent', role: 'user', content: `text ${PNG_URL}` },
+      db,
+    );
+    await chatAttachments.commitMessageMediaRefs(
+      { sessionId: 'fork', role: 'assistant', content: `copied ${PNG_URL}` },
+      db,
+    );
+
+    await expect(ledger.removeSessionRefs('parent', db)).resolves.toBe(1);
+    expect(db.select().from(schema.mediaRefs).all()).toMatchObject([
+      {
+        hash: PNG_HASH,
+        refKind: 'session-attachment',
+        refId: 'fork',
+        originSessionId: 'fork',
+        originKind: 'tool',
+      },
+    ]);
   });
 
   it('形状不合法的 URL 跳过不炸', async () => {

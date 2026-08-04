@@ -31,6 +31,10 @@ function createTables(db: Database.Database): void {
       source TEXT NOT NULL DEFAULT 'desktop',
       extra_dirs TEXT NOT NULL DEFAULT '[]',
       codex_history_has_product_prompt INTEGER,
+      runtime_owner_id TEXT,
+      runtime_owner_pid INTEGER,
+      runtime_owner_process_start TEXT,
+      runtime_owner_heartbeat_at INTEGER,
       cleared_at INTEGER,
       user_send_at INTEGER,
       created_at INTEGER NOT NULL,
@@ -56,6 +60,7 @@ function validArgs() {
   return {
     name: 'session.importShare',
     args: {
+      runtimeOwnerId: 'test-runtime-owner',
       session: {
         id: 'new-session-1',
         title: '分享来的会话',
@@ -135,7 +140,7 @@ describe('tx session.importShare', () => {
 
   it('inserts session and all messages (including rewound rows) atomically', () => {
     const result = tx(db, validArgs());
-    expect(result).toEqual({ messageCount: 3 });
+    expect(result).toEqual({ messageCount: 3, replacedSession: null });
     const session = db
       .prepare('SELECT * FROM sessions WHERE id = ?')
       .get('new-session-1') as Record<string, unknown>;
@@ -187,5 +192,130 @@ describe('tx session.importShare', () => {
       expect((err as { code?: string }).code).toBe('ALREADY_EXISTS');
     }
     expect(db.prepare('SELECT COUNT(*) AS n FROM messages').get()).toEqual({ n: 3 });
+  });
+
+  it('atomically deletes the expected live owner and inserts the replacement', () => {
+    db.prepare(
+      `INSERT INTO sessions (
+        id, title, working_dir, workspace_kind, agent_kind, status, sdk_session_id,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run('old-session', 'Old session', '/old/repo', 'project', 'cc', 'active', 'sdk-abc', 1, 2);
+    const args = validArgs();
+    (
+      args.args as typeof args.args & {
+        overwriteExisting: { sessionId: string; expectedStatus: 'active' | 'archived' };
+      }
+    ).overwriteExisting = {
+      sessionId: 'old-session',
+      expectedStatus: 'active',
+    };
+
+    expect(tx(db, args)).toEqual({
+      messageCount: 3,
+      replacedSession: {
+        sessionId: 'old-session',
+        title: 'Old session',
+        workingDir: '/old/repo',
+        workspaceKind: 'project',
+      },
+    });
+    expect(
+      db.prepare('SELECT status, updated_at FROM sessions WHERE id = ?').get('old-session'),
+    ).toEqual({ status: 'deleted', updated_at: 1700000001000 });
+    expect(db.prepare('SELECT COUNT(*) AS n FROM sessions').get()).toEqual({ n: 2 });
+  });
+
+  it('rolls the old status back when replacement message insertion fails', () => {
+    db.prepare(
+      `INSERT INTO sessions (id, title, agent_kind, status, sdk_session_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run('old-session', 'Old session', 'cc', 'archived', 'sdk-abc', 1, 2);
+    const args = validArgs();
+    (
+      args.args as typeof args.args & {
+        overwriteExisting: { sessionId: string; expectedStatus: 'active' | 'archived' };
+      }
+    ).overwriteExisting = {
+      sessionId: 'old-session',
+      expectedStatus: 'archived',
+    };
+    args.args.messages[2].id = 'm1';
+
+    expect(() => tx(db, args)).toThrow();
+    expect(db.prepare('SELECT status FROM sessions WHERE id = ?').get('old-session')).toEqual({
+      status: 'archived',
+    });
+    expect(db.prepare('SELECT id FROM sessions WHERE id = ?').get('new-session-1')).toBeUndefined();
+  });
+
+  it('rejects a stale overwrite precondition without changing either side', () => {
+    db.prepare(
+      `INSERT INTO sessions (id, title, agent_kind, status, sdk_session_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run('old-session', 'Old session', 'cc', 'archived', 'sdk-abc', 1, 2);
+    const args = validArgs();
+    (
+      args.args as typeof args.args & {
+        overwriteExisting: { sessionId: string; expectedStatus: 'active' | 'archived' };
+      }
+    ).overwriteExisting = {
+      sessionId: 'old-session',
+      expectedStatus: 'active',
+    };
+
+    try {
+      tx(db, args);
+      expect.unreachable();
+    } catch (err) {
+      expect((err as { code?: string }).code).toBe('PRECONDITION_FAILED');
+    }
+    expect(db.prepare('SELECT status FROM sessions WHERE id = ?').get('old-session')).toEqual({
+      status: 'archived',
+    });
+    expect(db.prepare('SELECT id FROM sessions WHERE id = ?').get('new-session-1')).toBeUndefined();
+  });
+
+  it('rolls back the old owner when a competing live session appears before replacement insert', () => {
+    db.prepare(
+      `INSERT INTO sessions (id, title, agent_kind, status, sdk_session_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      'old-session',
+      'Old session',
+      'cc',
+      'active',
+      'sdk-abc',
+      1,
+      2,
+      'competing-session',
+      'Competing session',
+      'cc',
+      'active',
+      'sdk-abc',
+      3,
+      4,
+    );
+    const args = validArgs();
+    (
+      args.args as typeof args.args & {
+        overwriteExisting: { sessionId: string; expectedStatus: 'active' | 'archived' };
+      }
+    ).overwriteExisting = {
+      sessionId: 'old-session',
+      expectedStatus: 'active',
+    };
+
+    try {
+      tx(db, args);
+      expect.unreachable();
+    } catch (err) {
+      expect((err as { code?: string }).code).toBe('PRECONDITION_FAILED');
+    }
+    expect(db.prepare('SELECT id, status FROM sessions ORDER BY id').all()).toEqual([
+      { id: 'competing-session', status: 'active' },
+      { id: 'old-session', status: 'active' },
+    ]);
+    expect(db.prepare('SELECT COUNT(*) AS n FROM messages').get()).toEqual({ n: 0 });
   });
 });

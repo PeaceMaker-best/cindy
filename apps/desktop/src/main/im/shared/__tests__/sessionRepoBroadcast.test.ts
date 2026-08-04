@@ -10,7 +10,10 @@ const mocks = vi.hoisted(() => {
   return {
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     insertConflict,
-    insertValues: vi.fn(() => ({ onConflictDoUpdate: insertConflict })),
+    insertValues: vi.fn(() => ({
+      onConflictDoNothing: insertConflict,
+      onConflictDoUpdate: insertConflict,
+    })),
     webContentsSend: vi.fn(),
     tapWindowBroadcast: vi.fn(),
   };
@@ -35,11 +38,18 @@ vi.mock('../../../localDb/client/current', () => ({
     drizzle: {
       insert: () => ({ values: mocks.insertValues }),
       // createSession upsert 后回读持久化行;返回空数组时回落 prepared row
-      select: () => ({ from: () => ({ where: () => ({ limit: async () => [] }) }) }),
+      select: () => ({
+        from: () => ({
+          where: () => ({ orderBy: () => ({ limit: async () => [] }) }),
+        }),
+      }),
     },
   }),
 }));
-vi.mock('../../../localDb/schema', () => ({ sessions: {} }));
+vi.mock('../../../localDb/schema', () => ({
+  sessions: {},
+  messages: { sessionId: {} },
+}));
 vi.mock('../../../maker-host/session-provider-store', () => ({
   setSessionProvider: vi.fn(),
 }));

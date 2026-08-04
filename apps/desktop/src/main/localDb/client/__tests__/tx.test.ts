@@ -27,6 +27,7 @@ CREATE TABLE sessions (
   permission_mode TEXT NOT NULL DEFAULT 'ask',
   status TEXT NOT NULL DEFAULT 'active',
   sdk_session_id TEXT,
+  worktree_path TEXT,
   total_token_usage INTEGER NOT NULL DEFAULT 0,
   total_cost_usd REAL NOT NULL DEFAULT 0,
   total_cost_amount REAL NOT NULL DEFAULT 0,
@@ -35,18 +36,40 @@ CREATE TABLE sessions (
   context_tokens INTEGER NOT NULL DEFAULT 0,
   context_window INTEGER NOT NULL DEFAULT 0,
   fast_mode INTEGER NOT NULL DEFAULT 0,
+  plan_mode_enabled INTEGER NOT NULL DEFAULT 0,
   cleared_at INTEGER,
   pinned_at INTEGER,
+  summary TEXT,
   user_send_at INTEGER,
   agent_kind TEXT NOT NULL DEFAULT 'cc',
+  source TEXT NOT NULL DEFAULT 'desktop',
+  feishu_open_id TEXT,
+  feishu_bot_app_id TEXT,
+  im_bot_context_id TEXT,
+  im_user_id TEXT,
+  im_logical_session_id TEXT,
+  im_generation INTEGER NOT NULL DEFAULT 0,
+  extra_dirs TEXT NOT NULL DEFAULT '[]',
   orca_role TEXT,
   workspace_kind TEXT NOT NULL DEFAULT 'project',
   codex_history_has_product_prompt INTEGER,
+  used_project_context INTEGER NOT NULL DEFAULT 0,
+  remote_host_id TEXT,
+  active_turn_started_at INTEGER,
+  active_turn_pid INTEGER,
+  last_turn_ended_at INTEGER,
+  runtime_owner_id TEXT,
+  runtime_owner_pid INTEGER,
+  runtime_owner_process_start TEXT,
+  runtime_owner_heartbeat_at INTEGER,
   parent_session_id TEXT,
   forked_at_message_id TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+CREATE UNIQUE INDEX uniq_sessions_live_im_logical
+  ON sessions(im_logical_session_id)
+  WHERE im_logical_session_id IS NOT NULL AND status != 'deleted';
 CREATE TABLE orca_teams (
   id TEXT PRIMARY KEY,
   lead_session_id TEXT NOT NULL,
@@ -102,6 +125,34 @@ CREATE TABLE im_bindings (
   PRIMARY KEY(channel, bot_context_id, user_id, scope_key)
 );
 CREATE INDEX idx_im_bindings_target ON im_bindings(target_session_id);
+CREATE TABLE session_pr_refs (id TEXT PRIMARY KEY, session_id TEXT NOT NULL);
+CREATE TABLE session_goals (session_id TEXT PRIMARY KEY, objective TEXT NOT NULL);
+CREATE TABLE agent_input_queue_snapshots (session_id TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at INTEGER NOT NULL);
+CREATE TABLE right_sidebar_tabs (id TEXT PRIMARY KEY, session_id TEXT NOT NULL);
+CREATE TABLE schedules (
+  id TEXT PRIMARY KEY,
+  target_session_id TEXT,
+  skip_log_session_id TEXT,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE schedule_runs (id TEXT PRIMARY KEY, session_id TEXT);
+CREATE TABLE wechat_inbox (
+  id TEXT PRIMARY KEY,
+  session_id TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  lease_until INTEGER,
+  last_error_code TEXT
+);
+CREATE TABLE wechat_file_attachments (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  session_id TEXT,
+  status TEXT NOT NULL DEFAULT 'staged'
+);
+CREATE TABLE media_refs (id TEXT PRIMARY KEY, ref_kind TEXT NOT NULL, ref_id TEXT NOT NULL);
+CREATE TABLE skill_usage_sources (raw_file_path TEXT PRIMARY KEY, session_id TEXT NOT NULL);
+CREATE TABLE skill_usage_exposures (id TEXT PRIMARY KEY, session_id TEXT NOT NULL);
+CREATE TABLE ghost_cards (call_id TEXT PRIMARY KEY, session_id TEXT);
 CREATE TABLE embedding_jobs (
   rowid INTEGER PRIMARY KEY AUTOINCREMENT,
   source TEXT NOT NULL,
@@ -206,7 +257,9 @@ describe('db worker tx handlers', () => {
           'local-1',
           's1',
           'assistant',
-          JSON.stringify('已保存::codex-file-citation{path="/tmp/报告.docx" purpose="output"},请查收。'),
+          JSON.stringify(
+            '已保存::codex-file-citation{path="/tmp/报告.docx" purpose="output"},请查收。',
+          ),
           1000,
         ],
       );
@@ -313,7 +366,9 @@ describe('db worker tx handlers', () => {
           'local-1',
           's1',
           'assistant',
-          JSON.stringify('保存 :codex-file-citation{path="/tmp/a:codex-file-citation{path=\\"/b\\"}.md"} 完成'),
+          JSON.stringify(
+            '保存 :codex-file-citation{path="/tmp/a:codex-file-citation{path=\\"/b\\"}.md"} 完成',
+          ),
           1000,
         ],
       );
@@ -562,62 +617,80 @@ describe('db worker tx handlers', () => {
         ],
       );
 
-      await expect(client.tx('session.treeRehydrate', {
-        sessionId: 's1',
-        now: 1000,
-        contextTokens: 69,
-        contextWindow: 200000,
-        messages: [
-          {
-            id: 'ignored-on-upsert',
-            clientId: 'shared-client',
-            role: 'assistant',
-            content: JSON.stringify('active branch'),
-            toolUseId: null,
-            agentMeta: JSON.stringify({ uuid: 'assistant-a' }),
-            agentKind: 'pi',
-            createdAt: 200,
-          },
-          {
-            id: 'new-active',
-            clientId: 'new-client',
-            role: 'user',
-            content: JSON.stringify({ text: 'new path' }),
-            toolUseId: null,
-            agentMeta: JSON.stringify({ uuid: 'user-b' }),
-            agentKind: 'pi',
-            createdAt: 201,
-          },
-        ],
-      })).resolves.toEqual({
+      await expect(
+        client.tx('session.treeRehydrate', {
+          sessionId: 's1',
+          now: 1000,
+          contextTokens: 69,
+          contextWindow: 200000,
+          messages: [
+            {
+              id: 'ignored-on-upsert',
+              clientId: 'shared-client',
+              role: 'assistant',
+              content: JSON.stringify('active branch'),
+              toolUseId: null,
+              agentMeta: JSON.stringify({ uuid: 'assistant-a' }),
+              agentKind: 'pi',
+              createdAt: 200,
+            },
+            {
+              id: 'new-active',
+              clientId: 'new-client',
+              role: 'user',
+              content: JSON.stringify({ text: 'new path' }),
+              toolUseId: null,
+              agentMeta: JSON.stringify({ uuid: 'user-b' }),
+              agentKind: 'pi',
+              createdAt: 201,
+            },
+          ],
+        }),
+      ).resolves.toEqual({
         messageCount: 2,
         // 隐藏动作那一刻的完整可见集(只有 shared-client 可见;hidden-client 早已 rewind),
         // 供调用方作删除广播的权威集 —— 含导航期间并发落库的消息。
         hiddenClientIds: ['shared-client'],
       });
 
-      await expect(client.query(
-        'SELECT id, client_id, content, created_at, rewind_at FROM messages WHERE session_id = ? ORDER BY id',
-        ['s1'],
-      )).resolves.toEqual([
+      await expect(
+        client.query(
+          'SELECT id, client_id, content, created_at, rewind_at FROM messages WHERE session_id = ? ORDER BY id',
+          ['s1'],
+        ),
+      ).resolves.toEqual([
         {
-          id: 'new-active', client_id: 'new-client', content: JSON.stringify({ text: 'new path' }),
-          created_at: 201, rewind_at: null,
+          id: 'new-active',
+          client_id: 'new-client',
+          content: JSON.stringify({ text: 'new path' }),
+          created_at: 201,
+          rewind_at: null,
         },
         {
-          id: 'old-hidden', client_id: 'hidden-client', content: JSON.stringify('already hidden'),
-          created_at: 90, rewind_at: 500,
+          id: 'old-hidden',
+          client_id: 'hidden-client',
+          content: JSON.stringify('already hidden'),
+          created_at: 90,
+          rewind_at: 500,
         },
         {
-          id: 'old-visible', client_id: 'shared-client', content: JSON.stringify('active branch'),
-          created_at: 200, rewind_at: null,
+          id: 'old-visible',
+          client_id: 'shared-client',
+          content: JSON.stringify('active branch'),
+          created_at: 200,
+          rewind_at: null,
         },
       ]);
-      await expect(client.queryOne(
-        'SELECT cleared_at, context_tokens, context_window, updated_at FROM sessions WHERE id = ?',
-        ['s1'],
-      )).resolves.toEqual({
-        cleared_at: null, context_tokens: 69, context_window: 200000, updated_at: 1000,
+      await expect(
+        client.queryOne(
+          'SELECT cleared_at, context_tokens, context_window, updated_at FROM sessions WHERE id = ?',
+          ['s1'],
+        ),
+      ).resolves.toEqual({
+        cleared_at: null,
+        context_tokens: 69,
+        context_window: 200000,
+        updated_at: 1000,
       });
     });
   });
@@ -632,11 +705,25 @@ describe('db worker tx handlers', () => {
           (id, client_id, session_id, role, content, agent_meta, agent_kind, created_at, rewind_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
-          'pre-visible', 'client-pre', 's1', 'user', JSON.stringify('before navigation'),
-          null, 'pi', 100, null,
+          'pre-visible',
+          'client-pre',
+          's1',
+          'user',
+          JSON.stringify('before navigation'),
+          null,
+          'pi',
+          100,
+          null,
           // 模拟导航进行中另一个窗口并发落库、导航前快照未见的消息。
-          'concurrent', 'client-concurrent', 's1', 'assistant', JSON.stringify('sent mid-navigation'),
-          null, 'pi', 150, null,
+          'concurrent',
+          'client-concurrent',
+          's1',
+          'assistant',
+          JSON.stringify('sent mid-navigation'),
+          null,
+          'pi',
+          150,
+          null,
         ],
       );
 
@@ -647,9 +734,14 @@ describe('db worker tx handlers', () => {
         contextWindow: 200000,
         messages: [
           {
-            id: 'active', clientId: 'client-active', role: 'assistant',
-            content: JSON.stringify('new active path'), toolUseId: null,
-            agentMeta: null, agentKind: 'pi', createdAt: 300,
+            id: 'active',
+            clientId: 'client-active',
+            role: 'assistant',
+            content: JSON.stringify('new active path'),
+            toolUseId: null,
+            agentMeta: null,
+            agentKind: 'pi',
+            createdAt: 300,
           },
         ],
       });
@@ -658,98 +750,154 @@ describe('db worker tx handlers', () => {
       expect(result.messageCount).toBe(1);
       expect([...result.hiddenClientIds].sort()).toEqual(['client-concurrent', 'client-pre']);
       // 并发消息确实被 rewind(不再可见),否则 Renderer 会继续显示 DB 里已隐藏的它。
-      await expect(client.query(
-        'SELECT client_id FROM messages WHERE session_id = ? AND rewind_at IS NULL ORDER BY client_id',
-        ['s1'],
-      )).resolves.toEqual([{ client_id: 'client-active' }]);
+      await expect(
+        client.query(
+          'SELECT client_id FROM messages WHERE session_id = ? AND rewind_at IS NULL ORDER BY client_id',
+          ['s1'],
+        ),
+      ).resolves.toEqual([{ client_id: 'client-active' }]);
     });
   });
 
-  it.each([false, true])('session.treeRehydrate preserves Cindy-managed attachments across A→B→A (inline=%s)', async (useInlineWorker) => {
-    await withClient(async (client) => {
-      await seedSession(client, 's1');
-      const original = {
-        text: 'Review these assets',
-        images: [{ url: 'cindy-media://blobs/image-a.webp', name: 'design.webp' }],
-        files: [{ path: '/repo/spec.pdf', name: 'spec.pdf' }],
-      };
-      const hostAgentMeta = {
-        origin: { kind: 'scheduler', scheduleId: 'schedule-1', runId: 'run-1' },
-        autoResume: true,
-        autoResumeInfo: { reason: 'capacity', attempt: 2, maxAttempts: 5, sessionTotal: 3 },
-      };
-      await client.exec(
-        `INSERT INTO messages
+  it.each([false, true])(
+    'session.treeRehydrate preserves Cindy-managed attachments across A→B→A (inline=%s)',
+    async (useInlineWorker) => {
+      await withClient(
+        async (client) => {
+          await seedSession(client, 's1');
+          const original = {
+            text: 'Review these assets',
+            images: [{ url: 'cindy-media://blobs/image-a.webp', name: 'design.webp' }],
+            files: [{ path: '/repo/spec.pdf', name: 'spec.pdf' }],
+          };
+          const hostAgentMeta = {
+            origin: { kind: 'scheduler', scheduleId: 'schedule-1', runId: 'run-1' },
+            autoResume: true,
+            autoResumeInfo: { reason: 'capacity', attempt: 2, maxAttempts: 5, sessionTotal: 3 },
+          };
+          await client.exec(
+            `INSERT INTO messages
           (id, client_id, session_id, role, content, agent_meta, agent_kind, created_at, rewind_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          'original-user', 'original-client', 's1', 'user', JSON.stringify(original),
-          JSON.stringify({
-            uuid: 'host-message-uuid',
-            piEntryId: 'pi-user-entry',
-            ...hostAgentMeta,
-          }), 'pi', 123, null,
-        ],
+            [
+              'original-user',
+              'original-client',
+              's1',
+              'user',
+              JSON.stringify(original),
+              JSON.stringify({
+                uuid: 'host-message-uuid',
+                piEntryId: 'pi-user-entry',
+                ...hostAgentMeta,
+              }),
+              'pi',
+              123,
+              null,
+            ],
+          );
+
+          await client.tx('session.treeRehydrate', {
+            sessionId: 's1',
+            now: 200,
+            contextTokens: 1,
+            contextWindow: 200000,
+            messages: [
+              {
+                id: 'pi-reprojected-user',
+                clientId: 'pi-tree-pi-user-entry-user',
+                role: 'user',
+                // Pi's transcript keeps only model-consumable blocks; the native image is a placeholder.
+                content: JSON.stringify({ text: 'Review these assets\n\n[image]' }),
+                toolUseId: null,
+                agentMeta: JSON.stringify({ uuid: 'pi-user-entry' }),
+                // DB createdAt=123 and Pi timestamp=100 are intentionally different: first navigation
+                // must restore by the persisted piEntryId, not by timestamp coincidence.
+                agentKind: 'pi',
+                createdAt: 100,
+              },
+            ],
+          });
+
+          await expect(
+            client.queryOne(
+              'SELECT content, agent_meta FROM messages WHERE session_id = ? AND client_id = ?',
+              ['s1', 'pi-tree-pi-user-entry-user'],
+            ),
+          ).resolves.toEqual({
+            content: JSON.stringify({
+              text: 'Review these assets\n\n[image]',
+              images: original.images,
+              files: original.files,
+            }),
+            agent_meta: JSON.stringify({ uuid: 'pi-user-entry', ...hostAgentMeta }),
+          });
+
+          // 先切到不相关的 B 分支：旧活动分支的附件不能被模糊复制过去。
+          await client.tx('session.treeRehydrate', {
+            sessionId: 's1',
+            now: 250,
+            contextTokens: 1,
+            contextWindow: 200000,
+            messages: [
+              {
+                id: 'branch-b-user',
+                clientId: 'pi-tree-branch-b-user',
+                role: 'user',
+                content: JSON.stringify({ text: 'Different branch' }),
+                toolUseId: null,
+                agentMeta: JSON.stringify({ uuid: 'branch-b' }),
+                agentKind: 'pi',
+                createdAt: 150,
+              },
+            ],
+          });
+          await expect(
+            client.queryOne(
+              'SELECT content, agent_meta FROM messages WHERE session_id = ? AND client_id = ?',
+              ['s1', 'pi-tree-branch-b-user'],
+            ),
+          ).resolves.toEqual({
+            content: JSON.stringify({ text: 'Different branch' }),
+            agent_meta: JSON.stringify({ uuid: 'branch-b' }),
+          });
+
+          // B→A 切回时按 entry uuid 复用 A 的历史投影，附件仍在。
+          await client.tx('session.treeRehydrate', {
+            sessionId: 's1',
+            now: 300,
+            contextTokens: 1,
+            contextWindow: 200000,
+            messages: [
+              {
+                id: 'pi-reprojected-user',
+                clientId: 'pi-tree-pi-user-entry-user',
+                role: 'user',
+                content: JSON.stringify({ text: 'Review these assets\n\n[image]' }),
+                toolUseId: null,
+                agentMeta: JSON.stringify({ uuid: 'pi-user-entry' }),
+                agentKind: 'pi',
+                createdAt: 100,
+              },
+            ],
+          });
+          await expect(
+            client.queryOne(
+              'SELECT content, agent_meta FROM messages WHERE session_id = ? AND client_id = ?',
+              ['s1', 'pi-tree-pi-user-entry-user'],
+            ),
+          ).resolves.toEqual({
+            content: JSON.stringify({
+              text: 'Review these assets\n\n[image]',
+              images: original.images,
+              files: original.files,
+            }),
+            agent_meta: JSON.stringify({ uuid: 'pi-user-entry', ...hostAgentMeta }),
+          });
+        },
+        { useInlineWorker },
       );
-
-      await client.tx('session.treeRehydrate', {
-        sessionId: 's1', now: 200, contextTokens: 1, contextWindow: 200000,
-        messages: [{
-          id: 'pi-reprojected-user', clientId: 'pi-tree-pi-user-entry-user', role: 'user',
-          // Pi's transcript keeps only model-consumable blocks; the native image is a placeholder.
-          content: JSON.stringify({ text: 'Review these assets\n\n[image]' }),
-          toolUseId: null, agentMeta: JSON.stringify({ uuid: 'pi-user-entry' }),
-          // DB createdAt=123 and Pi timestamp=100 are intentionally different: first navigation
-          // must restore by the persisted piEntryId, not by timestamp coincidence.
-          agentKind: 'pi', createdAt: 100,
-        }],
-      });
-
-      await expect(client.queryOne(
-        'SELECT content, agent_meta FROM messages WHERE session_id = ? AND client_id = ?',
-        ['s1', 'pi-tree-pi-user-entry-user'],
-      )).resolves.toEqual({
-        content: JSON.stringify({ text: 'Review these assets\n\n[image]', images: original.images, files: original.files }),
-        agent_meta: JSON.stringify({ uuid: 'pi-user-entry', ...hostAgentMeta }),
-      });
-
-      // 先切到不相关的 B 分支：旧活动分支的附件不能被模糊复制过去。
-      await client.tx('session.treeRehydrate', {
-        sessionId: 's1', now: 250, contextTokens: 1, contextWindow: 200000,
-        messages: [{
-          id: 'branch-b-user', clientId: 'pi-tree-branch-b-user', role: 'user',
-          content: JSON.stringify({ text: 'Different branch' }),
-          toolUseId: null, agentMeta: JSON.stringify({ uuid: 'branch-b' }),
-          agentKind: 'pi', createdAt: 150,
-        }],
-      });
-      await expect(client.queryOne(
-        'SELECT content, agent_meta FROM messages WHERE session_id = ? AND client_id = ?',
-        ['s1', 'pi-tree-branch-b-user'],
-      )).resolves.toEqual({
-        content: JSON.stringify({ text: 'Different branch' }),
-        agent_meta: JSON.stringify({ uuid: 'branch-b' }),
-      });
-
-      // B→A 切回时按 entry uuid 复用 A 的历史投影，附件仍在。
-      await client.tx('session.treeRehydrate', {
-        sessionId: 's1', now: 300, contextTokens: 1, contextWindow: 200000,
-        messages: [{
-          id: 'pi-reprojected-user', clientId: 'pi-tree-pi-user-entry-user', role: 'user',
-          content: JSON.stringify({ text: 'Review these assets\n\n[image]' }),
-          toolUseId: null, agentMeta: JSON.stringify({ uuid: 'pi-user-entry' }),
-          agentKind: 'pi', createdAt: 100,
-        }],
-      });
-      await expect(client.queryOne(
-        'SELECT content, agent_meta FROM messages WHERE session_id = ? AND client_id = ?',
-        ['s1', 'pi-tree-pi-user-entry-user'],
-      )).resolves.toEqual({
-        content: JSON.stringify({ text: 'Review these assets\n\n[image]', images: original.images, files: original.files }),
-        agent_meta: JSON.stringify({ uuid: 'pi-user-entry', ...hostAgentMeta }),
-      });
-    }, { useInlineWorker });
-  });
+    },
+  );
 
   it('sessions.renameTitles applies title changes atomically with preconditions', async () => {
     await withClient(async (client) => {
@@ -801,6 +949,413 @@ describe('db worker tx handlers', () => {
       ).resolves.toEqual({
         title: 'New title',
       });
+    });
+  });
+
+  it.each([false, true])(
+    'sessions.setStatus rejects deleted-session revival atomically (inline=%s)',
+    async (useInlineWorker) => {
+      await withClient(
+        async (client) => {
+          await seedSession(client, 'live', { status: 'active' });
+          await seedSession(client, 'gone', { status: 'deleted' });
+
+          await expect(
+            client.tx('sessions.setStatus', {
+              sessionIds: ['live', 'gone'],
+              status: 'archived',
+              runtimeOwnerId: 'test-runtime-owner',
+            }),
+          ).rejects.toMatchObject({ code: 'PRECONDITION_FAILED' });
+          await expect(
+            client.query<{ id: string; status: string }>(
+              'SELECT id, status FROM sessions ORDER BY id',
+            ),
+          ).resolves.toEqual([
+            { id: 'gone', status: 'deleted' },
+            { id: 'live', status: 'active' },
+          ]);
+        },
+        { useInlineWorker },
+      );
+    },
+  );
+
+  it.each([false, true])(
+    'session.importShare atomically replaces its expected live owner (inline=%s)',
+    async (useInlineWorker) => {
+      await withClient(
+        async (client) => {
+          await seedSession(client, 'old', {
+            title: 'Old session',
+            workingDir: '/old/repo',
+            status: 'active',
+            agentKind: 'cc',
+            sdkSessionId: 'sdk-shared',
+          });
+
+          const result = await client.tx('session.importShare', {
+            runtimeOwnerId: 'test-runtime-owner',
+            session: {
+              id: 'replacement',
+              title: 'Replacement',
+              workingDir: '/new/repo',
+              workspaceKind: 'project',
+              worktreePath: null,
+              model: 'claude',
+              effort: 'high',
+              permissionMode: 'ask',
+              providerId: null,
+              status: 'active',
+              sdkSessionId: 'sdk-shared',
+              totalTokenUsage: 0,
+              totalCostUsd: 0,
+              contextTokens: 0,
+              contextWindow: 200000,
+              fastMode: false,
+              planModeEnabled: false,
+              agentKind: 'cc',
+              source: 'shared',
+              extraDirs: '[]',
+              codexHistoryHasProductPrompt: null,
+              clearedAt: null,
+              userSendAt: null,
+              createdAt: 100,
+              updatedAt: 200,
+            },
+            messages: [
+              {
+                id: 'shared-message',
+                clientId: 'shared-client',
+                role: 'user',
+                content: '"hello"',
+                toolUseId: null,
+                agentMeta: null,
+                agentKind: 'cc',
+                createdAt: 150,
+                rewindAt: null,
+              },
+            ],
+            overwriteExisting: {
+              sessionId: 'old',
+              expectedStatus: 'active',
+            },
+          });
+
+          expect(result).toEqual({
+            messageCount: 1,
+            replacedSession: {
+              sessionId: 'old',
+              title: 'Old session',
+              workingDir: '/old/repo',
+              workspaceKind: 'project',
+            },
+          });
+          await expect(
+            client.query<{ id: string; status: string }>(
+              'SELECT id, status FROM sessions ORDER BY id',
+            ),
+          ).resolves.toEqual([
+            { id: 'old', status: 'deleted' },
+            { id: 'replacement', status: 'active' },
+          ]);
+        },
+        { useInlineWorker },
+      );
+    },
+  );
+
+  it.each([false, true])(
+    'deleted lifecycle keeps the tombstone and inserts a distinct IM generation (inline=%s)',
+    async (useInlineWorker) => {
+      await withClient(
+        async (client) => {
+          await seedSession(client, 'deleted-im', { status: 'deleted' });
+          await client.exec(
+            'UPDATE sessions SET im_logical_session_id = ?, im_generation = ? WHERE id = ?',
+            ['logical-im', 0, 'deleted-im'],
+          );
+          await seedSession(client, 'child');
+          await client.exec('UPDATE sessions SET parent_session_id = ? WHERE id = ?', [
+            'deleted-im',
+            'child',
+          ]);
+          await client.exec(
+            "INSERT INTO messages (id, client_id, session_id, role, content, created_at) VALUES ('m-old', 'c-old', 'deleted-im', 'user', '\"old\"', 1)",
+          );
+          const statements: Array<[string, unknown[]]> = [
+            ["INSERT INTO im_bindings VALUES ('slack','bot','user','', 'deleted-im',1,NULL)", []],
+            ["INSERT INTO session_goals VALUES ('deleted-im','old goal')", []],
+            ["INSERT INTO agent_input_queue_snapshots VALUES ('deleted-im','[]',1)", []],
+            ["INSERT INTO right_sidebar_tabs VALUES ('tab','deleted-im')", []],
+            ["INSERT INTO session_pr_refs VALUES ('pr','deleted-im')", []],
+            ["INSERT INTO schedules VALUES ('schedule','deleted-im','deleted-im',1)", []],
+            ["INSERT INTO schedule_runs VALUES ('run','deleted-im')", []],
+            [
+              "INSERT INTO wechat_inbox (id,session_id,status) VALUES ('inbox','deleted-im','pending')",
+              [],
+            ],
+            [
+              "INSERT INTO wechat_file_attachments (id,task_id,session_id,status) VALUES ('file','inbox','deleted-im','staged')",
+              [],
+            ],
+            ["INSERT INTO media_refs VALUES ('media','im-inbox','inbox')", []],
+            ["INSERT INTO skill_usage_sources VALUES ('source','deleted-im')", []],
+            ["INSERT INTO skill_usage_exposures VALUES ('exposure','deleted-im')", []],
+            ["INSERT INTO ghost_cards VALUES ('card','deleted-im')", []],
+          ];
+          for (const [sql, params] of statements) await client.exec(sql, params);
+
+          await expect(
+            client.tx('session.prepareDeletedLifecycle', {
+              sessionId: 'deleted-im',
+              now: 998,
+            }),
+          ).resolves.toBe(true);
+
+          await expect(
+            client.tx('session.replaceDeletedGeneration', {
+              oldSessionId: 'deleted-im',
+              newSessionId: 'fresh-im',
+              logicalSessionId: 'logical-im',
+              generation: 1,
+              title: 'Fresh IM',
+              workingDir: '/fresh',
+              workspaceKind: 'dialogue',
+              model: 'claude-opus-4-8',
+              effort: 'high',
+              permissionMode: 'auto',
+              providerId: null,
+              fastMode: false,
+              agentKind: 'cc',
+              source: 'slack',
+              feishuOpenId: null,
+              feishuBotAppId: null,
+              imBotContextId: 'bot',
+              imUserId: 'user',
+              now: 999,
+            }),
+          ).resolves.toBe('fresh-im');
+
+          await expect(
+            client.queryOne(
+              'SELECT status, title, cleared_at, sdk_session_id, im_logical_session_id, im_generation FROM sessions WHERE id = ?',
+              ['deleted-im'],
+            ),
+          ).resolves.toEqual({
+            status: 'deleted',
+            title: 'Session deleted-im',
+            cleared_at: null,
+            sdk_session_id: 'sdk-deleted-im',
+            im_logical_session_id: 'logical-im',
+            im_generation: 0,
+          });
+          await expect(
+            client.queryOne(
+              'SELECT status, title, cleared_at, sdk_session_id, im_logical_session_id, im_generation FROM sessions WHERE id = ?',
+              ['fresh-im'],
+            ),
+          ).resolves.toEqual({
+            status: 'active',
+            title: 'Fresh IM',
+            cleared_at: null,
+            sdk_session_id: null,
+            im_logical_session_id: 'logical-im',
+            im_generation: 1,
+          });
+          await expect(
+            client.queryOne('SELECT parent_session_id FROM sessions WHERE id = ?', ['child']),
+          ).resolves.toEqual({ parent_session_id: null });
+          await expect(
+            client.queryOne('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?', [
+              'fresh-im',
+            ]),
+          ).resolves.toEqual({ n: 0 });
+          await expect(
+            client.queryOne('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?', [
+              'deleted-im',
+            ]),
+          ).resolves.toEqual({ n: 1 });
+          for (const table of [
+            'im_bindings',
+            'session_goals',
+            'agent_input_queue_snapshots',
+            'right_sidebar_tabs',
+            'session_pr_refs',
+            'skill_usage_sources',
+            'skill_usage_exposures',
+            'ghost_cards',
+          ]) {
+            await expect(client.queryOne(`SELECT COUNT(*) AS n FROM ${table}`)).resolves.toEqual({
+              n: 0,
+            });
+          }
+          await expect(
+            client.queryOne(
+              'SELECT target_session_id, skip_log_session_id FROM schedules WHERE id = ?',
+              ['schedule'],
+            ),
+          ).resolves.toEqual({ target_session_id: null, skip_log_session_id: null });
+          await expect(
+            client.queryOne('SELECT status, last_error_code FROM wechat_inbox WHERE id = ?', [
+              'inbox',
+            ]),
+          ).resolves.toEqual({ status: 'cancelled', last_error_code: 'SESSION_DELETED' });
+          await expect(
+            client.queryOne('SELECT status FROM wechat_file_attachments WHERE id = ?', ['file']),
+          ).resolves.toEqual({ status: 'released' });
+          await expect(client.queryOne('SELECT COUNT(*) AS n FROM media_refs')).resolves.toEqual({
+            n: 0,
+          });
+        },
+        { useInlineWorker },
+      );
+    },
+  );
+
+  it.each([false, true])(
+    'deleted generation replacement rejects a stale tombstone when a newer generation exists (inline=%s)',
+    async (useInlineWorker) => {
+      await withClient(
+        async (client) => {
+          await seedSession(client, 'deleted-im-0', { status: 'deleted' });
+          await client.exec(
+            'UPDATE sessions SET im_logical_session_id = ?, im_generation = ? WHERE id = ?',
+            ['logical-im', 0, 'deleted-im-0'],
+          );
+          await seedSession(client, 'deleted-im-1', { status: 'deleted' });
+          await client.exec(
+            'UPDATE sessions SET im_logical_session_id = ?, im_generation = ? WHERE id = ?',
+            ['logical-im', 1, 'deleted-im-1'],
+          );
+
+          await expect(
+            client.tx(
+              'session.replaceDeletedGeneration',
+              deletedGenerationArgs('deleted-im-0', 'fresh-im-stale', 1),
+            ),
+          ).resolves.toBeNull();
+          await expect(
+            client.queryOne(
+              `SELECT COUNT(*) AS n FROM sessions
+               WHERE im_logical_session_id = ? AND status != 'deleted'`,
+              ['logical-im'],
+            ),
+          ).resolves.toEqual({ n: 0 });
+        },
+        { useInlineWorker },
+      );
+    },
+  );
+
+  it.each([false, true])(
+    'deleted lifecycle terminalizes only cancellable WeChat tasks before attachment cleanup (inline=%s)',
+    async (useInlineWorker) => {
+      await withClient(
+        async (client) => {
+          await seedSession(client, 'deleted-wechat', { status: 'deleted' });
+          const statuses = [
+            'pending',
+            'dispatching',
+            'accepted_running',
+            'waiting_desktop',
+            'delivery_pending',
+            'completed',
+          ];
+          for (const status of statuses) {
+            const id = `task-${status}`;
+            await client.exec(
+              'INSERT INTO wechat_inbox (id, session_id, status) VALUES (?, ?, ?)',
+              [id, 'deleted-wechat', status],
+            );
+            await client.exec(
+              'INSERT INTO wechat_file_attachments (id, task_id, session_id, status) VALUES (?, ?, ?, ?)',
+              [`file-${status}`, id, 'deleted-wechat', 'staged'],
+            );
+            await client.exec('INSERT INTO media_refs (id, ref_kind, ref_id) VALUES (?, ?, ?)', [
+              `media-${status}`,
+              'im-inbox',
+              id,
+            ]);
+          }
+          await client.exec(
+            "INSERT INTO media_refs (id, ref_kind, ref_id) VALUES ('outbox-media', 'wechat-outbox', 'outbox-delivery')",
+          );
+
+          await expect(
+            client.tx('session.prepareDeletedLifecycle', {
+              sessionId: 'deleted-wechat',
+              now: 999,
+            }),
+          ).resolves.toBe(true);
+
+          await expect(
+            client.query('SELECT id, status, last_error_code FROM wechat_inbox ORDER BY id'),
+          ).resolves.toEqual([
+            {
+              id: 'task-accepted_running',
+              status: 'interrupted',
+              last_error_code: 'SESSION_DELETED',
+            },
+            { id: 'task-completed', status: 'completed', last_error_code: null },
+            { id: 'task-delivery_pending', status: 'delivery_pending', last_error_code: null },
+            { id: 'task-dispatching', status: 'cancelled', last_error_code: 'SESSION_DELETED' },
+            { id: 'task-pending', status: 'cancelled', last_error_code: 'SESSION_DELETED' },
+            {
+              id: 'task-waiting_desktop',
+              status: 'interrupted',
+              last_error_code: 'SESSION_DELETED',
+            },
+          ]);
+          await expect(
+            client.query('SELECT id, status FROM wechat_file_attachments ORDER BY id'),
+          ).resolves.toEqual([
+            { id: 'file-accepted_running', status: 'released' },
+            { id: 'file-completed', status: 'staged' },
+            { id: 'file-delivery_pending', status: 'staged' },
+            { id: 'file-dispatching', status: 'released' },
+            { id: 'file-pending', status: 'released' },
+            { id: 'file-waiting_desktop', status: 'released' },
+          ]);
+          await expect(client.query('SELECT id FROM media_refs ORDER BY id')).resolves.toEqual([
+            { id: 'media-completed' },
+            { id: 'media-delivery_pending' },
+            { id: 'outbox-media' },
+          ]);
+        },
+        { useInlineWorker },
+      );
+    },
+  );
+
+  it('two worker clients racing replacement converge on one live generation', async () => {
+    await withTwoClients(async ([first, second]) => {
+      await seedSession(first, 'deleted-im', { status: 'deleted' });
+      await first.exec(
+        'UPDATE sessions SET im_logical_session_id = ?, im_generation = ? WHERE id = ?',
+        ['logical-im', 0, 'deleted-im'],
+      );
+
+      const [firstResult, secondResult] = await Promise.all([
+        first.tx(
+          'session.replaceDeletedGeneration',
+          deletedGenerationArgs('deleted-im', 'fresh-im-a', 1),
+        ),
+        second.tx(
+          'session.replaceDeletedGeneration',
+          deletedGenerationArgs('deleted-im', 'fresh-im-b', 1),
+        ),
+      ]);
+
+      expect(['fresh-im-a', 'fresh-im-b']).toContain(firstResult);
+      expect(secondResult).toBe(firstResult);
+      await expect(
+        first.query(
+          `SELECT id, status, im_generation FROM sessions
+           WHERE im_logical_session_id = ? AND status != 'deleted'`,
+          ['logical-im'],
+        ),
+      ).resolves.toEqual([{ id: firstResult, status: 'active', im_generation: 1 }]);
     });
   });
 
@@ -1460,6 +2015,106 @@ describe('db worker tx handlers', () => {
     });
   });
 
+  it('im.deleteBindingIfTarget refuses stale target-wide cleanup after an identity moved', async () => {
+    await withClient(async (client) => {
+      await seedSession(client, 'new-target');
+      await seedSession(client, 'stale-target');
+      await client.exec(
+        `INSERT INTO im_bindings (
+          channel, bot_context_id, user_id, scope_key, target_session_id,
+          attached_at, attached_via_card_message_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          'feishu',
+          'feishu-bot',
+          'ou_owner',
+          '',
+          'new-target',
+          200,
+          'feishu-card-new',
+          'discord',
+          'discord-bot',
+          '123456',
+          '',
+          'stale-target',
+          150,
+          'discord-card',
+        ],
+      );
+
+      await expect(
+        client.tx('im.deleteBindingIfTarget', {
+          channel: 'feishu',
+          botContextId: 'feishu-bot',
+          userId: 'ou_owner',
+          scopeKey: '',
+          targetSessionId: 'stale-target',
+        }),
+      ).resolves.toBe(false);
+
+      await expect(
+        client.query(
+          `SELECT channel, bot_context_id, user_id, scope_key, target_session_id
+           FROM im_bindings ORDER BY attached_at`,
+        ),
+      ).resolves.toEqual([
+        {
+          channel: 'discord',
+          bot_context_id: 'discord-bot',
+          user_id: '123456',
+          scope_key: '',
+          target_session_id: 'stale-target',
+        },
+        {
+          channel: 'feishu',
+          bot_context_id: 'feishu-bot',
+          user_id: 'ou_owner',
+          scope_key: '',
+          target_session_id: 'new-target',
+        },
+      ]);
+    });
+  });
+
+  it('im.deleteBindingIfTarget purges legacy duplicate owners after a successful CAS', async () => {
+    await withClient(async (client) => {
+      await seedSession(client, 'target');
+      await client.exec(
+        `INSERT INTO im_bindings (
+          channel, bot_context_id, user_id, scope_key, target_session_id,
+          attached_at, attached_via_card_message_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          'feishu',
+          'feishu-bot',
+          'ou_owner',
+          '',
+          'target',
+          100,
+          'feishu-card',
+          'discord',
+          'discord-bot',
+          '123456',
+          '',
+          'target',
+          200,
+          'discord-card',
+        ],
+      );
+
+      await expect(
+        client.tx('im.deleteBindingIfTarget', {
+          channel: 'discord',
+          botContextId: 'discord-bot',
+          userId: '123456',
+          scopeKey: '',
+          targetSessionId: 'target',
+        }),
+      ).resolves.toBe(true);
+      await expect(client.query('SELECT 1 FROM im_bindings')).resolves.toEqual([]);
+    });
+  });
+
   it('im.deleteBindings rolls back every startup cleanup when a later delete fails', async () => {
     await withClient(async (client) => {
       await seedSession(client, 'desktop-target');
@@ -1728,6 +2383,230 @@ describe('db worker tx handlers', () => {
     });
   });
 
+  it.each([false, true])(
+    'orca.removeWorker refuses a replacement worker link when expected session differs (inline=%s)',
+    async (useInlineWorker) => {
+      await withClient(
+        async (client) => {
+          await seedSession(client, 'lead');
+          await seedSession(client, 'worker-a', { orcaRole: 'worker' });
+          await seedSession(client, 'worker-b', { orcaRole: 'worker' });
+          await client.exec(
+            'INSERT INTO orca_teams (id, lead_session_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+            ['team-1', 'lead', 'active', 1, 1],
+          );
+          await client.exec(
+            'INSERT INTO orca_workers (id, team_id, session_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+            ['worker-1', 'team-1', 'worker-b', 'idle', 1, 1],
+          );
+
+          await expect(
+            client.tx('orca.removeWorker', {
+              workerId: 'worker-1',
+              expectedSessionId: 'worker-a',
+              now: 999,
+            }),
+          ).resolves.toBeNull();
+          await expect(
+            client.queryOne('SELECT session_id FROM orca_workers WHERE id = ?', ['worker-1']),
+          ).resolves.toEqual({ session_id: 'worker-b' });
+          await expect(
+            client.queryOne('SELECT status FROM sessions WHERE id = ?', ['worker-b']),
+          ).resolves.toEqual({ status: 'active' });
+        },
+        { useInlineWorker },
+      );
+    },
+  );
+
+  it.each([false, true])(
+    'orca.removeWorker never revives a deleted worker session (inline=%s)',
+    async (useInlineWorker) => {
+      await withClient(
+        async (client) => {
+          await seedSession(client, 'lead');
+          await seedSession(client, 'worker', { status: 'deleted', orcaRole: 'worker' });
+          await client.exec(
+            'INSERT INTO orca_teams (id, lead_session_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+            ['team-1', 'lead', 'active', 1, 1],
+          );
+          await client.exec(
+            'INSERT INTO orca_workers (id, team_id, session_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+            ['worker-1', 'team-1', 'worker', 'idle', 1, 1],
+          );
+
+          await expect(
+            client.tx('orca.removeWorker', { workerId: 'worker-1', now: 999 }),
+          ).resolves.toBeNull();
+          await expect(
+            client.queryOne('SELECT status, orca_role FROM sessions WHERE id = ?', ['worker']),
+          ).resolves.toEqual({ status: 'deleted', orca_role: null });
+        },
+        { useInlineWorker },
+      );
+    },
+  );
+
+  it.each([false, true])(
+    'orca.archiveWorkersByTeam atomically excludes deleted sessions (inline=%s)',
+    async (useInlineWorker) => {
+      await withClient(
+        async (client) => {
+          await seedSession(client, 'lead');
+          await seedSession(client, 'worker-active', { orcaRole: 'worker' });
+          await seedSession(client, 'worker-deleted', {
+            status: 'deleted',
+            orcaRole: 'worker',
+          });
+          await seedSession(client, 'worker-archived', {
+            status: 'archived',
+            orcaRole: 'worker',
+          });
+          await seedSession(client, 'worker-new', { orcaRole: 'worker' });
+          await client.exec(
+            'INSERT INTO orca_teams (id, lead_session_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+            ['team-archive', 'lead', 'completed', 1, 1],
+          );
+          for (const [id, sessionId] of [
+            ['worker-a', 'worker-active'],
+            ['worker-d', 'worker-deleted'],
+            ['worker-z', 'worker-archived'],
+            ['worker-new', 'worker-new'],
+          ] as const) {
+            await client.exec(
+              'INSERT INTO orca_workers (id, team_id, session_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+              [id, 'team-archive', sessionId, 'idle', 1, 1],
+            );
+          }
+
+          await expect(
+            client.tx('orca.archiveWorkersByTeam', {
+              teamId: 'team-archive',
+              sessionIds: ['worker-active', 'worker-deleted', 'worker-archived'],
+              now: 999,
+            }),
+          ).resolves.toEqual(['worker-active', 'worker-archived']);
+          await expect(
+            client.query(
+              'SELECT id, status, updated_at FROM sessions WHERE id LIKE ? ORDER BY id',
+              ['worker-%'],
+            ),
+          ).resolves.toEqual([
+            { id: 'worker-active', status: 'archived', updated_at: 999 },
+            { id: 'worker-archived', status: 'archived', updated_at: 999 },
+            { id: 'worker-deleted', status: 'deleted', updated_at: 1 },
+            { id: 'worker-new', status: 'active', updated_at: 1 },
+          ]);
+        },
+        { useInlineWorker },
+      );
+    },
+  );
+
+  it.each([false, true])(
+    'orca.archiveWorkersByTeam does not archive a snapshot after the team becomes active (inline=%s)',
+    async (useInlineWorker) => {
+      await withClient(
+        async (client) => {
+          await seedSession(client, 'lead');
+          await seedSession(client, 'worker', { orcaRole: 'worker' });
+          await client.exec(
+            'INSERT INTO orca_teams (id, lead_session_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+            ['team-archive-race', 'lead', 'active', 1, 1],
+          );
+          await client.exec(
+            'INSERT INTO orca_workers (id, team_id, session_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+            ['worker-race', 'team-archive-race', 'worker', 'idle', 1, 1],
+          );
+
+          await expect(
+            client.tx('orca.archiveWorkersByTeam', {
+              teamId: 'team-archive-race',
+              sessionIds: ['worker'],
+              now: 999,
+            }),
+          ).resolves.toEqual([]);
+          await expect(
+            client.queryOne('SELECT status FROM sessions WHERE id = ?', ['worker']),
+          ).resolves.toEqual({ status: 'active' });
+        },
+        { useInlineWorker },
+      );
+    },
+  );
+
+  it.each([false, true])(
+    'orca.reconcileInactiveTeamWorkersForLead atomically respects current team and session state (inline=%s)',
+    async (useInlineWorker) => {
+      await withClient(
+        async (client) => {
+          await seedSession(client, 'lead');
+          await seedSession(client, 'ended-active', { orcaRole: 'worker' });
+          await seedSession(client, 'ended-deleted', {
+            status: 'deleted',
+            orcaRole: 'worker',
+          });
+          await seedSession(client, 'ended-archived', {
+            status: 'archived',
+            orcaRole: 'worker',
+          });
+          await seedSession(client, 'ended-new', { orcaRole: 'worker' });
+          await seedSession(client, 'current-active', { orcaRole: 'worker' });
+          await client.exec(
+            'INSERT INTO orca_teams (id, lead_session_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+            ['team-ended', 'lead', 'completed', 1, 1],
+          );
+          await client.exec(
+            'INSERT INTO orca_teams (id, lead_session_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+            ['team-current', 'lead', 'active', 1, 1],
+          );
+          for (const [id, teamId, sessionId] of [
+            ['worker-a', 'team-ended', 'ended-active'],
+            ['worker-d', 'team-ended', 'ended-deleted'],
+            ['worker-z', 'team-ended', 'ended-archived'],
+            ['worker-new', 'team-ended', 'ended-new'],
+            ['worker-current', 'team-current', 'current-active'],
+          ] as const) {
+            await client.exec(
+              'INSERT INTO orca_workers (id, team_id, session_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+              [id, teamId, sessionId, 'idle', 1, 1],
+            );
+          }
+
+          await expect(
+            client.tx('orca.reconcileInactiveTeamWorkersForLead', {
+              leadSessionId: 'lead',
+              sessionIds: ['ended-active', 'ended-deleted', 'ended-archived'],
+              now: 777,
+            }),
+          ).resolves.toEqual(['ended-active']);
+          await expect(
+            client.query(
+              'SELECT id, status, updated_at FROM sessions WHERE orca_role = ? ORDER BY id',
+              ['worker'],
+            ),
+          ).resolves.toEqual([
+            { id: 'current-active', status: 'active', updated_at: 1 },
+            { id: 'ended-active', status: 'archived', updated_at: 777 },
+            { id: 'ended-archived', status: 'archived', updated_at: 1 },
+            { id: 'ended-deleted', status: 'deleted', updated_at: 1 },
+            { id: 'ended-new', status: 'active', updated_at: 1 },
+          ]);
+          await expect(
+            client.query('SELECT id, status, updated_at FROM orca_workers ORDER BY id'),
+          ).resolves.toEqual([
+            { id: 'worker-a', status: 'done', updated_at: 777 },
+            { id: 'worker-current', status: 'idle', updated_at: 1 },
+            { id: 'worker-d', status: 'done', updated_at: 777 },
+            { id: 'worker-new', status: 'idle', updated_at: 1 },
+            { id: 'worker-z', status: 'done', updated_at: 777 },
+          ]);
+        },
+        { useInlineWorker },
+      );
+    },
+  );
+
   it('serializes the same worker label across independent database workers', async () => {
     await withTwoClients(async ([first, second]) => {
       await seedSession(first, 'lead');
@@ -1942,6 +2821,30 @@ function sessionRow(id: string, overrides: Partial<TestSessionRow> = {}): TestSe
     createdAt: 1,
     updatedAt: 1,
     ...overrides,
+  };
+}
+
+function deletedGenerationArgs(oldSessionId: string, newSessionId: string, generation: number) {
+  return {
+    oldSessionId,
+    newSessionId,
+    logicalSessionId: 'logical-im',
+    generation,
+    title: 'Fresh IM',
+    workingDir: '/fresh',
+    workspaceKind: 'dialogue',
+    model: 'claude-opus-4-8',
+    effort: 'high',
+    permissionMode: 'auto',
+    providerId: null,
+    fastMode: false,
+    agentKind: 'cc',
+    source: 'slack',
+    feishuOpenId: null,
+    feishuBotAppId: null,
+    imBotContextId: 'bot',
+    imUserId: 'user',
+    now: 999,
   };
 }
 

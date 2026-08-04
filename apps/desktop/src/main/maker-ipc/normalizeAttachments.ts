@@ -542,6 +542,25 @@ export async function materializeQueuedOssAttachments(
 }
 
 /**
+ * Stage queued-message attachments without consuming their remote OSS source.
+ *
+ * The caller must invoke cleanupAfterAcceptance only after the coordinator
+ * mutation has committed. Any parse/hydration/mutation rejection must instead
+ * await cleanupBeforeAcceptance, which removes the local materialization while
+ * retaining OSS for a retry.
+ */
+export async function stageQueuedOssAttachments(
+  sessionId: string,
+  item: unknown,
+): Promise<{
+  item: unknown;
+  cleanupAfterAcceptance?: () => void;
+  cleanupBeforeAcceptance?: () => Promise<void>;
+}> {
+  return materializeQueuedOssAttachmentsInternal(sessionId, item, true);
+}
+
+/**
  * Direct maker:send carries attachment references in two parallel shapes:
  * the user-message blocks consumed by the agent and
  * sendOpts.persistUserMessage.content stored in the local transcript.

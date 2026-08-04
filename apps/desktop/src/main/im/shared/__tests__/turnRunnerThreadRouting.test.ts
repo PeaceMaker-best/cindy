@@ -31,7 +31,11 @@ const mocks = vi.hoisted(() => ({
   readXdGatewayApiKey: vi.fn(),
   bindingGet: vi.fn(),
   bindingDetach: vi.fn(),
+  bindingDetachIfTarget: vi.fn(),
+  bindingRefreshFromPersistence: vi.fn(),
+  bindingIsPersistedTarget: vi.fn(),
   bindingGetAttachCardMessageId: vi.fn(),
+  withSendToSessionLock: vi.fn(async (_sessionId: string, run: () => Promise<unknown>) => run()),
   touchUserSent: vi.fn(),
   persistUserMessage: vi.fn(),
   persistAssistantMessage: vi.fn(),
@@ -74,6 +78,9 @@ vi.mock('../../binding', () => ({
   bindingStore: {
     get: mocks.bindingGet,
     detach: mocks.bindingDetach,
+    detachIfTarget: mocks.bindingDetachIfTarget,
+    refreshFromPersistence: mocks.bindingRefreshFromPersistence,
+    isPersistedTarget: mocks.bindingIsPersistedTarget,
     getAttachCardMessageId: mocks.bindingGetAttachCardMessageId,
   },
 }));
@@ -84,6 +91,7 @@ vi.mock('../../../maker-ipc/register', () => ({
   noteSilentStopUserSend: mocks.noteSilentStopUserSend,
   noteSilentStopSessionReset: mocks.noteSilentStopSessionReset,
   onSilentStopSettled: mocks.onSilentStopSettled,
+  withSendToSessionLock: mocks.withSendToSessionLock,
 }));
 vi.mock('../pendingInteractions', () => ({
   registerPending: mocks.registerPending,
@@ -177,7 +185,8 @@ const fakeRepo: ImSessionRepo = {
     return rows.get(sessionIdFor(bot, user, scope)) ?? null;
   }),
   prepareNewSession: vi.fn(async (bot: string, user: string, scope?: string) =>
-    rowFor(sessionIdFor(bot, user, scope))),
+    rowFor(sessionIdFor(bot, user, scope)),
+  ),
   createSession: vi.fn(async (bot: string, user: string, scope?: string) => {
     const row = rowFor(sessionIdFor(bot, user, scope));
     rows.set(row.id, row);
@@ -259,6 +268,16 @@ beforeEach(() => {
     },
   ]);
   mocks.bindingGet.mockReturnValue(null);
+  mocks.bindingRefreshFromPersistence.mockImplementation(async (identity) =>
+    mocks.bindingGet(identity),
+  );
+  mocks.bindingDetachIfTarget.mockImplementation(async (identity, expectedTarget) => {
+    const currentTarget = mocks.bindingGet(identity);
+    if (!currentTarget || (expectedTarget && currentTarget !== expectedTarget)) return false;
+    mocks.bindingGet.mockReturnValue(null);
+    return true;
+  });
+  mocks.bindingIsPersistedTarget.mockResolvedValue(true);
   mocks.slackIm.reactToMessage.mockResolvedValue('eyes');
   mocks.slackIm.removeMessageReaction.mockResolvedValue(undefined);
   mocks.slackIm.sendText.mockResolvedValue({ messageId: 'C1|m' });
@@ -346,8 +365,8 @@ describe('turnRunner thread = session 路由(slack threadScoped)', () => {
   });
 
   it('binding(identity+scopeKey)命中 → attached 路由到 desktop session', async () => {
-    mocks.bindingGet.mockImplementation(
-      (id: { scopeKey?: string }) => (id.scopeKey === '300.3' ? 'desktop-sess-1' : null),
+    mocks.bindingGet.mockImplementation((id: { scopeKey?: string }) =>
+      id.scopeKey === '300.3' ? 'desktop-sess-1' : null,
     );
     mocks.dbSelect.mockReturnValue({
       from: () => ({
@@ -355,6 +374,7 @@ describe('turnRunner thread = session 路由(slack threadScoped)', () => {
           limit: async () => [
             {
               id: 'desktop-sess-1',
+              status: 'active',
               agentKind: 'cc',
               workingDir: '/tmp/desktop-wd',
               model: 'claude-opus-4-7',
@@ -385,10 +405,278 @@ describe('turnRunner thread = session 路由(slack threadScoped)', () => {
     );
   });
 
+  it('deleted binding 自动 CAS detach，并把本条消息路由到默认渠道任务', async () => {
+    mocks.bindingGet.mockReturnValue('desktop-sess-deleted');
+    mocks.dbSelect.mockReturnValue({
+      from: () => ({
+        where: () => ({
+          limit: async () => [
+            {
+              id: 'desktop-sess-deleted',
+              status: 'deleted',
+              agentKind: 'cc',
+              workingDir: '/tmp/deleted-desktop-wd',
+              model: 'claude-opus-4-7',
+              effort: 'xhigh',
+              permissionMode: 'auto',
+              fastMode: false,
+              sdkSessionId: 'sdk-deleted',
+            },
+          ],
+        }),
+      }),
+    });
+
+    await runTurn('300.3');
+
+    expect(mocks.bindingDetachIfTarget).toHaveBeenCalledWith(
+      { channel: 'slack', botContextId: 'T1', userId: 'U1', scopeKey: '300.3' },
+      'desktop-sess-deleted',
+    );
+    expect(harnesses.has('desktop-sess-deleted')).toBe(false);
+    expect(fakeRepo.createSession).toHaveBeenCalledOnce();
+    expect(harnesses.get('slack_T1_U1_300_3')!.send).toHaveBeenCalledOnce();
+  });
+
+  it('archived binding 自动 CAS detach，不把消息反复送进不可发送任务', async () => {
+    mocks.bindingGet.mockReturnValue('desktop-sess-archived');
+    mocks.dbSelect.mockReturnValue({
+      from: () => ({
+        where: () => ({
+          limit: async () => [
+            {
+              id: 'desktop-sess-archived',
+              status: 'archived',
+              agentKind: 'cc',
+              workingDir: '/tmp/archived-desktop-wd',
+            },
+          ],
+        }),
+      }),
+    });
+
+    await runTurn('300.3');
+
+    expect(mocks.bindingDetachIfTarget).toHaveBeenCalledWith(
+      { channel: 'slack', botContextId: 'T1', userId: 'U1', scopeKey: '300.3' },
+      'desktop-sess-archived',
+    );
+    expect(harnesses.has('desktop-sess-archived')).toBe(false);
+    expect(harnesses.get('slack_T1_U1_300_3')!.send).toHaveBeenCalledOnce();
+  });
+
+  it('deleted binding detach CAS 未命中时按最新 binding 重新路由', async () => {
+    mocks.bindingGet
+      .mockReturnValueOnce('desktop-sess-deleted')
+      .mockReturnValue('desktop-sess-new');
+    mocks.bindingDetachIfTarget.mockResolvedValueOnce(false);
+    mocks.dbSelect
+      .mockReturnValueOnce({
+        from: () => ({
+          where: () => ({
+            limit: async () => [
+              {
+                id: 'desktop-sess-deleted',
+                status: 'deleted',
+                workingDir: '/tmp/deleted-desktop-wd',
+              },
+            ],
+          }),
+        }),
+      })
+      .mockReturnValueOnce({
+        from: () => ({
+          where: () => ({
+            limit: async () => [
+              {
+                id: 'desktop-sess-new',
+                status: 'active',
+                agentKind: 'cc',
+                workingDir: '/tmp/new-desktop-wd',
+                model: 'claude-opus-4-7',
+                effort: 'xhigh',
+                permissionMode: 'auto',
+                fastMode: false,
+                sdkSessionId: 'sdk-new',
+              },
+            ],
+          }),
+        }),
+      });
+
+    await runTurn('300.3');
+
+    expect(harnesses.has('desktop-sess-deleted')).toBe(false);
+    expect(harnesses.get('desktop-sess-new')!.send).toHaveBeenCalledOnce();
+    expect(fakeRepo.createSession).not.toHaveBeenCalled();
+  });
+
+  it('active binding 查询期间换目标时按最新 binding 路由，不误投旧任务', async () => {
+    mocks.bindingGet.mockReturnValueOnce('desktop-sess-old').mockReturnValue('desktop-sess-new');
+    mocks.dbSelect
+      .mockReturnValueOnce({
+        from: () => ({
+          where: () => ({
+            limit: async () => [
+              {
+                id: 'desktop-sess-old',
+                status: 'active',
+                agentKind: 'cc',
+                workingDir: '/tmp/old-desktop-wd',
+                model: 'claude-opus-4-7',
+                effort: 'xhigh',
+                permissionMode: 'auto',
+                fastMode: false,
+                sdkSessionId: 'sdk-old',
+              },
+            ],
+          }),
+        }),
+      })
+      .mockReturnValueOnce({
+        from: () => ({
+          where: () => ({
+            limit: async () => [
+              {
+                id: 'desktop-sess-new',
+                status: 'active',
+                agentKind: 'cc',
+                workingDir: '/tmp/new-desktop-wd',
+                model: 'claude-opus-4-7',
+                effort: 'xhigh',
+                permissionMode: 'auto',
+                fastMode: false,
+                sdkSessionId: 'sdk-new',
+              },
+            ],
+          }),
+        }),
+      });
+
+    await runTurn('300.3');
+
+    expect(harnesses.has('desktop-sess-old')).toBe(false);
+    expect(harnesses.get('desktop-sess-new')!.send).toHaveBeenCalledOnce();
+    expect(fakeRepo.createSession).not.toHaveBeenCalled();
+  });
+
+  it('跨进程已删除持久 binding 时清掉本进程旧缓存并走默认任务', async () => {
+    mocks.bindingGet.mockReturnValue('desktop-sess-stale');
+    mocks.bindingRefreshFromPersistence
+      .mockResolvedValueOnce('desktop-sess-stale')
+      .mockResolvedValue(null);
+    mocks.dbSelect.mockReturnValue({
+      from: () => ({
+        where: () => ({
+          limit: async () => [
+            {
+              id: 'desktop-sess-stale',
+              status: 'active',
+              agentKind: 'cc',
+              workingDir: '/tmp/stale-desktop-wd',
+              model: 'claude-opus-4-7',
+              effort: 'xhigh',
+              permissionMode: 'auto',
+              fastMode: false,
+              sdkSessionId: 'sdk-stale',
+            },
+          ],
+        }),
+      }),
+    });
+
+    await runTurn('300.3');
+
+    expect(mocks.bindingDetachIfTarget).not.toHaveBeenCalled();
+    expect(harnesses.has('desktop-sess-stale')).toBe(false);
+    expect(harnesses.get('slack_T1_U1_300_3')!.send).toHaveBeenCalledOnce();
+  });
+
+  it('跨进程把持久 binding 从 A 替换为 B 时按 B 路由', async () => {
+    mocks.bindingGet.mockReturnValue('desktop-sess-old');
+    mocks.bindingRefreshFromPersistence
+      .mockResolvedValueOnce('desktop-sess-old')
+      .mockResolvedValueOnce('desktop-sess-new')
+      .mockResolvedValue('desktop-sess-new');
+    mocks.dbSelect
+      .mockReturnValueOnce({
+        from: () => ({
+          where: () => ({
+            limit: async () => [
+              {
+                id: 'desktop-sess-old',
+                status: 'active',
+                agentKind: 'cc',
+                workingDir: '/tmp/old-desktop-wd',
+                model: 'claude-opus-4-7',
+                effort: 'xhigh',
+                permissionMode: 'auto',
+                fastMode: false,
+                sdkSessionId: 'sdk-old',
+              },
+            ],
+          }),
+        }),
+      })
+      .mockReturnValueOnce({
+        from: () => ({
+          where: () => ({
+            limit: async () => [
+              {
+                id: 'desktop-sess-new',
+                status: 'active',
+                agentKind: 'cc',
+                workingDir: '/tmp/new-desktop-wd',
+                model: 'claude-opus-4-7',
+                effort: 'xhigh',
+                permissionMode: 'auto',
+                fastMode: false,
+                sdkSessionId: 'sdk-new',
+              },
+            ],
+          }),
+        }),
+      });
+
+    await runTurn('300.3');
+
+    expect(harnesses.has('desktop-sess-old')).toBe(false);
+    expect(harnesses.get('desktop-sess-new')!.send).toHaveBeenCalledOnce();
+    expect(fakeRepo.createSession).not.toHaveBeenCalled();
+  });
+
+  it('跨进程新建持久 binding 时不再错误落到默认任务', async () => {
+    mocks.bindingGet.mockReturnValue(null);
+    mocks.bindingRefreshFromPersistence.mockResolvedValue('desktop-sess-new');
+    mocks.dbSelect.mockReturnValue({
+      from: () => ({
+        where: () => ({
+          limit: async () => [
+            {
+              id: 'desktop-sess-new',
+              status: 'active',
+              agentKind: 'cc',
+              workingDir: '/tmp/new-desktop-wd',
+              model: 'claude-opus-4-7',
+              effort: 'xhigh',
+              permissionMode: 'auto',
+              fastMode: false,
+              sdkSessionId: 'sdk-new',
+            },
+          ],
+        }),
+      }),
+    });
+
+    await runTurn('300.3');
+
+    expect(harnesses.get('desktop-sess-new')!.send).toHaveBeenCalledOnce();
+    expect(fakeRepo.createSession).not.toHaveBeenCalled();
+  });
+
   it('replacement detach keeps the old listener until its active turn drains', async () => {
-    mocks.bindingGet.mockImplementation(
-      (id: { scopeKey?: string }) =>
-        id.scopeKey === '300.3' || id.scopeKey === '400.4' ? 'desktop-sess-1' : null,
+    mocks.bindingGet.mockImplementation((id: { scopeKey?: string }) =>
+      id.scopeKey === '300.3' || id.scopeKey === '400.4' ? 'desktop-sess-1' : null,
     );
     mocks.dbSelect.mockReturnValue({
       from: () => ({
@@ -396,6 +684,7 @@ describe('turnRunner thread = session 路由(slack threadScoped)', () => {
           limit: async () => [
             {
               id: 'desktop-sess-1',
+              status: 'active',
               agentKind: 'cc',
               workingDir: '/tmp/desktop-wd',
               model: 'claude-opus-4-7',
@@ -475,8 +764,8 @@ describe('turnRunner thread = session 路由(slack threadScoped)', () => {
   });
 
   it('新建+接管: 标题生成后锚点卡升级为正式标题(保留退出按钮)', async () => {
-    mocks.bindingGet.mockImplementation(
-      (id: { scopeKey?: string }) => (id.scopeKey === '400.4' ? 'desktop-new-1' : null),
+    mocks.bindingGet.mockImplementation((id: { scopeKey?: string }) =>
+      id.scopeKey === '400.4' ? 'desktop-new-1' : null,
     );
     mocks.bindingGetAttachCardMessageId.mockReturnValue('C1|anchor');
     // resolveRouteTarget 的 row 查询与标题草稿检查共用同一条 select 链 —
@@ -487,6 +776,7 @@ describe('turnRunner thread = session 路由(slack threadScoped)', () => {
           limit: async () => [
             {
               id: 'desktop-new-1',
+              status: 'active',
               agentKind: 'cc',
               workingDir: '/tmp/desktop-wd',
               model: 'claude-opus-4-7',
@@ -522,8 +812,8 @@ describe('turnRunner thread = session 路由(slack threadScoped)', () => {
 describe('turnRunner 自动任务转播(scheduler turn → 远程控制 thread)', () => {
   /** 接管 desktop-sess-1 到 thread 300.3,并清掉用户首轮,使后续 scheduler 事件走 stray。 */
   async function attachAndIdle(): Promise<SessionHarness> {
-    mocks.bindingGet.mockImplementation(
-      (id: { scopeKey?: string }) => (id.scopeKey === '300.3' ? 'desktop-sess-1' : null),
+    mocks.bindingGet.mockImplementation((id: { scopeKey?: string }) =>
+      id.scopeKey === '300.3' ? 'desktop-sess-1' : null,
     );
     mocks.dbSelect.mockReturnValue({
       from: () => ({
@@ -531,6 +821,7 @@ describe('turnRunner 自动任务转播(scheduler turn → 远程控制 thread)'
           limit: async () => [
             {
               id: 'desktop-sess-1',
+              status: 'active',
               agentKind: 'cc',
               workingDir: '/tmp/desktop-wd',
               model: 'claude-opus-4-7',
@@ -560,7 +851,9 @@ describe('turnRunner 自动任务转播(scheduler turn → 远程控制 thread)'
     mocks.slackIm.startStreamingText.mockResolvedValue(stub);
     const h = await attachAndIdle();
 
-    h.emit(withOrigin({ type: 'tool_use', data: { toolName: 'Read', input: { file_path: '/x/a.ts' } } }));
+    h.emit(
+      withOrigin({ type: 'tool_use', data: { toolName: 'Read', input: { file_path: '/x/a.ts' } } }),
+    );
     h.emit(withOrigin({ type: 'text', data: { text: '检查完毕,无新变化', isFinal: true } }));
 
     await vi.waitFor(() => {
@@ -605,7 +898,9 @@ describe('turnRunner 自动任务转播(scheduler turn → 远程控制 thread)'
     const h = await attachAndIdle();
 
     // 先开卡(一个工具步骤)
-    h.emit(withOrigin({ type: 'tool_use', data: { toolName: 'Read', input: { file_path: '/x/a.ts' } } }));
+    h.emit(
+      withOrigin({ type: 'tool_use', data: { toolName: 'Read', input: { file_path: '/x/a.ts' } } }),
+    );
     // 可重试 error:turn 仍在继续,不能收口卡片
     h.emit(withOrigin({ type: 'error', data: { message: 'transient 502', willRetry: true } }));
     await vi.waitFor(() => {

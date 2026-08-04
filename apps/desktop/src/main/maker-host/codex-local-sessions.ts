@@ -1624,6 +1624,8 @@ export interface ImportSharedCodexThreadParams {
 }
 
 export interface ImportSharedCodexThreadResult {
+  /** prepare 时选中的精确 state DB；finalize/rollback 必须绑定它，避免 DB rollover 清错库。 */
+  stateDbPath: string | null;
   /** 可用的 rollout 绝对路径(null = 包里没带 rollout 或文件名不安全被跳过)。 */
   rolloutPath: string | null;
   /** rollout 是否为本次真实写入(false = 盘上已有同名文件,复用未覆盖)。回滚只删真写入的。 */
@@ -1639,15 +1641,16 @@ export interface ImportSharedCodexThreadResult {
    * 不能用 stateWritten 判断:复用场景 stateWritten=false 但 state 完好。
    */
   statePresent: boolean;
+  /** Durable cwd/rollout pointer matches this import. */
+  stateFinalized: boolean;
 }
 
 /**
- * 会话分享导入:把包里的 codex thread 落到 desktop codex home。
- * 写三样:rollout jsonl(sessions/ 下,cwd 语义在 state 行里)、state 三表行
- * (threads.cwd / rollout_path 改写为本机新值,列交集 INSERT 容忍 schema 漂移)、
- * session_index.jsonl 追加。B 机无 state DB(从未跑过 codex)时跳过 state 写入,
- * 由调用方降档提示;rollout 仍落盘,用户跑过一次 codex 后 resume 链可自愈。
- * 失败回滚用 removeSharedCodexThread。
+ * 会话分享导入的可回滚准备阶段:只落本次新建的 rollout/state,不修改既有
+ * thread 的可变字段,也不追加 session_index.jsonl。调用方必须先提交 Cindy DB
+ * 事务,再调用 finalizeSharedCodexThreadImport 发布这些不可回滚的外部指针。
+ * B 机无 state DB(从未跑过 codex)时跳过 state 写入,由调用方降档提示;
+ * rollout 仍落盘,用户跑过一次 Codex 后 resume 链可自愈。
  */
 export async function importSharedCodexThread(
   params: ImportSharedCodexThreadParams,
@@ -1686,62 +1689,60 @@ export async function importSharedCodexThread(
   let stateWritten = false;
   const dbPath = findLatestStateDb(home);
   if (dbPath && params.stateRows.threads.length > 0) {
-    // thread 行已存在(典型是删除 Maker 会话后重导同一分享包——软删不清 state)时
-    // 不重插三表:threads 有 PK 会被 IGNORE,但 thread_dynamic_tools /
-    // thread_spawn_edges 无唯一约束,重复 INSERT 会翻倍;stateWritten 保持 false,
-    // 让回滚不去误删既有行。但既有 threads 行的可变字段(cwd / rollout_path)必须
-    // 刷新为本次导入值——codex resume 从 state DB 读这两列,不刷新会让重导会话
-    // 跑回旧目录 / 指向失效 rollout(review bot P2)。该 UPDATE 不登记回滚:把
-    // 指向收敛到盘上真实存在的文件是单调修正,导入失败后残留新值无害。
-    const preExisting = readRawThreadRow(dbPath, params.threadId) !== null;
+    // Existing rows are left untouched until Cindy DB commit. Otherwise a
+    // failed overwrite could poison the still-live old task's resume pointer.
     let db: Database.Database | null = null;
     try {
       db = createBetterSqliteDatabase(dbPath);
       db.pragma(`busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
       const targetDb = db;
-      if (preExisting) {
-        if (tableExists(targetDb, 'threads')) {
-          const columns = getTableColumns(targetDb, 'threads');
-          const sets: string[] = [];
-          const args: Record<string, SqlScalar> = { id: params.threadId };
-          if (columns.includes('cwd')) {
-            sets.push('cwd = @cwd');
-            args.cwd = params.newCwd;
-          }
-          if (rolloutPath && columns.includes('rollout_path')) {
-            sets.push('rollout_path = @rollout_path');
-            args.rollout_path = rolloutPath;
-          }
-          if (sets.length > 0) {
-            targetDb.prepare(`UPDATE threads SET ${sets.join(', ')} WHERE id = @id`).run(args);
-          }
-        }
-      } else {
-        const insertRows = (table: string, rows: Array<Record<string, unknown>>, overrides: Record<string, SqlScalar>) => {
-          if (rows.length === 0 || !tableExists(targetDb, table)) return;
+      const transaction = targetDb.transaction(() => {
+        if (!tableExists(targetDb, 'threads')) return;
+        const preExisting =
+          targetDb.prepare('SELECT 1 FROM threads WHERE id = ? LIMIT 1').get(params.threadId) !==
+          undefined;
+        if (preExisting) return;
+
+        const insertRows = (
+          table: string,
+          rows: Array<Record<string, unknown>>,
+          overrides: Record<string, SqlScalar>,
+        ): number => {
+          if (rows.length === 0 || !tableExists(targetDb, table)) return 0;
           const targetColumns = getTableColumns(targetDb, table);
+          let inserted = 0;
           for (const raw of rows) {
             const row = deserializeSqlRow(raw);
             const columns = targetColumns.filter((c) => c in row || c in overrides);
             if (columns.length === 0) continue;
             const colsSql = columns.map(quoteIdent).join(', ');
             const placeholders = columns.map((c) => `@${c}`).join(', ');
-            targetDb
-              .prepare(`INSERT OR IGNORE INTO ${quoteIdent(table)} (${colsSql}) VALUES (${placeholders})`)
-              .run({ ...pickColumns(row, columns), ...overrides });
+            inserted += targetDb
+              .prepare(
+                `INSERT OR IGNORE INTO ${quoteIdent(table)} (${colsSql}) VALUES (${placeholders})`,
+              )
+              .run({ ...pickColumns(row, columns), ...overrides }).changes;
           }
+          return inserted;
         };
-        targetDb.transaction(() => {
-          insertRows('threads', params.stateRows.threads, {
-            cwd: params.newCwd,
-            ...(rolloutPath ? { rollout_path: rolloutPath } : {}),
-          });
-          insertRows('thread_dynamic_tools', params.stateRows.threadDynamicTools, {});
-          insertRows('thread_spawn_edges', params.stateRows.threadSpawnEdges, {});
-        })();
+
+        const insertedThreads = insertRows('threads', params.stateRows.threads, {
+          id: params.threadId,
+          cwd: params.newCwd,
+          ...(rolloutPath ? { rollout_path: rolloutPath } : {}),
+        });
+        if (insertedThreads === 0) return;
         stateWritten = true;
-      }
+        insertRows('thread_dynamic_tools', params.stateRows.threadDynamicTools, {
+          thread_id: params.threadId,
+        });
+        insertRows('thread_spawn_edges', params.stateRows.threadSpawnEdges, {
+          parent_thread_id: params.threadId,
+        });
+      });
+      transaction.immediate();
     } catch (err) {
+      stateWritten = false;
       log.warn('import shared codex thread: state write failed', {
         threadId: params.threadId,
         error: err instanceof Error ? err.message : String(err),
@@ -1751,14 +1752,81 @@ export async function importSharedCodexThread(
     }
   }
 
-  await appendSessionIndexEntry(home, {
-    threadId: params.threadId,
-    title: params.title,
-    updatedAt: params.updatedAt,
-  } as CodexThreadSummary);
-
   const statePresent = dbPath ? readRawThreadRow(dbPath, params.threadId) !== null : false;
-  return { rolloutPath, rolloutWritten, stateWritten, statePresent };
+  const stateFinalized =
+    params.stateRows.threads.length === 0 ||
+    isImportedCodexThreadStateFinalized(dbPath, params.threadId, params.newCwd, rolloutPath);
+  return {
+    stateDbPath: dbPath,
+    rolloutPath,
+    rolloutWritten,
+    stateWritten,
+    statePresent,
+    stateFinalized,
+  };
+}
+
+/** Cindy DB 导入事务提交后,发布既有 thread 指针并追加 session index。全程 best-effort。 */
+export async function finalizeSharedCodexThreadImport(
+  params: ImportSharedCodexThreadParams,
+  written: ImportSharedCodexThreadResult,
+): Promise<ImportSharedCodexThreadResult> {
+  const home = getDesktopCodexHome();
+  const dbPath = written.stateDbPath;
+  if (dbPath) {
+    let db: Database.Database | null = null;
+    try {
+      db = createBetterSqliteDatabase(dbPath);
+      db.pragma(`busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
+      if (tableExists(db, 'threads')) {
+        const columns = getTableColumns(db, 'threads');
+        const sets: string[] = [];
+        const args: Record<string, SqlScalar> = { id: params.threadId };
+        if (columns.includes('cwd')) {
+          sets.push('cwd = @cwd');
+          args.cwd = params.newCwd;
+        }
+        if (written.rolloutPath && columns.includes('rollout_path')) {
+          sets.push('rollout_path = @rollout_path');
+          args.rollout_path = written.rolloutPath;
+        }
+        if (sets.length > 0) {
+          db.prepare(`UPDATE threads SET ${sets.join(', ')} WHERE id = @id`).run(args);
+        }
+      }
+    } catch (err) {
+      log.warn('finalize shared codex thread: state update failed', {
+        threadId: params.threadId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      closeDbQuietly(db);
+    }
+  }
+
+  try {
+    await appendSessionIndexEntry(home, {
+      threadId: params.threadId,
+      title: params.title,
+      updatedAt: params.updatedAt,
+    } as CodexThreadSummary);
+  } catch (err) {
+    log.warn('finalize shared codex thread: session index update failed', {
+      threadId: params.threadId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  return {
+    ...written,
+    statePresent: dbPath ? readRawThreadRow(dbPath, params.threadId) !== null : false,
+    stateFinalized: isImportedCodexThreadStateFinalized(
+      dbPath,
+      params.threadId,
+      params.newCwd,
+      written.rolloutPath,
+    ),
+  };
 }
 
 /** 会话分享导入失败的回滚:删本次**真实写入**的 rollout 与 state 三表行(best-effort);复用的既有文件/行不动。 */
@@ -1770,7 +1838,7 @@ export async function removeSharedCodexThread(
     await fsp.rm(written.rolloutPath, { force: true }).catch(() => undefined);
   }
   if (!written.stateWritten) return;
-  const dbPath = findLatestStateDb(getDesktopCodexHome());
+  const dbPath = written.stateDbPath;
   if (!dbPath) return;
   let db: Database.Database | null = null;
   try {
@@ -3370,6 +3438,20 @@ function readRawThreadRow(dbPath: string, threadId: string): SqlRow | null {
   } finally {
     closeDbQuietly(db);
   }
+}
+
+function isImportedCodexThreadStateFinalized(
+  dbPath: string | null,
+  threadId: string,
+  newCwd: string,
+  rolloutPath: string | null,
+): boolean {
+  if (!dbPath) return false;
+  const row = readRawThreadRow(dbPath, threadId);
+  if (!row) return false;
+  if ('cwd' in row && row.cwd !== newCwd) return false;
+  if (rolloutPath && 'rollout_path' in row && row.rollout_path !== rolloutPath) return false;
+  return true;
 }
 
 /** 合成 rollout 用的可读消息条目。 */

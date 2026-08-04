@@ -168,6 +168,22 @@ export const sessions = sqliteTable(
     imBotContextId: text('im_bot_context_id'),
     imUserId: text('im_user_id'),
     /**
+     * IM 会话的稳定逻辑身份。首代历史行等于自身 id；永久删除后重建的新 generation
+     * 使用新的 sessions.id，但继续共享同一个 logical id。这样旧消息和所有按 sessionId
+     * 隔离的运行态永远留在墓碑行，同时渠道下一条消息仍能定位当前 generation。
+     */
+    imLogicalSessionId: text('im_logical_session_id'),
+    /** 同一 IM 逻辑身份内的单调 generation；首代为 0。 */
+    imGeneration: integer('im_generation').notNull().default(0),
+    /** shared-userData 多实例下，当前持有该 physical runtime 的进程实例。 */
+    runtimeOwnerId: text('runtime_owner_id'),
+    /** runtime owner 的本机 PID；只用于确认 foreign owner 是否仍存活。 */
+    runtimeOwnerPid: integer('runtime_owner_pid'),
+    /** owner PID 的 OS 启动指纹，避免 PID 复用把崩溃残留误判为活进程。 */
+    runtimeOwnerProcessStart: text('runtime_owner_process_start'),
+    /** runtime owner lease heartbeat (unix ms)，用于崩溃/PID 复用后的安全接管。 */
+    runtimeOwnerHeartbeatAt: integer('runtime_owner_heartbeat_at'),
+    /**
      * 本 session 创建时是否注入了 project-context 知识（来自 .cindy/project-knowledge/）。
      * 仅在创建瞬间由 main IPC 写入；后续不变。
      * Render 端用此字段决定 sidebar stripe / chat header chip 显示。
@@ -240,8 +256,28 @@ export const sessions = sqliteTable(
     ),
     // IM 通用标识查询(slack 等渠道按 (source, botContextId, userId) 找会话行)
     idxImLookup: index('idx_sessions_im_lookup').on(t.source, t.imBotContextId, t.imUserId),
+    idxImLogicalGeneration: index('idx_sessions_im_logical_generation').on(
+      t.imLogicalSessionId,
+      t.imGeneration,
+    ),
+    uniqLiveImLogicalSession: uniqueIndex('uniq_sessions_live_im_logical')
+      .on(t.imLogicalSessionId)
+      .where(sql`${t.imLogicalSessionId} IS NOT NULL AND ${t.status} != 'deleted'`),
   }),
 );
+
+/**
+ * Durable completion marker for the irreversible resource phase of permanent
+ * task deletion. Tombstones remain in sessions for history, so startup uses
+ * this table to retry only interrupted finalizers instead of rescanning every
+ * historical deleted task on every login.
+ */
+export const sessionDeletionFinalizations = sqliteTable('session_deletion_finalizations', {
+  sessionId: text('session_id')
+    .primaryKey()
+    .references(() => sessions.id, { onDelete: 'cascade' }),
+  finalizedAt: integer('finalized_at').notNull(),
+});
 
 export const orcaTeams = sqliteTable(
   'orca_teams',

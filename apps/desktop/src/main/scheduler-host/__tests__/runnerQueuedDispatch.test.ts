@@ -218,6 +218,16 @@ interface QueueHarness {
   failAutoResume(): void;
 }
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function createQueueHarness(opts: {
   busy: boolean;
   hasQueued?: boolean;
@@ -234,6 +244,8 @@ function createQueueHarness(opts: {
    * 复刻「目标会话在入队前的 await 期间恰好空闲」这条既有注释明确允许的顺序。
    */
   acceptBeforeEnqueueResolves?: boolean;
+  /** Hold enqueuePrompt after any synchronous accept but before its mutation result settles. */
+  beforeEnqueueResolves?: () => Promise<void>;
   /** runner 收到 terminal error 时，普通自动续跑是否已接管。 */
   autoResumePending?: () => boolean;
 }): QueueHarness {
@@ -253,6 +265,7 @@ function createQueueHarness(opts: {
         if (opts.enqueueDuplicate) return { duplicate: true as const };
         enqueueCalls.push(req);
         if (opts.acceptBeforeEnqueueResolves) await req.onAccepted();
+        await opts.beforeEnqueueResolves?.();
         return { clientId: `client-${enqueueCalls.length}` };
       }),
       removeQueuedPrompt: (sessionId, clientId) => {
@@ -302,6 +315,7 @@ function createRunnerHarness(
     metaModel?: string;
     /** 停用轴裁决桩(缺省 = 不裁决,与生产未接线时一致)。 */
     checkModelRoute?: MakerScheduleRunnerDeps['checkModelRoute'];
+    acquireSessionLifecycleLease?: MakerScheduleRunnerDeps['acquireSessionLifecycleLease'];
   } = {},
 ) {
   const logger = createLogger();
@@ -332,6 +346,7 @@ function createRunnerHarness(
     logger,
     schedulerQueue,
     checkModelRoute: opts.checkModelRoute,
+    acquireSessionLifecycleLease: opts.acquireSessionLifecycleLease,
   });
   return { runner, logger, notifier, maker };
 }
@@ -351,6 +366,63 @@ beforeEach(() => {
 });
 
 describe('MakerScheduleRunner queued dispatch (busy bound session)', () => {
+  it('does not inspect or enqueue when deletion wins lifecycle admission', async () => {
+    const harness = createSessionHarness(async () => ({ accepted: true }));
+    const queue = createQueueHarness({ busy: true });
+    const acquireSessionLifecycleLease = vi.fn(async () => ({
+      acquired: false as const,
+      reason: 'deleted',
+    }));
+    const { runner, maker } = createRunnerHarness(harness.session, queue.deps, {
+      acquireSessionLifecycleLease,
+    });
+
+    await expect(runner.fire(heartbeatSchedule(), createFireContext())).rejects.toThrow(
+      /lifecycle admission failed: deleted/,
+    );
+
+    expect(acquireSessionLifecycleLease).toHaveBeenCalledWith(SESSION_ID);
+    expect(maker.getSessionMeta).not.toHaveBeenCalled();
+    expect(mocks.getSessionRowSnapshot).not.toHaveBeenCalled();
+    expect(queue.deps.enqueuePrompt).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    'holds lifecycle admission through enqueue settlement (acceptBeforeResolve=%s)',
+    async (acceptBeforeEnqueueResolves) => {
+      const enqueueGate = deferred();
+      const release = vi.fn();
+      const harness = createSessionHarness(async () => ({ accepted: true }));
+      const queue = createQueueHarness({
+        busy: true,
+        acceptBeforeEnqueueResolves,
+        beforeEnqueueResolves: () => enqueueGate.promise,
+      });
+      const { runner } = createRunnerHarness(harness.session, queue.deps, {
+        acquireSessionLifecycleLease: vi.fn(async () => ({
+          acquired: true as const,
+          release,
+        })),
+      });
+      const ctx = createFireContext();
+
+      const firePromise = runner.fire(heartbeatSchedule(), ctx);
+      await vi.waitFor(() => expect(queue.enqueueCalls).toHaveLength(1));
+      if (acceptBeforeEnqueueResolves) {
+        await vi.waitFor(() => expect(ctx.onTurnActive).toHaveBeenCalledWith(SESSION_ID));
+      }
+      expect(release).not.toHaveBeenCalled();
+
+      enqueueGate.resolve();
+      await vi.waitFor(() => expect(release).toHaveBeenCalledTimes(1));
+
+      if (!acceptBeforeEnqueueResolves) await queue.accept();
+      harness.emit({ type: 'done', data: {}, source: 'claude-code' });
+      await expect(firePromise).resolves.toMatchObject({ sessionId: SESSION_ID });
+      expect(release).toHaveBeenCalledTimes(1);
+    },
+  );
+
   it('enqueues instead of sending directly; captures turn result after dispatch', async () => {
     const harness = createSessionHarness(async () => ({ accepted: true }));
     const queue = createQueueHarness({ busy: true });

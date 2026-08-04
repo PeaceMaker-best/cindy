@@ -68,6 +68,7 @@ import {
   materializeDirectSendOssAttachments,
   normalizeUserMessage,
   materializeQueuedOssAttachments,
+  stageQueuedOssAttachments,
 } from '../maker-ipc/normalizeAttachments';
 import { buildAttachmentOssRef } from '../../shared/attachmentOssRef';
 
@@ -95,6 +96,45 @@ describe('queued attachment cleanup regression', () => {
       }),
     ).rejects.toThrow();
     expect(removeRemote).toHaveBeenCalledWith('oss/first.png');
+  });
+
+  it('keeps OSS retryable until queue acceptance and deletes it exactly once afterward', async () => {
+    const ref = buildAttachmentOssRef({
+      ossKey: 'oss/queued.png',
+      mimeType: 'image/png',
+      originalName: 'queued.png',
+    });
+    const out = await stageQueuedOssAttachments('sess-1', {
+      clientId: 'queued-client',
+      files: [{ path: ref, mimeType: 'image/png' }],
+    });
+
+    expect(downloadToFile).toHaveBeenCalledTimes(1);
+    expect(removeRemote).not.toHaveBeenCalled();
+    out.cleanupAfterAcceptance?.();
+    out.cleanupAfterAcceptance?.();
+    expect(removeRemote).toHaveBeenCalledTimes(1);
+    expect(removeRemote).toHaveBeenCalledWith('oss/queued.png');
+  });
+
+  it('cleans rejected queue materialization locally while retaining remote OSS for retry', async () => {
+    const ref = buildAttachmentOssRef({
+      ossKey: 'oss/retry.png',
+      mimeType: 'image/png',
+      originalName: 'retry.png',
+    });
+    deleteZeroRefBlobRecord.mockResolvedValue(true);
+    const out = await stageQueuedOssAttachments('sess-1', {
+      clientId: 'retry-client',
+      files: [{ path: ref, mimeType: 'image/png' }],
+    });
+
+    await out.cleanupBeforeAcceptance?.();
+    await out.cleanupBeforeAcceptance?.();
+    expect(removeRefById).toHaveBeenCalledTimes(1);
+    expect(deleteZeroRefBlobRecord).toHaveBeenCalledTimes(1);
+    expect(deleteBlobFile).toHaveBeenCalledTimes(1);
+    expect(removeRemote).not.toHaveBeenCalled();
   });
 });
 

@@ -16,6 +16,7 @@ interface GoalSessionRestoreMaker {
 
 interface GoalSessionRow {
   providerId: string | null;
+  status?: string;
 }
 
 /** Injectable seams keep the dormant-session restore ordering deterministic in tests. */
@@ -38,6 +39,18 @@ export async function restoreSessionForGoal(
   sessionId: string,
   deps: RestoreGoalSessionDeps,
 ): Promise<SessionLike | undefined> {
+  let row: GoalSessionRow | null;
+  try {
+    row = await (deps.getSessionRow ?? getSessionRowSnapshot)(sessionId);
+  } catch (err) {
+    deps.warn('[goal-host] ensureSession row lookup failed', {
+      sessionId,
+      error: String(err),
+    });
+    return undefined;
+  }
+  if (!row || (row.status !== undefined && row.status !== 'active')) return undefined;
+
   const live = deps.maker.getSession(sessionId);
   if (live) return live;
 
@@ -48,7 +61,6 @@ export async function restoreSessionForGoal(
   }
 
   try {
-    const row = await (deps.getSessionRow ?? getSessionRowSnapshot)(sessionId);
     const opts: MakerSessionCreateOpts = {
       id: sessionId,
       agentKind: meta.agentKind,

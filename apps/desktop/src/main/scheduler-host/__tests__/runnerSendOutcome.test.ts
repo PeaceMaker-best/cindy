@@ -245,6 +245,60 @@ describe('MakerScheduleRunner send outcome policy', () => {
     });
   });
 
+  it('does not inspect, create, or send when deletion wins lifecycle admission', async () => {
+    const h = createSessionHarness(async () => ({ accepted: true }));
+    const acquireSessionLifecycleLease = vi.fn(async () => ({
+      acquired: false as const,
+      reason: 'deleted',
+    }));
+    const { runner, maker } = createRunnerHarness(h.session, {
+      acquireSessionLifecycleLease,
+    });
+
+    await expect(runner.fire(
+      baseSchedule({ targetSessionId: 'scheduler-session' }),
+      createFireContext(),
+    )).rejects.toThrow(
+      /lifecycle admission failed: deleted/,
+    );
+
+    expect(acquireSessionLifecycleLease).toHaveBeenCalledWith('scheduler-session');
+    expect(maker.getSessionMeta).not.toHaveBeenCalled();
+    expect(mocks.getSessionRowSnapshot).not.toHaveBeenCalled();
+    expect(maker.createSession).not.toHaveBeenCalled();
+    expect(h.send).not.toHaveBeenCalled();
+  });
+
+  it('releases direct-send lifecycle admission exactly once after Session.send settles', async () => {
+    let settleSend!: (result: SessionSendResult) => void;
+    const sendGate = new Promise<SessionSendResult>((resolve) => {
+      settleSend = resolve;
+    });
+    const releaseLifecycle = vi.fn();
+    const h = createSessionHarness(async (_message, opts) => {
+      await opts?.onAccepted?.();
+      return sendGate;
+    });
+    const { runner } = createRunnerHarness(h.session, {
+      acquireSessionLifecycleLease: vi.fn(async () => ({
+        acquired: true as const,
+        release: releaseLifecycle,
+      })),
+    });
+
+    const firePromise = runner.fire(baseSchedule(), createFireContext());
+    await vi.waitFor(() => expect(h.send).toHaveBeenCalledTimes(1));
+    expect(releaseLifecycle).not.toHaveBeenCalled();
+
+    settleSend({ accepted: true });
+    await vi.waitFor(() => expect(releaseLifecycle).toHaveBeenCalledTimes(1));
+    expect(await settleWithin(firePromise, 25)).toEqual({ status: 'timeout' });
+
+    h.emit({ type: 'done', data: {} });
+    await expect(firePromise).resolves.toMatchObject({ sessionId: 'scheduler-session' });
+    expect(releaseLifecycle).toHaveBeenCalledTimes(1);
+  });
+
   it('marks accepted:false scheduler runs failed without waiting for terminal events; review-pr inherits this runner policy', async () => {
     const h = createSessionHarness(async () => ({
       accepted: false,

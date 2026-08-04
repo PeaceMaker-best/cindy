@@ -8614,6 +8614,7 @@
     },
     "note": {
       "codexStateSkipped": "Codex has not been initialized on this machine, so session state was not fully restored. Run any Codex session once, then continuing will work.",
+      "codexStateFinalizeFailed": "Codex session state was imported, but its continuation pointer could not be updated. Re-import this share file to retry the repair.",
       "workdirKeyInexact": "The chosen directory path is too long to place transcripts; downgraded to chat history only."
     }
   },

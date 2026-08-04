@@ -5,12 +5,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type {
-  AgentEvent,
-  MakerEvent,
-  Session,
-  SessionSendResult,
-} from '@cindy/maker-core';
+import type { AgentEvent, MakerEvent, Session, SessionSendResult } from '@cindy/maker-core';
 import type { ChannelIM } from '@cindy/im';
 
 const mocks = vi.hoisted(() => ({
@@ -36,6 +31,10 @@ const mocks = vi.hoisted(() => ({
   readXdGatewayApiKey: vi.fn(),
   bindingGet: vi.fn(),
   bindingDetach: vi.fn(),
+  bindingDetachIfTarget: vi.fn(),
+  bindingRefreshFromPersistence: vi.fn(),
+  bindingIsPersistedTarget: vi.fn(),
+  withSendToSessionLock: vi.fn(async (_sessionId: string, run: () => Promise<unknown>) => run()),
   findActiveSession: vi.fn(),
   createSession: vi.fn(),
   touchUserSent: vi.fn(),
@@ -118,6 +117,9 @@ vi.mock('../../binding', () => ({
   bindingStore: {
     get: mocks.bindingGet,
     detach: mocks.bindingDetach,
+    detachIfTarget: mocks.bindingDetachIfTarget,
+    refreshFromPersistence: mocks.bindingRefreshFromPersistence,
+    isPersistedTarget: mocks.bindingIsPersistedTarget,
   },
 }));
 
@@ -128,6 +130,7 @@ vi.mock('../../../maker-ipc/register', () => ({
   noteSilentStopUserSend: mocks.noteSilentStopUserSend,
   noteSilentStopSessionReset: mocks.noteSilentStopSessionReset,
   onSilentStopSettled: mocks.onSilentStopSettled,
+  withSendToSessionLock: mocks.withSendToSessionLock,
 }));
 
 vi.mock('../pendingInteractions', () => ({
@@ -174,9 +177,7 @@ interface SessionHarness {
 }
 
 function createSessionHarness(
-  sendImpl: (
-    message: Parameters<Session['send']>[0],
-  ) => Promise<SessionSendResult>,
+  sendImpl: (message: Parameters<Session['send']>[0]) => Promise<SessionSendResult>,
   sessionId = 'feishu-session',
 ): SessionHarness {
   const listeners: Array<(event: AgentEvent) => void> = [];
@@ -318,9 +319,7 @@ function getRunner(): ImTurnRunner {
   return runner;
 }
 
-function setupSession(
-  sendImpl: Parameters<typeof createSessionHarness>[0],
-): SessionHarness {
+function setupSession(sendImpl: Parameters<typeof createSessionHarness>[0]): SessionHarness {
   const h = createSessionHarness(sendImpl);
   mocks.getMaker.mockReturnValue(createMakerHarness(h.session));
   return h;
@@ -335,6 +334,7 @@ function setupAttachedSession(
   mocks.desktopSessionRows.mockResolvedValue([
     {
       id: sessionId,
+      status: 'active',
       agentKind: 'claude-code',
       workingDir: 'F:\\XDMaker',
       model: 'claude-opus-4-7',
@@ -374,19 +374,13 @@ interface TurnOverrides {
   text?: string;
 }
 
-async function runDefaultTurn(
-  onTurnComplete = vi.fn(),
-  overrides: TurnOverrides = {},
-) {
+async function runDefaultTurn(onTurnComplete = vi.fn(), overrides: TurnOverrides = {}) {
   const { turnPromise } = await startDefaultTurn(onTurnComplete, overrides);
   await turnPromise;
   return { onTurnComplete };
 }
 
-async function startDefaultTurn(
-  onTurnComplete = vi.fn(),
-  overrides: TurnOverrides = {},
-) {
+async function startDefaultTurn(onTurnComplete = vi.fn(), overrides: TurnOverrides = {}) {
   const turnPromise = getRunner().runAgentTurn({
     botContextId: 'cli_test_bot',
     userId: 'ou_user',
@@ -417,10 +411,7 @@ async function waitForAssertion(assertion: () => void): Promise<void> {
   throw lastError;
 }
 
-function expectSafeSendOutcomeLog(expected: {
-  source: string;
-  reason: string;
-}): void {
+function expectSafeSendOutcomeLog(expected: { source: string; reason: string }): void {
   expect(mocks.logger.error).toHaveBeenCalledWith(
     'feishu session send failed before dispatch',
     expect.objectContaining({
@@ -445,6 +436,11 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
   beforeEach(() => {
     vi.clearAllMocks();
     makerEventListeners = [];
+    mocks.bindingDetachIfTarget.mockResolvedValue(true);
+    mocks.bindingRefreshFromPersistence.mockImplementation(async (identity) =>
+      mocks.bindingGet(identity),
+    );
+    mocks.bindingIsPersistedTarget.mockResolvedValue(true);
     mocks.readXdGatewayApiKey.mockReturnValue('xd-gateway-key');
     mocks.hasCustomProviderKey.mockReturnValue(false);
     mocks.listProviders.mockResolvedValue([
@@ -515,6 +511,156 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
     runner = null;
   });
 
+  it('does not wire, touch, persist, or send when deletion wins outer lifecycle admission', async () => {
+    const maker = createMakerHarness(createSessionHarness(async () => ({ accepted: true })).session);
+    mocks.getMaker.mockReturnValue(maker);
+    const withActiveSessionLifecycle = vi.fn(async () => ({
+      admitted: false as const,
+      reason: 'deleted',
+    }));
+    const localRunner = createTurnRunner(fakeAdapter, fakeRepo, fakeCards, {
+      withActiveSessionLifecycle,
+    });
+
+    try {
+      await localRunner.runAgentTurn({
+        botContextId: 'cli_test_bot',
+        userId: 'ou_user',
+        userMessageId: 'msg-delete-first',
+        text: 'late message',
+        attachments: [],
+      });
+
+      expect(withActiveSessionLifecycle).toHaveBeenCalledWith(
+        'feishu-session',
+        expect.any(Function),
+      );
+      expect(maker.createSession).not.toHaveBeenCalled();
+      expect(mocks.wireSessionToIpcExternal).not.toHaveBeenCalled();
+      expect(mocks.touchUserSent).not.toHaveBeenCalled();
+      expect(mocks.persistUserMessage).not.toHaveBeenCalled();
+    } finally {
+      await localRunner.disposeAllSessions();
+    }
+  });
+
+  it('holds outer lifecycle admission through direct send acceptance and settlement', async () => {
+    mocks.findActiveSession.mockResolvedValue({
+      id: 'feishu-session',
+      agentKind: 'claude-code',
+      workingDir: 'F:\\XDMaker',
+      model: 'claude-opus-4-7',
+      effort: 'xhigh',
+      permissionMode: 'bypassPermissions',
+      fastMode: false,
+      sdkSessionId: 'sdk-existing',
+      providerId: null,
+    });
+    const order: string[] = [];
+    const sendGate = deferred<SessionSendResult>();
+    const h = setupSession(async () => ({ accepted: true }));
+    h.send.mockImplementationOnce(async (_message, opts) => {
+      order.push('send-start');
+      await opts?.beforeProviderStart?.();
+      await opts?.onAccepted?.();
+      order.push('accepted-effects-done');
+      const result = await sendGate.promise;
+      order.push('send-settled');
+      return result;
+    });
+    const localRunner = createTurnRunner(fakeAdapter, fakeRepo, fakeCards, {
+      withActiveSessionLifecycle: vi.fn(async (_sessionId, run) => {
+        order.push('lifecycle-acquired');
+        const value = await run();
+        order.push('lifecycle-released');
+        return { admitted: true as const, value };
+      }),
+    });
+
+    try {
+      const turnPromise = localRunner.runAgentTurn({
+        botContextId: 'cli_test_bot',
+        userId: 'ou_user',
+        userMessageId: 'msg-direct-admission',
+        text: 'send safely',
+        attachments: [],
+      });
+      await vi.waitFor(() => expect(order).toContain('accepted-effects-done'));
+      expect(order).not.toContain('lifecycle-released');
+
+      sendGate.resolve({ accepted: true });
+      await expect(turnPromise).resolves.toBeUndefined();
+      expect(order).toEqual([
+        'lifecycle-acquired',
+        'send-start',
+        'accepted-effects-done',
+        'send-settled',
+        'lifecycle-released',
+      ]);
+      expect(mocks.persistUserMessage).toHaveBeenCalledTimes(1);
+
+      h.emit({ type: 'done', data: {} });
+      await flushMicrotasks();
+    } finally {
+      await localRunner.disposeAllSessions();
+    }
+  });
+
+  it('rechecks lifecycle admission before retrying a busy queued send', async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.findActiveSession.mockResolvedValue({
+        id: 'feishu-session',
+        agentKind: 'claude-code',
+        workingDir: 'F:\\XDMaker',
+        model: 'claude-opus-4-7',
+        effort: 'xhigh',
+        permissionMode: 'bypassPermissions',
+        fastMode: false,
+        sdkSessionId: 'sdk-existing',
+        providerId: null,
+      });
+      const err = new Error('SESSION_RUNNING') as Error & { code?: string };
+      err.code = 'SESSION_RUNNING';
+      const h = setupSession(async () => ({ accepted: true }));
+      h.send.mockRejectedValueOnce(err);
+      let admissionCount = 0;
+      const onTurnComplete = vi.fn();
+      const localRunner = createTurnRunner(fakeAdapter, fakeRepo, fakeCards, {
+        withActiveSessionLifecycle: vi.fn(async (_sessionId, run) => {
+          admissionCount += 1;
+          if (admissionCount === 1) {
+            return { admitted: true as const, value: await run() };
+          }
+          return { admitted: false as const, reason: 'deleted' };
+        }),
+      });
+
+      try {
+        await localRunner.runAgentTurn({
+          botContextId: 'cli_test_bot',
+          userId: 'ou_user',
+          userMessageId: 'msg-retry-delete',
+          text: 'retry only if active',
+          attachments: [],
+          onTurnComplete,
+        });
+        expect(h.send).toHaveBeenCalledTimes(1);
+        expect(mocks.persistUserMessage).not.toHaveBeenCalled();
+
+        await vi.advanceTimersByTimeAsync(600);
+        expect(admissionCount).toBe(2);
+        expect(h.send).toHaveBeenCalledTimes(1);
+        expect(mocks.persistUserMessage).not.toHaveBeenCalled();
+        expect(onTurnComplete).toHaveBeenCalledTimes(1);
+      } finally {
+        await localRunner.disposeAllSessions();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('keeps IM persistence, ack, card, and completion exactly-once when Maker recovery is transparent', async () => {
     const streamingHandle = {
       messageId: 'stream-recovered',
@@ -550,18 +696,36 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
   it('passes persisted null Pi providerId through cold IM session creation', async () => {
     // Pi core 将 null 解释为“清除显式来源”；undefined 会反查同名 BYOM provider。
     mocks.findActiveSession.mockResolvedValue({
-      id: 'feishu-session', agentKind: 'pi', workingDir: 'F:\\XDMaker', model: 'gpt-5',
-      effort: 'high', permissionMode: 'auto', fastMode: false, sdkSessionId: null, providerId: null,
+      id: 'feishu-session',
+      agentKind: 'pi',
+      workingDir: 'F:\\XDMaker',
+      model: 'gpt-5',
+      effort: 'high',
+      permissionMode: 'auto',
+      fastMode: false,
+      sdkSessionId: null,
+      providerId: null,
     });
-    mocks.listProviders.mockResolvedValue([{ id: 'xd', name: 'XD', source: 'builtin', connected: true,
-      agents: ['pi'], models: { pi: [{ id: 'gpt-5' }] }, routing: { pi: { upstream: 'https://gateway.example/v1', authStrategy: 'gateway-key' } } }]);
+    mocks.listProviders.mockResolvedValue([
+      {
+        id: 'xd',
+        name: 'XD',
+        source: 'builtin',
+        connected: true,
+        agents: ['pi'],
+        models: { pi: [{ id: 'gpt-5' }] },
+        routing: { pi: { upstream: 'https://gateway.example/v1', authStrategy: 'gateway-key' } },
+      },
+    ]);
     const h = createSessionHarness(async () => ({ accepted: true }));
     const maker = createMakerHarness(h.session);
     mocks.getMaker.mockReturnValue(maker);
 
     await runDefaultTurn();
 
-    expect(maker.createSession).toHaveBeenCalledWith(expect.objectContaining({ agentKind: 'pi', providerId: null }));
+    expect(maker.createSession).toHaveBeenCalledWith(
+      expect.objectContaining({ agentKind: 'pi', providerId: null }),
+    );
   });
 
   it('marks only an accepted attached IM turn headless and releases it on done', async () => {
@@ -662,6 +826,10 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
       order.push('release');
     });
     const acquirePendingAgentSwitch = vi.fn(async () => {
+      // Initial wiring owns the one process-local send lock. The deferred-switch
+      // dependency then owns the route/send lease through refresh and dispatch,
+      // so the send path must not acquire a second lock.
+      expect(mocks.withSendToSessionLock).toHaveBeenCalledTimes(1);
       order.push('apply');
       live = switchedSession.session;
       emitMakerEvent({
@@ -686,6 +854,7 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
       });
 
       expect(acquirePendingAgentSwitch).toHaveBeenCalledWith('feishu-session');
+      expect(mocks.withSendToSessionLock).toHaveBeenCalledTimes(1);
       expect(oldSession.send).not.toHaveBeenCalled();
       expect(switchedSession.send).toHaveBeenCalledTimes(1);
       expect(mocks.wireSessionToIpcExternal).toHaveBeenLastCalledWith(switchedSession.session);
@@ -955,7 +1124,9 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
     try {
       // pre-check 时 isTurnRunning=false, 但 send 时另一端抢先开了 turn —
       // 第一次 send 抛 SESSION_RUNNING, 应入队重试而不是回"启动 agent 失败"。
-      const err = new Error('SESSION_RUNNING: PROMPT_SECRET TOKEN_VALUE file body') as Error & { code?: string };
+      const err = new Error('SESSION_RUNNING: PROMPT_SECRET TOKEN_VALUE file body') as Error & {
+        code?: string;
+      };
       err.code = 'SESSION_RUNNING';
       const h = setupSession(async () => ({ accepted: true }));
       h.send.mockRejectedValueOnce(err);
@@ -997,11 +1168,9 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
 
     expect(onTurnComplete).toHaveBeenCalledTimes(1);
     expect(mocks.feishuIm.removeMessageReaction).toHaveBeenCalledWith('msg-user', 'reaction-1');
-    expect(mocks.feishuIm.sendText).toHaveBeenCalledWith(
-      'ou_user',
-      ui.agent.credentialBusy,
-      { threadTs: undefined },
-    );
+    expect(mocks.feishuIm.sendText).toHaveBeenCalledWith('ou_user', ui.agent.credentialBusy, {
+      threadTs: undefined,
+    });
     expect(mocks.persistUserMessage).not.toHaveBeenCalled();
     expect(mocks.logger.error).not.toHaveBeenCalledWith(
       expect.stringContaining('session send failed before dispatch'),
@@ -1010,7 +1179,9 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
   });
 
   it('queues a second message while the first turn is running and dispatches it after done', async () => {
-    mocks.feishuIm.reactToMessage.mockImplementation(async (messageId: string) => `reaction-${messageId}`);
+    mocks.feishuIm.reactToMessage.mockImplementation(
+      async (messageId: string) => `reaction-${messageId}`,
+    );
     const h = setupSession(async () => ({ accepted: true }));
     const firstComplete = vi.fn();
     await runDefaultTurn(firstComplete, {
@@ -1053,7 +1224,10 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
     });
 
     expect(firstComplete).toHaveBeenCalledTimes(1);
-    expect(mocks.feishuIm.removeMessageReaction).toHaveBeenCalledWith('msg-first', 'reaction-msg-first');
+    expect(mocks.feishuIm.removeMessageReaction).toHaveBeenCalledWith(
+      'msg-first',
+      'reaction-msg-first',
+    );
     expect(mocks.persistUserMessage).toHaveBeenCalledTimes(2);
     // assistant 落库收口在 messagePersistBroadcaster(经 wireSessionToIpcExternal),
     // turnRunner 不再自写 — 自写会与 broadcaster 双份落库。
@@ -1065,7 +1239,10 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
     await flushMicrotasks();
 
     expect(secondComplete).toHaveBeenCalledTimes(1);
-    expect(mocks.feishuIm.removeMessageReaction).toHaveBeenCalledWith('msg-second', 'reaction-msg-second');
+    expect(mocks.feishuIm.removeMessageReaction).toHaveBeenCalledWith(
+      'msg-second',
+      'reaction-msg-second',
+    );
   });
 
   it('queues while a desktop-originated turn is running (attached takeover) and dispatches on its stray done', async () => {
@@ -1412,9 +1589,7 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
       },
     });
     await flushMicrotasks();
-    expect(handle.replace.mock.calls.map((c) => String(c[0])).join('\n')).toContain(
-      '正在自动重试',
-    );
+    expect(handle.replace.mock.calls.map((c) => String(c[0])).join('\n')).toContain('正在自动重试');
 
     // 重投成功, 但这一轮一个字都没输出。
     h.emit({ type: 'done', data: {} });
@@ -1669,7 +1844,10 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
           codex: [],
         },
         routing: {
-          'claude-code': { upstream: 'https://api.anthropic.com', authStrategy: 'oauth-passthrough' },
+          'claude-code': {
+            upstream: 'https://api.anthropic.com',
+            authStrategy: 'oauth-passthrough',
+          },
         },
       },
     ]);
@@ -1709,7 +1887,10 @@ describe('turnRunner send outcome policy (feishu adapter characterization)', () 
           codex: [],
         },
         routing: {
-          'claude-code': { upstream: 'https://api.anthropic.com', authStrategy: 'oauth-passthrough' },
+          'claude-code': {
+            upstream: 'https://api.anthropic.com',
+            authStrategy: 'oauth-passthrough',
+          },
         },
       },
       {

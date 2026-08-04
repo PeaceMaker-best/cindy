@@ -54,6 +54,10 @@ import { CURRENT_CINDY_REGION } from '../../shared/brandRegion.js';
 import { getAppCapabilities } from '../appCapabilities.js';
 import { ownerScopedUserDataPath } from '../appSessionState.js';
 import {
+  withActiveSessionLifecycleLock,
+  withSessionLifecycleLock,
+} from '../sessionLifecycleLock.js';
+import {
   HOOK_CONTROL_EVENT,
   HOOK_CONTROL_INVOKE,
   HOOK_WORKSPACE_ALIAS_RE,
@@ -334,7 +338,21 @@ function ensureInstances(): { store: SlackHookStore; manager: HookControlManager
         filePath: ownerScopedUserDataPath('hook-bindings.json'),
         log,
       }),
-      runner: createMakerHookSessionRunner({ log }),
+      runner: createMakerHookSessionRunner({
+        log,
+        withSessionLifecycle: async (sessionId, run) => {
+          const result = await withSessionLifecycleLock(sessionId, () => run());
+          return result.acquired
+            ? { acquired: true, value: result.value }
+            : { acquired: false, reason: result.reason };
+        },
+        withActiveSessionLifecycle: async (sessionId, run) => {
+          const result = await withActiveSessionLifecycleLock(sessionId, () => run());
+          return result.admitted
+            ? { admitted: true, value: result.value }
+            : { admitted: false, reason: result.reason };
+        },
+      }),
       buildContextPrefix: buildGroupContextPrefix,
       // 新建 hook 会话默认预建独立 worktree(并发隔离); deps 组装与
       // maker-ipc/register.ts 的 use_worktree 分支同款。失败由 dispatcher

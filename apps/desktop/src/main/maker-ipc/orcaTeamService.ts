@@ -590,9 +590,9 @@ export function createOrcaTeamService(deps: OrcaTeamServiceDeps): OrcaTeamServic
       let result: DispatchWorkerMessageResult;
       const wasLiveBeforeDispatch = deps.getLiveSession(target.sessionId) !== null;
       try {
-        if ((target.status === 'idle' || target.status === 'done') && !wasLiveBeforeDispatch) {
-          await deps.resumeWorkerSession(target, link);
-        }
+        // dispatchWorkerMessage owns the lifecycle-safe wake/create + send
+        // boundary. Pre-resuming here would release that admission before the
+        // actual dispatch and let deletion interleave between the two steps.
         result = await deps.dispatchWorkerMessage({
           targetSessionId: params.targetSessionId,
           message: params.message,

@@ -12,6 +12,7 @@
 
 import { createLogger } from '../../logger';
 import { acquirePendingAgentSwitchForDirectSend } from '../../maker-ipc/register';
+import { withActiveSessionLifecycleLock } from '../../sessionLifecycleLock';
 import { createImSessionRepo, type ImSessionRepo } from './sessionRepo';
 import { createCardBuilders, type ImCardBuilders } from './cardBuilders';
 import { createTurnRunner, type ImTurnRunner } from './turnRunner';
@@ -70,6 +71,12 @@ export function createImOrchestrator(adapter: ImChannelAdapter): ImOrchestrator 
   const cards = createCardBuilders(adapter.ui, repo.getDefaultEffortFor);
   const turnRunner = createTurnRunner(adapter, repo, cards, {
     acquirePendingAgentSwitch: acquirePendingAgentSwitchForDirectSend,
+    withActiveSessionLifecycle: async (sessionId, run) => {
+      const result = await withActiveSessionLifecycleLock(sessionId, () => run());
+      return result.admitted
+        ? { admitted: true, value: result.value }
+        : { admitted: false, reason: result.reason };
+    },
   });
   const slash = createSlashHandlers(adapter, repo, cards, turnRunner);
   const attachMessageHandler = createMessageHandler(adapter, slash, turnRunner);

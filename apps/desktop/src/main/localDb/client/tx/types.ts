@@ -15,11 +15,16 @@ export type DbTxName =
   | 'orca.setWorkerFocus'
   | 'orca.removeWorker'
   | 'orca.cancelStaleTeams'
+  | 'orca.archiveWorkersByTeam'
+  | 'orca.reconcileInactiveTeamWorkersForLead'
   | 'sessions.renameTitles'
   | 'sessions.setStatus'
+  | 'session.prepareDeletedLifecycle'
+  | 'session.replaceDeletedGeneration'
   | 'session.agentSwitchFallback'
   | 'message.delete'
   | 'im.deleteBindings'
+  | 'im.deleteBindingIfTarget'
   | 'im.replaceBinding'
   | 'wechatActivateBindingEpoch'
   | 'wechatCommitPollBatch'
@@ -241,6 +246,8 @@ export interface OrcaSetWorkerFocusArgs {
 /** F-COLLAB: create_worker 派发失败时移除 worker link，并归档对应 session。 */
 export interface OrcaRemoveWorkerArgs {
   workerId: string;
+  /** Session id observed before acquiring its lifecycle lock. */
+  expectedSessionId?: string;
   now: number;
 }
 
@@ -255,11 +262,60 @@ export interface OrcaCancelStaleTeamsArgs {
   now: number;
 }
 
+/** Atomically archive every non-deleted session currently linked to one team. */
+export interface OrcaArchiveWorkersByTeamArgs {
+  teamId: string;
+  /** Stable session-id snapshot captured before lifecycle locks are acquired. */
+  sessionIds?: string[];
+  now: number;
+}
+
+/** Atomically reconcile worker rows and active sessions for a lead's ended teams. */
+export interface OrcaReconcileInactiveTeamWorkersForLeadArgs {
+  leadSessionId: string;
+  /** Stable session-id snapshot captured before lifecycle locks are acquired. */
+  sessionIds?: string[];
+  now: number;
+}
+
 export interface SessionsRenameTitleChange {
   sessionId: string;
   title: string;
   expectedCurrentTitle?: string;
   expectedUpdatedAt?: string;
+}
+
+/** Atomically seal durable work that must not outlive a permanently deleted task. */
+export interface SessionPrepareDeletedLifecycleArgs {
+  sessionId: string;
+  now: number;
+}
+
+/**
+ * Publish a fresh IM generation without mutating the deleted tombstone or its
+ * message history. The transaction returns the already-live generation when a
+ * competing process won first.
+ */
+export interface SessionReplaceDeletedGenerationArgs {
+  oldSessionId: string;
+  newSessionId: string;
+  logicalSessionId: string;
+  generation: number;
+  title: string;
+  workingDir: string;
+  workspaceKind: 'project' | 'dialogue';
+  model: string;
+  effort: string;
+  permissionMode: string;
+  providerId: string | null;
+  fastMode: boolean;
+  agentKind: string;
+  source: string;
+  feishuOpenId: string | null;
+  feishuBotAppId: string | null;
+  imBotContextId: string | null;
+  imUserId: string | null;
+  now: number;
 }
 
 export interface SessionsRenameTitlesArgs {
@@ -277,6 +333,7 @@ export interface SessionsRenameTitleResult {
 export interface SessionsSetStatusArgs {
   sessionIds: string[];
   status: 'active' | 'archived';
+  runtimeOwnerId: string;
 }
 
 /** resume 停泊失败后的原子回落:清失效绑定并把边界改成全量交接。 */
@@ -369,6 +426,26 @@ export interface SessionImportShareArgs {
     createdAt: number;
     rewindAt: number | null;
   }>;
+  /**
+   * 覆盖导入时由事务 compare-and-set 软删的旧会话。expectedStatus 防止预检后
+   * 会话状态被并发修改；agentKind/sdkSessionId 直接复用新 session 行作为身份。
+   */
+  overwriteExisting?: {
+    sessionId: string;
+    expectedStatus: 'active' | 'archived';
+  };
+  /** Current process runtime-owner prefix; required for overwrite deletion CAS. */
+  runtimeOwnerId?: string;
+}
+
+export interface SessionImportShareResult {
+  messageCount: number;
+  replacedSession: {
+    sessionId: string;
+    title: string | null;
+    workingDir: string | null;
+    workspaceKind: string | null;
+  } | null;
 }
 
 /**
@@ -392,6 +469,15 @@ export interface ImDeleteBindingsArgs {
     userId: string;
     scopeKey: string;
   }>;
+}
+
+/** Compare-and-delete one identity/target pair, then purge legacy duplicates. */
+export interface ImDeleteBindingIfTargetArgs {
+  channel: string;
+  botContextId: string;
+  userId: string;
+  scopeKey: string;
+  targetSessionId: string;
 }
 
 export type WechatInboxStatus =
@@ -543,7 +629,14 @@ export interface WechatOutboxChunkInput {
   kind: WechatOutboxKind;
   chunkIndex: number;
   text: string;
-  mediaJson?: string;
+  media?: WechatOutboxMediaInput[];
+}
+
+export interface WechatOutboxMediaInput {
+  hash: string;
+  absPath: string;
+  fileName: string;
+  clientId: string;
 }
 
 export interface WechatCommitInterruptedArgs {
@@ -690,11 +783,16 @@ export type DbTxArgsByName = {
   'orca.setWorkerFocus': OrcaSetWorkerFocusArgs;
   'orca.removeWorker': OrcaRemoveWorkerArgs;
   'orca.cancelStaleTeams': OrcaCancelStaleTeamsArgs;
+  'orca.archiveWorkersByTeam': OrcaArchiveWorkersByTeamArgs;
+  'orca.reconcileInactiveTeamWorkersForLead': OrcaReconcileInactiveTeamWorkersForLeadArgs;
   'sessions.renameTitles': SessionsRenameTitlesArgs;
   'sessions.setStatus': SessionsSetStatusArgs;
+  'session.prepareDeletedLifecycle': SessionPrepareDeletedLifecycleArgs;
+  'session.replaceDeletedGeneration': SessionReplaceDeletedGenerationArgs;
   'session.agentSwitchFallback': SessionAgentSwitchFallbackArgs;
   'message.delete': MessageDeleteArgs;
   'im.deleteBindings': ImDeleteBindingsArgs;
+  'im.deleteBindingIfTarget': ImDeleteBindingIfTargetArgs;
   'im.replaceBinding': ImReplaceBindingArgs;
   wechatActivateBindingEpoch: WechatActivateBindingEpochArgs;
   wechatCommitPollBatch: WechatCommitPollBatchArgs;
@@ -733,11 +831,16 @@ export type DbTxResultByName = {
   'orca.setWorkerFocus': undefined;
   'orca.removeWorker': string | null;
   'orca.cancelStaleTeams': undefined;
+  'orca.archiveWorkersByTeam': string[];
+  'orca.reconcileInactiveTeamWorkersForLead': string[];
   'sessions.renameTitles': SessionsRenameTitleResult[];
   'sessions.setStatus': SessionsSetStatusResultItem[];
+  'session.prepareDeletedLifecycle': boolean;
+  'session.replaceDeletedGeneration': string | null;
   'session.agentSwitchFallback': undefined;
   'message.delete': MessageDeleteResult;
   'im.deleteBindings': undefined;
+  'im.deleteBindingIfTarget': boolean;
   'im.replaceBinding': undefined;
   wechatActivateBindingEpoch: WechatActivateBindingEpochResult;
   wechatCommitPollBatch: WechatCommitPollBatchResult;
@@ -756,5 +859,5 @@ export type DbTxResultByName = {
   wechatPromoteTaskAttachments: WechatPromoteTaskAttachmentsResult;
   wechatRefreshOutboxContexts: WechatRefreshOutboxContextsResult;
   wechatUnbindCleanup: WechatUnbindCleanupResult;
-  'session.importShare': { messageCount: number };
+  'session.importShare': SessionImportShareResult;
 };

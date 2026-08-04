@@ -12,8 +12,12 @@ const mocks = vi.hoisted(() => ({
     attachedAt: number;
     attachedViaCardMessageId: string | null;
   }>,
-  deleteWhere: vi.fn(async () => undefined),
-  tx: vi.fn(async () => undefined),
+  refreshRows: [] as Array<{
+    targetSessionId: string;
+    attachedViaCardMessageId: string | null;
+  }>,
+  deleteWhere: vi.fn(async () => ({ changes: 1 })),
+  tx: vi.fn(async (name: string) => name === 'im.deleteBindingIfTarget'),
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
@@ -35,7 +39,14 @@ vi.mock('../../localDb/client/current', () => ({
   getDbClient: () => ({
     tx: mocks.tx,
     drizzle: {
-      select: () => ({ from: async () => [...mocks.rows] }),
+      select: (fields?: unknown) =>
+        fields
+          ? {
+              from: () => ({
+                where: () => ({ limit: async () => [...mocks.refreshRows] }),
+              }),
+            }
+          : { from: async () => [...mocks.rows] },
       delete: () => ({ where: mocks.deleteWhere }),
     },
   }),
@@ -68,6 +79,61 @@ describe('SqliteBindingStore single-owner reverse index', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.rows.length = 0;
+    mocks.refreshRows.length = 0;
+  });
+
+  it('refreshes a binding replaced by another process', async () => {
+    mocks.rows.push({
+      channel: 'feishu',
+      botContextId: 'feishu-bot',
+      userId: 'ou_owner',
+      scopeKey: '',
+      targetSessionId: 'desktop-session-a',
+      attachedAt: 100,
+      attachedViaCardMessageId: 'card-a',
+    });
+    mocks.refreshRows.push({
+      targetSessionId: 'desktop-session-b',
+      attachedViaCardMessageId: 'card-b',
+    });
+    const store = new SqliteBindingStore();
+    const events: BindingChangeEvent<string>[] = [];
+    store.onChange((event) => events.push(event));
+    await store.preload();
+
+    await expect(store.refreshFromPersistence(feishuIdentity)).resolves.toBe('desktop-session-b');
+
+    expect(store.get(feishuIdentity)).toBe('desktop-session-b');
+    expect(store.findByTarget('desktop-session-a')).toBeNull();
+    expect(store.findByTarget('desktop-session-b')).toEqual(feishuIdentity);
+    expect(store.getAttachCardMessageId(feishuIdentity)).toBe('card-b');
+    expect(events).toEqual([
+      {
+        identity: feishuIdentity,
+        value: 'desktop-session-b',
+        prevValue: 'desktop-session-a',
+      },
+    ]);
+  });
+
+  it('loads a binding created by another process after preload', async () => {
+    mocks.refreshRows.push({
+      targetSessionId: 'desktop-session',
+      attachedViaCardMessageId: 'new-card',
+    });
+    const store = new SqliteBindingStore();
+    const events: BindingChangeEvent<string>[] = [];
+    store.onChange((event) => events.push(event));
+    await store.preload();
+
+    await expect(store.refreshFromPersistence(feishuIdentity)).resolves.toBe('desktop-session');
+
+    expect(store.get(feishuIdentity)).toBe('desktop-session');
+    expect(store.findByTarget('desktop-session')).toEqual(feishuIdentity);
+    expect(store.getAttachCardMessageId(feishuIdentity)).toBe('new-card');
+    expect(events).toEqual([
+      { identity: feishuIdentity, value: 'desktop-session', prevValue: null },
+    ]);
   });
 
   it('replaces the previous channel when another identity attaches the same session', async () => {
@@ -129,7 +195,7 @@ describe('SqliteBindingStore single-owner reverse index', () => {
   it('serializes concurrent attachments before reading and updating the indexes', async () => {
     const store = new SqliteBindingStore();
     const events: BindingChangeEvent<string>[] = [];
-    const firstTransaction = deferred<undefined>();
+    const firstTransaction = deferred<boolean>();
     store.onChange((event) => events.push(event));
     await store.preload();
     mocks.tx.mockImplementationOnce(() => firstTransaction.promise);
@@ -144,7 +210,7 @@ describe('SqliteBindingStore single-owner reverse index', () => {
     await vi.waitFor(() => expect(mocks.tx).toHaveBeenCalledTimes(1));
     expect(store.findByTarget('desktop-session')).toBeNull();
 
-    firstTransaction.resolve(undefined);
+    firstTransaction.resolve(true);
     await firstAttach;
     await secondAttach;
 
@@ -166,14 +232,14 @@ describe('SqliteBindingStore single-owner reverse index', () => {
     await store.preload();
     await store.attach(feishuIdentity, 'desktop-session-a');
     mocks.deleteWhere.mockClear();
-    const moveTransaction = deferred<undefined>();
+    const moveTransaction = deferred<boolean>();
     mocks.tx.mockImplementationOnce(() => moveTransaction.promise);
 
     const move = store.attach(feishuIdentity, 'desktop-session-b');
     await vi.waitFor(() => expect(mocks.tx).toHaveBeenCalledTimes(2));
     const staleDetach = store.detachIfTarget(feishuIdentity, 'desktop-session-a');
 
-    moveTransaction.resolve(undefined);
+    moveTransaction.resolve(true);
     await move;
     await expect(staleDetach).resolves.toBe(false);
 
@@ -181,6 +247,16 @@ describe('SqliteBindingStore single-owner reverse index', () => {
     expect(store.findByTarget('desktop-session-a')).toBeNull();
     expect(store.findByTarget('desktop-session-b')).toEqual(feishuIdentity);
     expect(mocks.deleteWhere).not.toHaveBeenCalled();
+  });
+
+  it('does not delete a replacement identity when the persisted target changed', async () => {
+    const store = new SqliteBindingStore();
+    await store.preload();
+    await store.attach(feishuIdentity, 'desktop-session');
+    mocks.tx.mockResolvedValueOnce(false);
+
+    await expect(store.detachIfTarget(feishuIdentity, 'desktop-session')).resolves.toBe(false);
+    expect(store.get(feishuIdentity)).toBe('desktop-session');
   });
 
   it('repairs persisted duplicate targets by keeping the latest takeover', async () => {
@@ -263,7 +339,7 @@ describe('SqliteBindingStore single-owner reverse index', () => {
     expect(store.findByTarget('desktop-session')).toEqual(discordIdentity);
   });
 
-  it('purges every persisted owner of a target when its visible winner detaches', async () => {
+  it('detaches only the visible identity when duplicate target rows exist', async () => {
     mocks.rows.push(
       {
         channel: 'feishu',
@@ -288,13 +364,14 @@ describe('SqliteBindingStore single-owner reverse index', () => {
     const store = new SqliteBindingStore();
     await expect(store.preload()).rejects.toThrow('db locked');
 
-    await expect(
-      store.detachIfTarget(discordIdentity, 'desktop-session'),
-    ).resolves.toBe(true);
+    await expect(store.detachIfTarget(discordIdentity, 'desktop-session')).resolves.toBe(true);
 
-    expect(mocks.deleteWhere).toHaveBeenCalledWith({
-      column: 'targetSessionId',
-      value: 'desktop-session',
+    expect(mocks.tx).toHaveBeenLastCalledWith('im.deleteBindingIfTarget', {
+      channel: 'discord',
+      botContextId: 'discord-bot',
+      userId: '123456',
+      scopeKey: '',
+      targetSessionId: 'desktop-session',
     });
     expect(store.findByTarget('desktop-session')).toBeNull();
     expect(store.get(discordIdentity)).toBeNull();

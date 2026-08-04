@@ -56,6 +56,25 @@ export interface SilentStopAutoResumeGuardDeps {
   now?: () => number;
 }
 
+/**
+ * Execute the delayed silent-stop callback inside the same active-session
+ * admission boundary used by interactive sends. The captured runtime identity
+ * also prevents an old generation from resuming a replacement runtime.
+ */
+export async function runScheduledSilentStopAutoResume<TSession extends { id: string }>(
+  session: TSession,
+  deps: {
+    withActiveRoute: (sessionId: string, run: () => Promise<void>) => Promise<unknown>;
+    getCurrentSession: (sessionId: string) => TSession | null | undefined;
+    handle: (session: TSession) => Promise<void>;
+  },
+): Promise<void> {
+  await deps.withActiveRoute(session.id, async () => {
+    if (deps.getCurrentSession(session.id) !== session) return;
+    await deps.handle(session);
+  });
+}
+
 export class SilentStopAutoResumeGuard {
   private readonly sessions = new Map<string, SessionGuardState>();
 

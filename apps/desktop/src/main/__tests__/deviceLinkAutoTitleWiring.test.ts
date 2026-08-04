@@ -42,12 +42,45 @@ describe('device-link auto-title wiring', () => {
   });
 
   it('入队:调度发生在 coordinator 接受之后', () => {
-    // enqueue 是同步的、不会拒绝(重复 clientId 也只是幂等返回),排在它之后即可。
+    // receipt 是同步的；只有真正插入新项才能消费 OSS/改标题。
     const body = handlerBody('INPUT_ENQUEUE', 'INPUT_COMPACT');
-    const acceptAt = body.indexOf('inputCoordinator.enqueue');
+    const acceptAt = body.indexOf('inputCoordinator.enqueueWithReceipt');
     const commitAt = body.indexOf('commitAutoTitle()');
     expect(acceptAt).toBeGreaterThan(-1);
     expect(commitAt).toBeGreaterThan(acceptAt);
+    expect(body.slice(acceptAt, commitAt)).toMatch(/if \(receipt\.inserted\)/);
+  });
+
+  it('入队重传在 OSS 物化前幂等返回', () => {
+    const body = handlerBody('INPUT_ENQUEUE', 'INPUT_COMPACT');
+    const restoreAt = body.indexOf('inputCoordinator.ensureQueueRestored');
+    const parseAt = body.indexOf('requireQueuedMessage(item)');
+    const duplicateAt = body.indexOf('inputCoordinator.isDuplicateEnqueue');
+    const stageAt = body.indexOf('stageQueuedOssAttachments');
+    const receiptAt = body.indexOf('inputCoordinator.enqueueWithReceipt');
+    expect(restoreAt).toBeGreaterThan(-1);
+    expect(parseAt).toBeGreaterThan(restoreAt);
+    expect(duplicateAt).toBeGreaterThan(parseAt);
+    expect(stageAt).toBeGreaterThan(duplicateAt);
+    expect(receiptAt).toBeGreaterThan(stageAt);
+    expect(body.slice(duplicateAt, stageAt)).toMatch(
+      /return inputCoordinator\.getProjection\(sid\)/,
+    );
+  });
+
+  it('编辑已不在队列的项时不下载 OSS', () => {
+    const body = handlerBody('INPUT_UPDATE_CONTENT', 'INPUT_MOVE');
+    const restoreAt = body.indexOf('inputCoordinator.ensureQueueRestored');
+    const firstEligibilityAt = body.indexOf('inputCoordinator.canUpdateQueuedItemContent');
+    const stageAt = body.indexOf('stageQueuedOssAttachments');
+    const secondEligibilityAt = body.indexOf(
+      'inputCoordinator.canUpdateQueuedItemContent',
+      firstEligibilityAt + 1,
+    );
+    expect(restoreAt).toBeGreaterThan(-1);
+    expect(firstEligibilityAt).toBeGreaterThan(restoreAt);
+    expect(stageAt).toBeGreaterThan(firstEligibilityAt);
+    expect(secondEligibilityAt).toBeGreaterThan(stageAt);
   });
 
   it('插话:等 steer 落定且受理了才调度', () => {
@@ -55,7 +88,7 @@ describe('device-link auto-title wiring', () => {
     // 改掉默认名 / 合成占位 / fork 占位就是凭空改名(review P1)。
     const body = handlerBody('INPUT_STEER', 'INPUT_STOP');
     expect(body).toMatch(/const accepted = await inputCoordinator\.steer\(/);
-    expect(body).toMatch(/if \(accepted\) commitAutoTitle\(\);/);
+    expect(body).toMatch(/if \(accepted\) \{[\s\S]*?commitAutoTitle\(\);[\s\S]*?\}/);
     const acceptAt = body.indexOf('await inputCoordinator.steer(');
     expect(body.indexOf('commitAutoTitle()')).toBeGreaterThan(acceptAt);
   });
@@ -76,19 +109,25 @@ describe('user rename notification ordering', () => {
     // 智能标题仍能满足 `WHERE title = 期望值` 把用户刚保存的名字盖掉(review P1)。
     for (const [note, write] of [
       // local-db:sessions:update(本机重命名框)
-      ["if (typeof p.title === 'string') noteUserTitleWritten(sid);",
-       'await db.update(sessions).set(setObj).where(eq(sessions.id, sid));'],
+      [
+        "if (typeof p.title === 'string') noteUserTitleWritten(sid);",
+        /const writeResult = await commitSessionStatusTransition\(\s*sid,\s*p\.status,/s,
+      ],
       // patchSessionMetaInDb(device-link 远程改名)
-      ['if (patch.title !== undefined) noteUserTitleWritten(sessionId);',
-       'await db.update(sessions).set(setObj).where(eq(sessions.id, sessionId));'],
+      [
+        'if (patch.title !== undefined) noteUserTitleWritten(sessionId);',
+        /const writeResult = await commitSessionStatusTransition\(\s*sessionId,\s*patch\.status,/s,
+      ],
       // renameSessionTitlesInDb(MCP 批量改名)
-      ['for (const change of changes) noteUserTitleWritten(change.sessionId);',
-       "getDbClient()\n    .tx('sessions.renameTitles'"],
+      [
+        'for (const change of changes) noteUserTitleWritten(change.sessionId);',
+        /const applied = await getDbClient\(\)\s*\.tx\('sessions\.renameTitles'/s,
+      ],
     ] as const) {
       const noteAt = sessionsSource.indexOf(note);
       expect(noteAt).toBeGreaterThan(-1);
-      const writeAt = sessionsSource.indexOf(write, noteAt);
-      expect(writeAt).toBeGreaterThan(noteAt);
+      const writeMatch = sessionsSource.slice(noteAt).match(write);
+      expect(writeMatch?.index ?? -1).toBeGreaterThan(0);
     }
   });
 

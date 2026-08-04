@@ -10,7 +10,7 @@
  *     status → 'deleted' / 'archived' 的显式状态变更(见 localDb/ipc/sessions.ts)。
  *
  * 崩溃窗口兜底:状态已写库但回收未跑完(app 崩溃/被杀)会留下孤儿 worktree,
- * 启动时 reconcileWorktreesForDeletedSessions() 对账清理(只认 deleted/行已缺失,
+ * 启动时 reconcileWorktreesForDeletedSessions() 对账清理(只认 deleted,
  * archived 不在启动期回收——归档回收错过就保留,偏保守)。
  */
 
@@ -19,6 +19,7 @@ import { eq, inArray } from 'drizzle-orm';
 import { removeWorktreeForSession } from './WorktreeManager';
 import * as store from './worktreeStore';
 import { getDbClient } from '../localDb/client/current';
+import type { DbClient } from '../localDb/client/DbClient';
 import { sessions } from '../localDb/schema';
 import { createLogger } from '../logger';
 
@@ -35,7 +36,22 @@ const log = createLogger('sessionRemovalRecycle');
  * 调用方约定:先确保该会话的 CLI 子进程已关闭(Windows 下子进程 cwd 在
  * worktree 内会锁目录,git worktree remove 必败),再调本函数。
  */
-export async function recycleWorktreeForRemovedSession(sessionId: string): Promise<void> {
+export interface SessionRemovalRecycleOptions {
+  /** Captured owner database for startup reconciliation. */
+  dbClient?: DbClient;
+  /** Fail closed when the account or current database handle changes. */
+  canContinue?: () => boolean | Promise<boolean>;
+}
+
+async function canContinue(options: SessionRemovalRecycleOptions): Promise<boolean> {
+  return options.canContinue ? await options.canContinue() : true;
+}
+
+export async function recycleWorktreeForRemovedSession(
+  sessionId: string,
+  options: SessionRemovalRecycleOptions = {},
+): Promise<void> {
+  if (!(await canContinue(options))) return;
   const meta = store.get(sessionId);
   if (!meta) return;
   if (meta.ephemeral) {
@@ -44,7 +60,7 @@ export async function recycleWorktreeForRemovedSession(sessionId: string): Promi
     );
     return;
   }
-  const status = await readCurrentSessionStatus(sessionId);
+  const status = await readCurrentSessionStatus(sessionId, options.dbClient);
   if (status !== 'deleted' && status !== 'archived') {
     log.info(
       `[sessionRemovalRecycle] skip worktree recycle for session ${sessionId}: current status=${status ?? 'missing'}`,
@@ -52,8 +68,11 @@ export async function recycleWorktreeForRemovedSession(sessionId: string): Promi
     return;
   }
   await removeWorktreeForSession(sessionId, {
+    dbClient: options.dbClient,
     canRemove: async () => {
-      const currentStatus = await readCurrentSessionStatus(sessionId);
+      if (!(await canContinue(options))) return false;
+      const currentStatus = await readCurrentSessionStatus(sessionId, options.dbClient);
+      if (!(await canContinue(options))) return false;
       return currentStatus === 'deleted' || currentStatus === 'archived';
     },
   });
@@ -68,9 +87,12 @@ export async function isSessionStillRemovable(sessionId: string): Promise<boolea
   return status === 'deleted' || status === 'archived';
 }
 
-async function readCurrentSessionStatus(sessionId: string): Promise<string | null> {
+async function readCurrentSessionStatus(
+  sessionId: string,
+  dbClient?: DbClient,
+): Promise<string | null> {
   try {
-    const db = getDbClient().drizzle;
+    const db = (dbClient ?? getDbClient()).drizzle;
     const [row] = await db
       .select({ status: sessions.status })
       .from(sessions)
@@ -86,24 +108,33 @@ async function readCurrentSessionStatus(sessionId: string): Promise<string | nul
 }
 
 /**
- * 启动期对账:store 里登记的非 ephemeral worktree,若其 owning session 行已缺失
- * 或 status='deleted',说明删除时回收没跑完(崩溃窗口 / 回收失败),补一次回收。
+ * 启动期对账:store 里登记的非 ephemeral worktree,若其 owning session 明确为
+ * status='deleted',说明删除时回收没跑完(崩溃窗口 / 回收失败),补一次回收。
+ * 行缺失不作为证据:共享 userData 的多账号场景下,缺失可能只是属于另一个账号。
  *
  * 刻意不处理 archived:升级前归档留下的 dirty worktree 存量(旧逻辑 dirty 保留)
  * 若在启动期一律补收,等于升级瞬间批量 stash+删目录,用户零感知——违背本次重构
  * 的初衷。归档场景只在归档动作发生时回收一次,错过就保留。
  */
-export async function reconcileWorktreesForDeletedSessions(): Promise<void> {
+export async function reconcileWorktreesForDeletedSessions(
+  options: SessionRemovalRecycleOptions = {},
+): Promise<void> {
+  if (!(await canContinue(options))) return;
   const candidates = store.getAll().filter((m) => !m.ephemeral);
   if (candidates.length === 0) return;
 
   let rows: Array<{ id: string; status: string | null }>;
   try {
-    const db = getDbClient().drizzle;
+    const db = (options.dbClient ?? getDbClient()).drizzle;
     rows = await db
       .select({ id: sessions.id, status: sessions.status })
       .from(sessions)
-      .where(inArray(sessions.id, candidates.map((m) => m.sessionId)));
+      .where(
+        inArray(
+          sessions.id,
+          candidates.map((m) => m.sessionId),
+        ),
+      );
   } catch (err) {
     // DB 不可用时不做任何删除(保守方向:漏收一轮无害,误删不可逆)。
     log.warn(
@@ -115,13 +146,25 @@ export async function reconcileWorktreesForDeletedSessions(): Promise<void> {
 
   const statusById = new Map(rows.map((r) => [r.id, r.status]));
   for (const meta of candidates) {
+    if (!(await canContinue(options))) return;
     const status = statusById.get(meta.sessionId);
-    const orphaned = status === undefined || status === 'deleted';
+    // A missing row is ambiguous when multiple accounts share userData: it may
+    // belong to another account, so only an explicit deleted tombstone is safe
+    // evidence for startup cleanup.
+    const orphaned = status === 'deleted';
     if (!orphaned) continue;
     log.info(
-      `[sessionRemovalRecycle] reconciling orphaned worktree at ${meta.path} (session ${meta.sessionId}, status=${status ?? 'missing'})`,
+      `[sessionRemovalRecycle] reconciling orphaned worktree at ${meta.path} (session ${meta.sessionId}, status=${status})`,
     );
-    await removeWorktreeForSession(meta.sessionId).catch((err) => {
+    await removeWorktreeForSession(meta.sessionId, {
+      dbClient: options.dbClient,
+      canRemove: async () => {
+        if (!(await canContinue(options))) return false;
+        const currentStatus = await readCurrentSessionStatus(meta.sessionId, options.dbClient);
+        if (!(await canContinue(options))) return false;
+        return currentStatus === 'deleted';
+      },
+    }).catch((err) => {
       log.warn(
         `[sessionRemovalRecycle] reconcile remove failed for ${meta.path}:`,
         err instanceof Error ? err.message : String(err),

@@ -1,13 +1,15 @@
 import { BrowserWindow } from 'electron';
-import { and, desc, eq, inArray, ne, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, ne } from 'drizzle-orm';
 import { createId } from '@paralleldrive/cuid2';
 
+import type { DbClient } from './client/DbClient.js';
 import { getDbClient } from './client/current.js';
 import { orcaWorkers, orcaTeams, sessions } from './schema.js';
 import { createLogger } from '../logger.js';
 import { throwIpcError } from '../utils/ipcValidate.js';
 import { tapWindowBroadcast } from '../device-link/broadcast-tap.js';
 import { notifyAgentIslandSessionPatch } from './agentIslandSessionPatch.js';
+import { withSessionLifecycleLock, withSessionLifecycleLocks } from '../sessionLifecycleLock.js';
 
 const log = createLogger('orca-team-store');
 
@@ -83,7 +85,10 @@ export interface OrcaWorkerLinkRecord {
 
 export type OrcaWorkerCreationReservationResult =
   | { ok: true; occupiedSlotsBefore: number }
-  | { ok: false; errorCode: 'DUPLICATE_LABEL' | 'WORKER_CREATION_IN_PROGRESS' | 'WORKER_LIMIT_HARD_EXCEEDED' };
+  | {
+      ok: false;
+      errorCode: 'DUPLICATE_LABEL' | 'WORKER_CREATION_IN_PROGRESS' | 'WORKER_LIMIT_HARD_EXCEEDED';
+    };
 
 export async function reserveWorkerCreation(input: {
   reservationId: string;
@@ -145,9 +150,7 @@ export async function createOrGetTeamForLead(input: {
   return created;
 }
 
-export async function getTeamByLeadSession(
-  leadSessionId: string,
-): Promise<OrcaTeamRecord | null> {
+export async function getTeamByLeadSession(leadSessionId: string): Promise<OrcaTeamRecord | null> {
   const db = getDbClient().drizzle;
   const [row] = await db
     .select()
@@ -162,16 +165,12 @@ export async function getTeamByLeadSession(
  * DB 层 partial unique 约束可能因历史 migration / drift 暂时缺失,因此这里仍做 read-time dedup:
  * 同一 lead 如果出现多个 active team,保留最新一条,其余标记为 cancelled。
  */
-export async function getActiveTeamByLead(
-  leadSessionId: string,
-): Promise<OrcaTeamRecord | null> {
+export async function getActiveTeamByLead(leadSessionId: string): Promise<OrcaTeamRecord | null> {
   const db = getDbClient().drizzle;
   const rows = await db
     .select()
     .from(orcaTeams)
-    .where(
-      and(eq(orcaTeams.leadSessionId, leadSessionId), eq(orcaTeams.status, 'active')),
-    )
+    .where(and(eq(orcaTeams.leadSessionId, leadSessionId), eq(orcaTeams.status, 'active')))
     .orderBy(desc(orcaTeams.updatedAt), desc(orcaTeams.createdAt));
 
   const latest = rows[0];
@@ -246,18 +245,24 @@ export async function markTeamEnded(
  * orca_role 字段保留 'worker' 不动 — 历史上下文识别需要它。
  */
 export async function archiveWorkersByTeam(teamId: string): Promise<string[]> {
-  const db = getDbClient().drizzle;
-  const rows = await db
-    .select({ sessionId: orcaWorkers.sessionId })
-    .from(orcaWorkers)
-    .where(eq(orcaWorkers.teamId, teamId));
-  const ids = rows.map((r) => r.sessionId);
-  if (ids.length === 0) return [];
-  const now = Date.now();
-  await db
-    .update(sessions)
-    .set({ status: 'archived', updatedAt: now })
-    .where(sql`${sessions.id} IN (${sql.join(ids.map((id) => sql`${id}`), sql`, `)})`);
+  const dbClient = getDbClient();
+  const sessionIds = await listWorkerSessionIdsForTeam(teamId, dbClient);
+  const locked = await withSessionLifecycleLocks(sessionIds, async () =>
+    dbClient.tx('orca.archiveWorkersByTeam', {
+      teamId,
+      sessionIds,
+      now: Date.now(),
+    }),
+  );
+  if (!locked.acquired) {
+    log.warn('orca worker archive skipped because lifecycle locks were unavailable', {
+      teamId,
+      sessionIds,
+      reason: locked.reason,
+    });
+    return [];
+  }
+  const ids = locked.value;
   for (const id of ids) broadcastSessionPatch(id, { status: 'archived' });
   return ids;
 }
@@ -291,35 +296,24 @@ export async function markWorkersStatusByTeam(
 export async function reconcileInactiveTeamWorkersForLead(
   leadSessionId: string,
 ): Promise<string[]> {
-  const db = getDbClient().drizzle;
-  const teamRows = await db
-    .select({ id: orcaTeams.id })
-    .from(orcaTeams)
-    .where(and(eq(orcaTeams.leadSessionId, leadSessionId), ne(orcaTeams.status, 'active')));
-  const teamIds = teamRows.map((r) => r.id);
-  if (teamIds.length === 0) return [];
-
-  // 这些非 active team 下仍 active 的孤儿 worker session。只取 status='active':已 archived 的
-  // 无需再动,已被用户软删除的 status='deleted' 必须原样保留(不能借 reconcile 复活)。
-  const workerRows = await db
-    .select({ sessionId: orcaWorkers.sessionId })
-    .from(orcaWorkers)
-    .innerJoin(sessions, eq(orcaWorkers.sessionId, sessions.id))
-    .where(and(inArray(orcaWorkers.teamId, teamIds), eq(sessions.status, 'active')));
-  const ids = workerRows.map((r) => r.sessionId);
-
-  const now = Date.now();
-  // orca_workers 收敛 done(对齐 markWorkersStatusByTeam;已 done 的重写无副作用)。
-  await db
-    .update(orcaWorkers)
-    .set({ status: 'done', updatedAt: now })
-    .where(inArray(orcaWorkers.teamId, teamIds));
-
-  if (ids.length === 0) return [];
-  await db
-    .update(sessions)
-    .set({ status: 'archived', updatedAt: now })
-    .where(inArray(sessions.id, ids));
+  const dbClient = getDbClient();
+  const sessionIds = await listInactiveTeamWorkerSessionIdsForLead(leadSessionId, dbClient);
+  const locked = await withSessionLifecycleLocks(sessionIds, async () =>
+    dbClient.tx('orca.reconcileInactiveTeamWorkersForLead', {
+      leadSessionId,
+      sessionIds,
+      now: Date.now(),
+    }),
+  );
+  if (!locked.acquired) {
+    log.warn('orca inactive-team worker reconcile skipped because lifecycle locks were unavailable', {
+      leadSessionId,
+      sessionIds,
+      reason: locked.reason,
+    });
+    return [];
+  }
+  const ids = locked.value;
   for (const id of ids) broadcastSessionPatch(id, { status: 'archived' });
   return ids;
 }
@@ -349,12 +343,11 @@ export async function addOrUpdateWorker(input: {
   focused?: boolean;
   idleSince?: number | null;
 }): Promise<OrcaWorkerRecord> {
-  const team =
-    input.teamId
-      ? await getTeamById(input.teamId)
-      : input.leadSessionId
-        ? await createOrGetTeamForLead({ leadSessionId: input.leadSessionId })
-        : null;
+  const team = input.teamId
+    ? await getTeamById(input.teamId)
+    : input.leadSessionId
+      ? await createOrGetTeamForLead({ leadSessionId: input.leadSessionId })
+      : null;
   if (!team) {
     throwIpcError('INVALID_PARAMS', 'teamId or leadSessionId is required to add an Orca worker');
   }
@@ -383,9 +376,7 @@ export async function addOrUpdateWorker(input: {
   return worker;
 }
 
-export async function listWorkersByLead(
-  leadSessionId: string,
-): Promise<OrcaWorkerRecord[]> {
+export async function listWorkersByLead(leadSessionId: string): Promise<OrcaWorkerRecord[]> {
   const grouped = await listWorkersByLeads([leadSessionId]);
   return grouped[leadSessionId] ?? [];
 }
@@ -394,7 +385,9 @@ export async function listWorkersByLeads(
   leadSessionIds: readonly string[],
 ): Promise<Record<string, OrcaWorkerRecord[]>> {
   const uniqueLeadSessionIds = [...new Set(leadSessionIds)];
-  const grouped = Object.fromEntries(uniqueLeadSessionIds.map((id) => [id, [] as OrcaWorkerRecord[]]));
+  const grouped = Object.fromEntries(
+    uniqueLeadSessionIds.map((id) => [id, [] as OrcaWorkerRecord[]]),
+  );
   if (uniqueLeadSessionIds.length === 0) {
     return grouped;
   }
@@ -404,11 +397,13 @@ export async function listWorkersByLeads(
     .from(orcaWorkers)
     .innerJoin(orcaTeams, eq(orcaTeams.id, orcaWorkers.teamId))
     .innerJoin(sessions, eq(sessions.id, orcaWorkers.sessionId))
-    .where(and(
-      inArray(orcaTeams.leadSessionId, uniqueLeadSessionIds),
-      eq(orcaTeams.status, 'active'),
-      eq(sessions.status, 'active'),
-    ))
+    .where(
+      and(
+        inArray(orcaTeams.leadSessionId, uniqueLeadSessionIds),
+        eq(orcaTeams.status, 'active'),
+        eq(sessions.status, 'active'),
+      ),
+    )
     .orderBy(orcaTeams.leadSessionId, desc(orcaWorkers.createdAt));
   for (const row of rows) {
     grouped[row.team.leadSessionId]?.push(workerToRecord(row.worker, row.team, row.session));
@@ -519,10 +514,28 @@ export async function restoreWorkerDoneIfIdle(workerId: string): Promise<boolean
  * 这条路径只服务失败清理，不影响正常协同结束时保留历史 worker link 的语义。
  */
 export async function removeWorker(workerId: string): Promise<void> {
-  const removedSessionId = await getDbClient().tx('orca.removeWorker', {
-    workerId,
-    now: Date.now(),
-  });
+  const dbClient = getDbClient();
+  const row = await dbClient.queryOne<{ sessionId: string }>(
+    'SELECT session_id AS sessionId FROM orca_workers WHERE id = ? LIMIT 1',
+    [workerId],
+  );
+  if (!row) return;
+  const locked = await withSessionLifecycleLock(row.sessionId, async () =>
+    dbClient.tx('orca.removeWorker', {
+      workerId,
+      expectedSessionId: row.sessionId,
+      now: Date.now(),
+    }),
+  );
+  if (!locked.acquired) {
+    log.warn('orca worker removal skipped because lifecycle lock was unavailable', {
+      workerId,
+      sessionId: row.sessionId,
+      reason: locked.reason,
+    });
+    return;
+  }
+  const removedSessionId = locked.value;
   if (removedSessionId) {
     broadcastSessionPatch(removedSessionId, { status: 'archived', orcaRole: null });
   }
@@ -543,16 +556,28 @@ export async function setWorkerFocus(teamId: string, workerId: string): Promise<
  * 归档单个 worker session, 不牵连同 team 其他 worker。
  */
 export async function archiveSingleWorkerSession(sessionId: string): Promise<void> {
-  const db = getDbClient().drizzle;
-  const now = Date.now();
-  await db.update(sessions).set({ status: 'archived', updatedAt: now }).where(eq(sessions.id, sessionId));
-  broadcastSessionPatch(sessionId, { status: 'archived' });
+  const dbClient = getDbClient();
+  const locked = await withSessionLifecycleLock(sessionId, async () => {
+    const db = dbClient.drizzle;
+    const now = Date.now();
+    const result = await db
+      .update(sessions)
+      .set({ status: 'archived', updatedAt: now })
+      .where(and(eq(sessions.id, sessionId), ne(sessions.status, 'deleted')))
+      .run();
+    return result.changes > 0;
+  });
+  if (!locked.acquired) {
+    log.warn('orca worker session archive skipped because lifecycle lock was unavailable', {
+      sessionId,
+      reason: locked.reason,
+    });
+    return;
+  }
+  if (locked.value) broadcastSessionPatch(sessionId, { status: 'archived' });
 }
 
-export async function setSessionOrcaRole(
-  sessionId: string,
-  role: OrcaRole | null,
-): Promise<void> {
+export async function setSessionOrcaRole(sessionId: string, role: OrcaRole | null): Promise<void> {
   const db = getDbClient().drizzle;
   await db.update(sessions).set({ orcaRole: role }).where(eq(sessions.id, sessionId));
   broadcastSessionPatch(sessionId, { orcaRole: role });
@@ -560,12 +585,31 @@ export async function setSessionOrcaRole(
 
 async function getTeamById(id: string): Promise<OrcaTeamRecord | null> {
   const db = getDbClient().drizzle;
-  const [row] = await db
-    .select()
-    .from(orcaTeams)
-    .where(eq(orcaTeams.id, id))
-    .limit(1);
+  const [row] = await db.select().from(orcaTeams).where(eq(orcaTeams.id, id)).limit(1);
   return row ? teamToRecord(row) : null;
+}
+
+async function listWorkerSessionIdsForTeam(teamId: string, dbClient: DbClient): Promise<string[]> {
+  const rows = await dbClient.query<{ sessionId: string }>(
+    'SELECT DISTINCT session_id AS sessionId FROM orca_workers WHERE team_id = ? ORDER BY session_id',
+    [teamId],
+  );
+  return rows.map((row) => row.sessionId);
+}
+
+async function listInactiveTeamWorkerSessionIdsForLead(
+  leadSessionId: string,
+  dbClient: DbClient,
+): Promise<string[]> {
+  const rows = await dbClient.query<{ sessionId: string }>(
+    `SELECT DISTINCT ow.session_id AS sessionId
+     FROM orca_workers AS ow
+     INNER JOIN orca_teams AS ot ON ot.id = ow.team_id
+     WHERE ot.lead_session_id = ? AND ot.status != 'active'
+     ORDER BY ow.session_id`,
+    [leadSessionId],
+  );
+  return rows.map((row) => row.sessionId);
 }
 
 function teamToRecord(row: typeof orcaTeams.$inferSelect): OrcaTeamRecord {

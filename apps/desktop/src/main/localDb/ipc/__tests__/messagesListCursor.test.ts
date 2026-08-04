@@ -8,11 +8,12 @@ const h = vi.hoisted(() => ({
   db: null as ReturnType<typeof drizzle> | null,
   sqlite: null as Database.Database | null,
   handlers: new Map<string, (...args: unknown[]) => unknown>(),
-  cleanupStagedChatAttachments: vi.fn(async (_filePaths: readonly string[]) => undefined),
-  query: vi.fn(async (query: string): Promise<Array<{ content: string }>> => {
-    if (!h.sqlite) throw new Error('test sqlite not initialized');
-    return h.sqlite.prepare(query).all() as Array<{ content: string }>;
-  }),
+  query: vi.fn(
+    async (query: string, params: unknown[] = []): Promise<Array<Record<string, unknown>>> => {
+      if (!h.sqlite) throw new Error('test sqlite not initialized');
+      return h.sqlite.prepare(query).all(...params) as Array<Record<string, unknown>>;
+    },
+  ),
   tx: vi.fn(
     async (
       _name: string,
@@ -73,22 +74,6 @@ vi.mock('../../../cindy-media/ledger', () => ({
 vi.mock('../../../cindy-media/chatAttachments', () => ({
   commitMessageMediaRefs: vi.fn(async () => undefined),
 }));
-vi.mock('../../../file-browser/remote-file-cache', () => ({
-  cleanupStagedChatAttachments: h.cleanupStagedChatAttachments,
-  extractChatAttachmentPathsFromPersistedContent: (content: string): string[] => {
-    try {
-      const parsed = JSON.parse(content) as { files?: unknown };
-      if (!Array.isArray(parsed.files)) return [];
-      return parsed.files.flatMap((entry) => {
-        if (!entry || typeof entry !== 'object') return [];
-        const candidate = (entry as { path?: unknown }).path;
-        return typeof candidate === 'string' ? [candidate] : [];
-      });
-    } catch {
-      return [];
-    }
-  },
-}));
 vi.mock('../../client/current', () => ({
   getDbClient: () => ({ drizzle: h.db, query: h.query, tx: h.tx }),
 }));
@@ -100,7 +85,7 @@ import {
   findPendingForkOrigin,
   getMessageDeletionTarget,
   commitMessageDeletion,
-  listDeletableSessionPersistedChatAttachmentPaths,
+  listDeletedSessionChatAttachmentPaths,
   listPersistedChatAttachmentPaths,
   markLatestAgentHandoffConsumed,
   readPriorUserRoundCost,
@@ -186,15 +171,15 @@ function insertCostMessage(
 }
 
 describe('staged chat attachment retention', () => {
-  it('keeps a shared staged path until the last non-deleted fork is deleted', async () => {
+  it('extracts distinct protected paths in SQLite without returning message bodies', async () => {
     const sqlite = createDb();
-    sqlite.prepare('INSERT INTO sessions (id, status) VALUES (?, ?)').run('parent', 'deleted');
-    sqlite
-      .prepare('INSERT INTO sessions (id, parent_session_id, status) VALUES (?, ?, ?)')
-      .run('fork', 'parent', 'active');
+    sqlite.prepare('INSERT INTO sessions (id, status) VALUES (?, ?)').run('deleted', 'deleted');
+    sqlite.prepare('INSERT INTO sessions (id, status) VALUES (?, ?)').run('retained', 'active');
 
     const sharedPath = 'C:\\chat-attachment-cache\\owner\\shared.bin';
-    const parentOnlyPath = 'C:\\chat-attachment-cache\\owner\\parent-only.bin';
+    const retainedPath = 'C:\\chat-attachment-cache\\owner\\retained.bin';
+    const deletedPath = 'C:\\chat-attachment-cache\\owner\\deleted.bin';
+    const unrelatedContent = JSON.stringify({ text: 'x'.repeat(1024 * 1024) });
     const insert = sqlite.prepare(`
       INSERT INTO messages (
         id, client_id, session_id, role, content, created_at
@@ -203,66 +188,46 @@ describe('staged chat attachment retention', () => {
       )
     `);
     insert.run({
-      id: 'parent-message',
-      sessionId: 'parent',
+      id: 'retained-unrelated',
+      sessionId: 'retained',
+      content: unrelatedContent,
+      createdAt: 1,
+    });
+    insert.run({
+      id: 'retained-attachment',
+      sessionId: 'retained',
       content: JSON.stringify({
-        files: [{ path: sharedPath }, { path: parentOnlyPath }],
+        files: [
+          { path: sharedPath },
+          'legacy-scalar-entry',
+          { path: retainedPath },
+          { path: sharedPath },
+        ],
       }),
-      createdAt: 1,
-    });
-    insert.run({
-      id: 'fork-message',
-      sessionId: 'fork',
-      content: JSON.stringify({ files: [{ path: sharedPath }] }),
       createdAt: 2,
     });
-
-    await expect(listDeletableSessionPersistedChatAttachmentPaths('parent')).resolves.toEqual([
-      parentOnlyPath,
-    ]);
-
-    sqlite.prepare("UPDATE sessions SET status = 'deleted' WHERE id = 'fork'").run();
-    await expect(listDeletableSessionPersistedChatAttachmentPaths('parent')).resolves.toEqual([
-      sharedPath,
-      parentOnlyPath,
-    ]);
-  });
-
-  it('keeps a fork-referenced path when deleting a message from the parent session', async () => {
-    const sqlite = createDb();
-    sqlite.prepare('INSERT INTO sessions (id, status) VALUES (?, ?)').run('parent', 'active');
-    sqlite
-      .prepare('INSERT INTO sessions (id, parent_session_id, status) VALUES (?, ?, ?)')
-      .run('fork', 'parent', 'active');
-
-    const sharedPath = 'C:\\chat-attachment-cache\\owner\\shared.bin';
-    const parentOnlyPath = 'C:\\chat-attachment-cache\\owner\\parent-only.bin';
-    const insert = sqlite.prepare(`
-      INSERT INTO messages (
-        id, client_id, session_id, role, content, created_at
-      ) VALUES (
-        @id, @clientId, @sessionId, 'user', @content, @createdAt
-      )
-    `);
     insert.run({
-      id: 'parent-message',
-      clientId: 'parent-client',
-      sessionId: 'parent',
-      content: JSON.stringify({ files: [{ path: sharedPath }, { path: parentOnlyPath }] }),
-      createdAt: 1,
+      id: 'deleted-attachment',
+      sessionId: 'deleted',
+      content: JSON.stringify({ files: [{ path: deletedPath }] }),
+      createdAt: 3,
     });
     insert.run({
-      id: 'fork-message',
-      clientId: 'fork-client',
-      sessionId: 'fork',
-      content: JSON.stringify({ files: [{ path: sharedPath }] }),
-      createdAt: 2,
+      id: 'malformed-attachment',
+      sessionId: 'retained',
+      content: '{"files":[{"path":"chat-attachment-cache',
+      createdAt: 4,
     });
 
-    h.cleanupStagedChatAttachments.mockClear();
-    await commitMessageDeletion('parent', ['parent-client'], 'handoff');
-
-    expect(h.cleanupStagedChatAttachments).toHaveBeenCalledWith([parentOnlyPath]);
+    h.query.mockClear();
+    const paths = await listPersistedChatAttachmentPaths();
+    expect(paths).toHaveLength(2);
+    expect(paths).toEqual(expect.arrayContaining([sharedPath, retainedPath]));
+    expect(h.query).toHaveBeenCalledWith(
+      expect.stringContaining('json_tree'),
+      ['%chat-attachment-cache%'],
+    );
+    expect(h.query.mock.calls[0][0]).toContain('SELECT DISTINCT');
   });
 
   it('does not protect staged paths referenced only by deleted sessions', async () => {
@@ -297,10 +262,82 @@ describe('staged chat attachment retention', () => {
       createdAt: 3,
     });
 
-    await expect(listPersistedChatAttachmentPaths()).resolves.toEqual([
-      'C:\\chat-attachment-cache\\active.bin',
-      'C:\\chat-attachment-cache\\archived.bin',
+    const paths = await listPersistedChatAttachmentPaths();
+    expect(paths).toEqual(
+      expect.arrayContaining([
+        'C:\\chat-attachment-cache\\active.bin',
+        'C:\\chat-attachment-cache\\archived.bin',
+      ]),
+    );
+    expect(paths).toHaveLength(2);
+  });
+
+  it('returns only deleted-session staged paths with no live reference', async () => {
+    const sqlite = createDb();
+    for (const [id, status] of [
+      ['deleted', 'deleted'],
+      ['active', 'active'],
+      ['archived', 'archived'],
+      ['other-deleted', 'deleted'],
+    ]) {
+      sqlite.prepare('INSERT INTO sessions (id, status) VALUES (?, ?)').run(id, status);
+    }
+
+    const insert = sqlite.prepare(`
+      INSERT INTO messages (
+        id, client_id, session_id, role, content, created_at
+      ) VALUES (
+        @id, @id, @sessionId, 'user', @content, @createdAt
+      )
+    `);
+    insert.run({
+      id: 'deleted-only',
+      sessionId: 'deleted',
+      content: JSON.stringify({ files: [{ path: 'C:\\chat-attachment-cache\\deleted-only.bin' }] }),
+      createdAt: 1,
+    });
+    insert.run({
+      id: 'shared-deleted',
+      sessionId: 'deleted',
+      content: JSON.stringify({ files: [{ path: 'C:\\chat-attachment-cache\\shared.bin' }] }),
+      createdAt: 2,
+    });
+    insert.run({
+      id: 'shared-active',
+      sessionId: 'active',
+      content: JSON.stringify({ files: [{ path: 'C:\\chat-attachment-cache\\shared.bin' }] }),
+      createdAt: 3,
+    });
+    insert.run({
+      id: 'shared-archived',
+      sessionId: 'archived',
+      content: JSON.stringify({ files: [{ path: 'C:\\chat-attachment-cache\\archived-shared.bin' }] }),
+      createdAt: 4,
+    });
+    insert.run({
+      id: 'archived-deleted',
+      sessionId: 'deleted',
+      content: JSON.stringify({ files: [{ path: 'C:\\chat-attachment-cache\\archived-shared.bin' }] }),
+      createdAt: 5,
+    });
+    insert.run({
+      id: 'other-deleted',
+      sessionId: 'other-deleted',
+      content: JSON.stringify({ files: [{ path: 'C:\\chat-attachment-cache\\deleted-too.bin' }] }),
+      createdAt: 6,
+    });
+    insert.run({
+      id: 'deleted-too',
+      sessionId: 'deleted',
+      content: JSON.stringify({ files: [{ path: 'C:\\chat-attachment-cache\\deleted-too.bin' }] }),
+      createdAt: 7,
+    });
+
+    await expect(listDeletedSessionChatAttachmentPaths('deleted')).resolves.toEqual([
+      'C:\\chat-attachment-cache\\deleted-only.bin',
+      'C:\\chat-attachment-cache\\deleted-too.bin',
     ]);
+    expect(h.query.mock.calls.at(-1)?.[0]).toContain('GROUP BY filePath');
   });
 });
 

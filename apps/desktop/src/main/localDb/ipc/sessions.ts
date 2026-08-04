@@ -9,14 +9,23 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 import { ipcMain, app, BrowserWindow } from 'electron';
-import { eq, ne, and, desc, count, inArray, isNotNull, isNull, sql, type SQL } from 'drizzle-orm';
-
 import {
-  DEFAULT_DRAFT_SESSION_TITLE,
-  normalizeAutoTitle,
-} from '@cindy/maker-shared/session-title';
+  eq,
+  ne,
+  and,
+  or,
+  desc,
+  count,
+  inArray,
+  isNotNull,
+  isNull,
+  sql,
+  type SQL,
+} from 'drizzle-orm';
 
-import { getDbClient } from '../client/current';
+import { DEFAULT_DRAFT_SESSION_TITLE, normalizeAutoTitle } from '@cindy/maker-shared/session-title';
+
+import { getCurrentDbClientUserId, getDbClient, tryGetDbClient } from '../client/current';
 import type { DbClient } from '../client/DbClient';
 import { sessions, messages } from '../schema';
 import { throwIpcError, requireString, requireObject } from '../../utils/ipcValidate';
@@ -33,17 +42,16 @@ import { ensureDialogueWorkspaceDir } from '../dialogueWorkspace';
 import { recomputePrRefsForSession } from '../../git-context/prRefsStore';
 import { ensureProjectGitInitialized } from '../../git-snapshot/projectGitBootstrap';
 import { readGitSafetySettings } from '../../maker-host/git-safety-settings-store';
-import * as imageCacheStore from '../../imageCacheStore';
-import { removeSessionRefs as removeSessionMediaRefs } from '../../cindy-media/ledger';
-import { removeWechatSessionAttachmentDir } from '../../im/wechat/mediaStaging';
+import { noteSessionClearBoundary } from '../../messagePersistBroadcaster';
+import { withSendToSessionLock } from '../../maker-ipc/sessionRouteLock.js';
 import { upsertRecentWorkdir } from './recentWorkdirs';
 import { createLogger } from '../../logger';
+import { cleanupDeletedSessionResources } from '../../sessionDeletionCleanup';
 import { DESKTOP_VISIBLE_SESSION_SOURCES } from '../../../shared/sessionSource.js';
 import { normalizeWorkingDirForStorage } from '../../../shared/workingDir.js';
 import type { SessionReference } from '../../../shared/sessionReference.js';
 import { tapWindowBroadcast } from '../../device-link/broadcast-tap.js';
 import { notifyAgentIslandSessionPatch } from '../agentIslandSessionPatch';
-import { noteSessionClearBoundary } from '../../messagePersistBroadcaster';
 import {
   ackSessionTurnEndedDurable,
   ackSessionTurnEndedIfUnchanged,
@@ -53,13 +61,14 @@ import {
   listInterruptedPendingSessionIds,
   setOnSessionTurnEndedPersisted,
 } from '../sessionActiveTurn';
-import {
-  dismissErrorMessage,
-  listDeletableSessionPersistedChatAttachmentPaths,
-  rebroadcastAgentSwitchBoundary,
-} from './messages';
-import { cleanupStagedChatAttachments } from '../../file-browser/remote-file-cache';
+import { dismissErrorMessage, rebroadcastAgentSwitchBoundary } from './messages';
 import { assertTrustedAppRendererEvent } from '../../security/trustedAppRenderer.js';
+import { withSessionLifecycleLock, withSessionLifecycleLocks } from '../../sessionLifecycleLock.js';
+import {
+  assertSessionRuntimeOwnedLocallyOrUnclaimed,
+  getSessionRuntimeOwnerPrefix,
+} from '../../sessionRuntimeOwnership.js';
+import { getSessionLifecycleRuntime } from './sessionLifecycleRuntime.js';
 
 const log = createLogger('sessions');
 const REMOTE_EDITABLE_META = new Set(['status', 'title', 'pinnedAt']);
@@ -111,20 +120,16 @@ function broadcastWorktreeChanged(sessionId: string): void {
 function scheduleWorktreeRecycleForStatusChange(sessionId: string, status: unknown): void {
   if (status !== 'deleted' && status !== 'archived') return;
   void (async () => {
-    const [mh, recycle, routeLock] = await Promise.all([
-      import('../../maker-host/index.js'),
-      import('../../worktree/sessionRemovalRecycle.js'),
-      import('../../maker-ipc/register.js'),
-    ]);
-    if (!(await recycle.isSessionStillRemovable(sessionId))) return;
-    await routeLock.withSendToSessionLock(sessionId, async () => {
-      if (!(await recycle.isSessionStillRemovable(sessionId))) return;
-      await mh
+    const runtime = getSessionLifecycleRuntime();
+    if (!(await runtime.isSessionStillRemovable(sessionId))) return;
+    await withSendToSessionLock(sessionId, async () => {
+      if (!(await runtime.isSessionStillRemovable(sessionId))) return;
+      await runtime
         .getMakerIfReady()
         ?.closeSession(sessionId)
         .catch(() => undefined);
     });
-    await recycle.recycleWorktreeForRemovedSession(sessionId);
+    await runtime.recycleWorktreeForRemovedSession(sessionId);
   })()
     .catch((err) => {
       log.warn('worktree recycle after session status change failed', {
@@ -138,10 +143,9 @@ function scheduleWorktreeRecycleForStatusChange(sessionId: string, status: unkno
 }
 
 // shadow savepoint 链(refs/cindy/savepoints/<sid>)刻意**不**挂 status 变化
-// 即时清理:覆盖导入等流程会把旧会话瞬态置为 deleted、失败后经 journal 恢复,
-// status 触发的 ref 删除与这类回滚天然竞态(删了就不可逆)。孤儿 ref 隐藏且
-// 极小,统一由启动期 reconcileSavepointRefsForDeletedSessions() 清理——启动期
-// 不存在进行中的瞬态软删流程。
+// 即时清理:ref 隐藏且极小,统一由启动期
+// reconcileSavepointRefsForDeletedSessions() 清理,避免在用户操作热路径执行额外
+// Git I/O；启动期按已提交的 deleted 状态对账即可。
 
 /**
  * 会话 status 变化的订阅槽①旁路通知(archived → did-session-archived)。
@@ -156,14 +160,496 @@ function notifyGhostSessionStatusChange(
   workingDir?: string | null,
 ): void {
   if (status !== 'archived') return;
-  void import('../../cindy-brain/index.js')
-    .then((m) =>
-      m.notifyGhostSessionEvent('archived', {
+  try {
+    getSessionLifecycleRuntime().notifyGhostSessionEvent('archived', {
+      sessionId,
+      ...(workingDir ? { workdir: workingDir } : {}),
+    });
+  } catch {
+    // Startup wiring is fail-closed; the lifecycle event is best effort.
+  }
+}
+
+/**
+ * Finish the irreversible side effects of a permanent session deletion.
+ *
+ * Status is re-read before every irreversible resource family so stale
+ * compatibility calls fail closed. The individual resource families are
+ * best-effort; startup reconciliation remains the fallback for worktrees and
+ * media GC.
+ */
+async function isSessionStillDeleted(
+  sessionId: string,
+  context?: DeletedSessionLifecycleContext,
+): Promise<boolean> {
+  if (!(await lifecycleContextCanContinue(context))) return false;
+  const dbClient = context?.dbClient ?? getDbClient();
+  let current: { status: string } | undefined;
+  try {
+    current = await dbClient.queryOne<{ status: string }>(
+      'SELECT status FROM sessions WHERE id = ? LIMIT 1',
+      [sessionId],
+    );
+  } catch (err) {
+    log.warn('deleted session lifecycle status check failed', {
+      sessionId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return false;
+  }
+  if (!(await lifecycleContextCanContinue(context))) return false;
+  return current?.status === 'deleted';
+}
+
+async function isDeletedSessionLifecycleFinalized(
+  sessionId: string,
+  context?: DeletedSessionLifecycleContext,
+): Promise<boolean> {
+  if (!(await lifecycleContextCanContinue(context))) return false;
+  const dbClient = context?.dbClient ?? getDbClient();
+  try {
+    const marker = await dbClient.queryOne<{ finalized: number }>(
+      `SELECT 1 AS finalized
+       FROM session_deletion_finalizations AS finalization
+       INNER JOIN sessions AS session ON session.id = finalization.session_id
+       WHERE finalization.session_id = ? AND session.status = 'deleted'
+       LIMIT 1`,
+      [sessionId],
+    );
+    if (!(await lifecycleContextCanContinue(context))) return false;
+    return marker?.finalized === 1;
+  } catch (err) {
+    log.warn('deleted session lifecycle marker check failed', {
+      sessionId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return false;
+  }
+}
+
+async function markDeletedSessionLifecycleFinalized(
+  sessionId: string,
+  context?: DeletedSessionLifecycleContext,
+): Promise<boolean> {
+  if (!(await lifecycleContextCanContinue(context))) return false;
+  const dbClient = context?.dbClient ?? getDbClient();
+  try {
+    await dbClient.exec(
+      `INSERT OR IGNORE INTO session_deletion_finalizations (session_id, finalized_at)
+       SELECT id, ? FROM sessions WHERE id = ? AND status = 'deleted'`,
+      [Date.now(), sessionId],
+    );
+    if (!(await lifecycleContextCanContinue(context))) return false;
+    return isDeletedSessionLifecycleFinalized(sessionId, context);
+  } catch (err) {
+    log.warn('deleted session lifecycle marker commit failed', {
+      sessionId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return false;
+  }
+}
+
+async function runFinalizedDeletedSessionUnlocked(
+  sessionId: string,
+  context?: DeletedSessionLifecycleContext,
+): Promise<{ completed: false } | { completed: true; value: undefined }>;
+async function runFinalizedDeletedSessionUnlocked<T>(
+  sessionId: string,
+  transition: () => Promise<T>,
+  context?: DeletedSessionLifecycleContext,
+): Promise<{ completed: false } | { completed: true; value: T }>;
+async function runFinalizedDeletedSessionUnlocked<T>(
+  sessionId: string,
+  transitionOrContext?: (() => Promise<T>) | DeletedSessionLifecycleContext,
+  context?: DeletedSessionLifecycleContext,
+): Promise<{ completed: false } | { completed: true; value: T | undefined }> {
+  const transition =
+    typeof transitionOrContext === 'function' ? transitionOrContext : undefined;
+  const lifecycleContext =
+    typeof transitionOrContext === 'function' ? context : transitionOrContext ?? context;
+  const runtime = getSessionLifecycleRuntime();
+  return withSendToSessionLock(sessionId, async () => {
+    const shouldContinue = () => isSessionStillDeleted(sessionId, lifecycleContext);
+    if (!(await shouldContinue())) return { completed: false };
+
+    try {
+      // Startup reconciliation must never tear down a tombstone still owned by
+      // a live foreign process. The deleting process performs this same check
+      // before the status commit; repeating it here makes retry fail closed.
+      await assertSessionRuntimeOwnedLocallyOrUnclaimed(sessionId);
+      if (!(await shouldContinue())) return { completed: false };
+      if (await isDeletedSessionLifecycleFinalized(sessionId, lifecycleContext)) {
+        if (!transition) return { completed: true, value: undefined };
+        if (!(await lifecycleContextCanContinue(lifecycleContext))) {
+          return { completed: false };
+        }
+        return { completed: true, value: await transition() };
+      }
+      if (!(await shouldContinue())) return { completed: false };
+      const prepared = await (lifecycleContext?.dbClient ?? getDbClient()).tx('session.prepareDeletedLifecycle', {
         sessionId,
-        ...(workingDir ? { workdir: workingDir } : {}),
-      }),
-    )
-    .catch(() => {});
+        now: Date.now(),
+      });
+      if (!prepared) return { completed: false };
+    } catch (err) {
+      log.warn('deleted session runtime teardown failed', {
+        sessionId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+      return { completed: false };
+    }
+    if (!(await shouldContinue())) return { completed: false };
+
+    let allSucceeded = await removeHookAttachmentDir(sessionId, 'deleted');
+    if (!(await shouldContinue())) return { completed: false };
+    try {
+      await runtime.recycleWorktreeForRemovedSession(sessionId);
+    } catch (err) {
+      allSucceeded = false;
+      log.warn('deleted session worktree cleanup failed', {
+        sessionId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      broadcastWorktreeChanged(sessionId);
+    }
+    if (!(await shouldContinue())) return { completed: false };
+    if (
+      !(await cleanupDeletedSessionResources(sessionId, {
+        shouldContinue,
+        dbClient: lifecycleContext?.dbClient,
+        ownerId: lifecycleContext?.ownerId ?? undefined,
+      }))
+    ) {
+      allSucceeded = false;
+    }
+    if (!(await shouldContinue())) return { completed: false };
+    if (!allSucceeded) return { completed: false };
+    if (!(await markDeletedSessionLifecycleFinalized(sessionId, lifecycleContext))) {
+      return { completed: false };
+    }
+    if (!transition) return { completed: true, value: undefined };
+    if (!(await lifecycleContextCanContinue(lifecycleContext))) {
+      return { completed: false };
+    }
+    return { completed: true, value: await transition() };
+  });
+}
+
+async function prepareSessionForPermanentDeletionBeforeCommitUnlocked(
+  sessionId: string,
+): Promise<() => Promise<void>> {
+  const runtime = getSessionLifecycleRuntime();
+  let rollbackRuntime: (() => Promise<void>) | undefined;
+  let makerSealed = false;
+  let rolledBack = false;
+  const rollback = async (): Promise<void> => {
+    if (rolledBack) return;
+    rolledBack = true;
+    try {
+      await rollbackRuntime?.();
+    } catch (error) {
+      log.warn('failed to roll back session runtime deletion prep', {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    if (makerSealed) {
+      try {
+      await runtime.getMakerIfReady()?.unsealSession(sessionId);
+      } catch (error) {
+        log.warn('failed to roll back Maker session deletion seal', {
+          sessionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  };
+  try {
+    await withSendToSessionLock(sessionId, async () => {
+      rollbackRuntime = await runtime.prepareSessionRuntimeForPermanentDeletion(sessionId);
+      await runtime.getGoalController()?.clearGoal(sessionId);
+      const maker = runtime.getMakerIfReady();
+      if (maker) {
+        makerSealed = true;
+        await maker.sealSession(sessionId);
+      }
+      // Runtime close stops new SDK events. Drain everything already admitted to
+      // the global persistence FIFO before the tombstone becomes visible.
+      await runtime.drainPersistQueue();
+    });
+  } catch (error) {
+    await rollback();
+    throw error;
+  }
+  return rollback;
+}
+
+async function finalizeDeletedSessionLifecycleUnlocked(
+  sessionId: string,
+  context?: DeletedSessionLifecycleContext,
+): Promise<boolean> {
+  return (await runFinalizedDeletedSessionUnlocked(sessionId, context)).completed;
+}
+
+async function requireSessionLifecycleLock<T>(
+  sessionId: string,
+  run: () => Promise<T>,
+): Promise<T> {
+  const locked = await withSessionLifecycleLock(sessionId, run);
+  if (!locked.acquired) {
+    throwIpcError('PRECONDITION_FAILED', `Session lifecycle is busy or unavailable: ${sessionId}`);
+  }
+  return locked.value;
+}
+
+/**
+ * Linearization point for status transitions. Producers take the same logical
+ * lifecycle lock before checking `active`, so once `deleted` commits no late
+ * runtime, queue, attachment, or message admission can cross the tombstone.
+ */
+async function commitSessionStatusTransition<T>(
+  sessionId: string,
+  status: unknown,
+  commit: () => T | PromiseLike<T>,
+  didCommit: (value: T) => boolean = () => true,
+): Promise<T> {
+  const runCommit = async (): Promise<T> => await commit();
+  if (status === undefined) return runCommit();
+  return requireSessionLifecycleLock(sessionId, async () => {
+    await assertSessionRuntimeOwnedLocallyOrUnclaimed(sessionId);
+    if (status !== 'deleted') return runCommit();
+    const rollback = await prepareSessionForPermanentDeletionBeforeCommitUnlocked(sessionId);
+    let committed = false;
+    try {
+      const value = await runCommit();
+      if (didCommit(value)) {
+        committed = true;
+        const completed = await finalizeDeletedSessionLifecycleUnlocked(sessionId);
+        if (!completed) {
+          log.warn('deleted session lifecycle remains for startup reconciliation', { sessionId });
+        }
+      } else {
+        await rollback();
+      }
+      return value;
+    } catch (error) {
+      if (!committed) await rollback();
+      throw error;
+    }
+  });
+}
+
+export async function finalizeDeletedSessionLifecycle(
+  sessionId: string,
+  context?: DeletedSessionLifecycleContext,
+): Promise<boolean> {
+  const result = await withSessionLifecycleLock(sessionId, () =>
+    finalizeDeletedSessionLifecycleUnlocked(sessionId, context),
+  );
+  return result.acquired ? result.value : false;
+}
+
+export interface DeletedSessionLifecycleReconcileResult {
+  scanned: number;
+  completed: number;
+  pending: number;
+}
+
+const DELETED_SESSION_RECONCILE_PAGE_SIZE = 64;
+
+export interface DeletedSessionLifecycleContext {
+  /** Database handle captured before startup reconciliation begins. */
+  dbClient: DbClient;
+  /** Fail closed when the account or current database handle changes. */
+  canContinue: () => boolean | Promise<boolean>;
+  ownerId?: string | null;
+}
+
+async function lifecycleContextCanContinue(
+  context?: DeletedSessionLifecycleContext,
+): Promise<boolean> {
+  return context ? await context.canContinue() : true;
+}
+
+/**
+ * Retry every committed deletion tombstone after the owner database is ready.
+ * Each tombstone is isolated so one foreign runtime lease or filesystem error
+ * cannot prevent later sessions from releasing their remaining resources.
+ */
+export type DeletedSessionLifecycleReconcileOptions = Partial<DeletedSessionLifecycleContext>;
+
+export async function reconcileDeletedSessionLifecycles(
+  options: DeletedSessionLifecycleReconcileOptions = {},
+): Promise<DeletedSessionLifecycleReconcileResult> {
+  const dbClient = options.dbClient ?? getDbClient();
+  const ownerId = options.ownerId ?? getCurrentDbClientUserId();
+  const context: DeletedSessionLifecycleContext = {
+    dbClient,
+    ownerId,
+    canContinue:
+      options.canContinue ??
+      (options.dbClient
+        ? () => getCurrentDbClientUserId() === ownerId && tryGetDbClient() === dbClient
+        : () => getCurrentDbClientUserId() === ownerId),
+  };
+  let cursor: string | null = null;
+  let scanned = 0;
+  let completed = 0;
+  while (true) {
+    if (!(await context.canContinue())) break;
+    const rows: Array<{ id: string }> = await dbClient.query<{ id: string }>(
+      `SELECT session.id
+       FROM sessions AS session
+       LEFT JOIN session_deletion_finalizations AS finalization
+         ON finalization.session_id = session.id
+       WHERE session.status = 'deleted'
+         AND finalization.session_id IS NULL
+         ${cursor === null ? '' : 'AND session.id > ?'}
+       ORDER BY session.id
+       LIMIT ?`,
+      cursor === null
+        ? [DELETED_SESSION_RECONCILE_PAGE_SIZE]
+        : [cursor, DELETED_SESSION_RECONCILE_PAGE_SIZE],
+    );
+    if (rows.length === 0) break;
+    if (!(await context.canContinue())) break;
+    scanned += rows.length;
+    for (const row of rows) {
+      if (!(await context.canContinue())) {
+        return { scanned, completed, pending: scanned - completed };
+      }
+      try {
+        if (await finalizeDeletedSessionLifecycle(row.id, context)) {
+          completed += 1;
+        } else {
+          log.warn('deleted session startup reconciliation remains pending', {
+            sessionId: row.id,
+          });
+        }
+      } catch (err) {
+        log.warn('deleted session startup reconciliation failed', {
+          sessionId: row.id,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+      if (!(await context.canContinue())) {
+        return { scanned, completed, pending: scanned - completed };
+      }
+    }
+    cursor = rows.at(-1)?.id ?? cursor;
+    if (rows.length < DELETED_SESSION_RECONCILE_PAGE_SIZE) break;
+  }
+  return {
+    scanned,
+    completed,
+    pending: scanned - completed,
+  };
+}
+
+/**
+ * Run a fresh-context transition only after the old deleted task has completed
+ * every irreversible cleanup family. The same per-session lock also prevents a
+ * late compatibility finalizer from cleaning resources after the transition.
+ */
+export async function withFinalizedDeletedSession<T>(
+  sessionId: string,
+  transition: () => Promise<T>,
+): Promise<T | null> {
+  const locked = await withSessionLifecycleLock(sessionId, async () => {
+    const result = await runFinalizedDeletedSessionUnlocked(sessionId, transition);
+    return result.completed ? result.value : null;
+  });
+  return locked.acquired ? locked.value : null;
+}
+
+export interface CommittedSessionDeletion {
+  sessionId: string;
+  title: string | null;
+  workingDir: string | null;
+  workspaceKind: string | null;
+}
+
+async function publishAndFinalizeCommittedSessionDeletionUnlocked(
+  deleted: CommittedSessionDeletion,
+): Promise<void> {
+  try {
+    notifyAgentIslandSessionPatch(deleted.sessionId, {
+      status: 'deleted',
+      title: deleted.title,
+      workingDir: deleted.workingDir,
+      workspaceKind: deleted.workspaceKind,
+    });
+  } catch (err) {
+    log.warn('committed session deletion agent-island notification failed', {
+      sessionId: deleted.sessionId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+  try {
+    broadcastSessionPatched(deleted.sessionId, { status: 'deleted' });
+  } catch (err) {
+    log.warn('committed session deletion broadcast failed', {
+      sessionId: deleted.sessionId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+  const completed = await finalizeDeletedSessionLifecycleUnlocked(deleted.sessionId);
+  if (!completed) {
+    log.warn('committed session deletion remains for startup reconciliation', {
+      sessionId: deleted.sessionId,
+    });
+  }
+}
+
+export async function commitAndFinalizeSessionDeletion<T>(
+  sessionId: string,
+  commit: () => Promise<{ value: T; deleted: CommittedSessionDeletion | null }>,
+): Promise<T> {
+  return requireSessionLifecycleLock(sessionId, async () => {
+    await assertSessionRuntimeOwnedLocallyOrUnclaimed(sessionId);
+    const rollback = await prepareSessionForPermanentDeletionBeforeCommitUnlocked(sessionId);
+    let committed = false;
+    try {
+      const result = await commit();
+      if (result.deleted) {
+        committed = true;
+        await publishAndFinalizeCommittedSessionDeletionUnlocked(result.deleted);
+      } else {
+        await rollback();
+      }
+      return result.value;
+    } catch (error) {
+      if (!committed) await rollback();
+      throw error;
+    }
+  });
+}
+
+/**
+ * Publish a deletion that was committed inside another DB transaction, then
+ * run its irreversible resource lifecycle exactly once. Share overwrite uses
+ * this after atomically deleting the old row and inserting the replacement.
+ */
+export async function notifySessionDeletedAfterCommit(
+  deleted: CommittedSessionDeletion,
+): Promise<void> {
+  await requireSessionLifecycleLock(deleted.sessionId, async () => {
+    await assertSessionRuntimeOwnedLocallyOrUnclaimed(deleted.sessionId);
+    await publishAndFinalizeCommittedSessionDeletionUnlocked(deleted);
+  });
+}
+
+function applySessionStatusLifecycle(
+  sessionId: string,
+  status: unknown,
+  workingDir?: string | null,
+): void {
+  notifyGhostSessionStatusChange(sessionId, status, workingDir);
+  if (status === 'deleted') return;
+  scheduleWorktreeRecycleForStatusChange(sessionId, status);
+  void removeHookAttachmentDir(sessionId, status);
 }
 
 /** device-link 远程 set-* 回流可持久化的 session settings 字段(见 persistSessionFields)。 */
@@ -608,7 +1094,8 @@ export async function getOverwritableAutoTitle(
   const db = getDbClient().drizzle;
   const row = await selectSessionWithCount(db, id);
   if (!row) return null;
-  const agentKind = row.agentKind === 'codex' || row.agentKind === 'pi' ? row.agentKind : 'claude-code';
+  const agentKind =
+    row.agentKind === 'codex' || row.agentKind === 'pi' ? row.agentKind : 'claude-code';
   const overwritable =
     row.title === DEFAULT_DRAFT_SESSION_TITLE ||
     (!!row.parentSessionId && row.title.startsWith(FORK_PLACEHOLDER_TITLE_PREFIX)) ||
@@ -1030,49 +1517,52 @@ export function registerSessionIpc(
         throwIpcError('INVALID_PARAMS', 'expected.remoteHostId must be a string or null');
       }
 
-      const db = getDbClient().drizzle;
-      // 显式 .run() 才能从生产 DbClient.drizzle proxy 拿到 changes；隐式 await
-      // 会丢弃写结果。CAS 是否命中必须以该原子 UPDATE 的 changes 判定。
-      const writeResult = await db
-        .update(sessions)
-        .set(sessionPatchToRow({ status: 'active' }))
-        .where(
-          and(
-            eq(sessions.id, sid),
-            eq(sessions.status, 'archived'),
-            expectedWorkingDir === null
-              ? isNull(sessions.workingDir)
-              : eq(sessions.workingDir, expectedWorkingDir),
-            eq(sessions.workspaceKind, expectedWorkspaceKind),
-            expectedRemoteHostId === null
-              ? isNull(sessions.remoteHostId)
-              : eq(sessions.remoteHostId, expectedRemoteHostId),
-          ),
-        )
-        .run();
+      return requireSessionLifecycleLock(sid, async () => {
+        await assertSessionRuntimeOwnedLocallyOrUnclaimed(sid);
+        const db = getDbClient().drizzle;
+        // 显式 .run() 才能从生产 DbClient.drizzle proxy 拿到 changes；隐式 await
+        // 会丢弃写结果。CAS 是否命中必须以该原子 UPDATE 的 changes 判定。
+        const writeResult = await db
+          .update(sessions)
+          .set(sessionPatchToRow({ status: 'active' }))
+          .where(
+            and(
+              eq(sessions.id, sid),
+              eq(sessions.status, 'archived'),
+              expectedWorkingDir === null
+                ? isNull(sessions.workingDir)
+                : eq(sessions.workingDir, expectedWorkingDir),
+              eq(sessions.workspaceKind, expectedWorkspaceKind),
+              expectedRemoteHostId === null
+                ? isNull(sessions.remoteHostId)
+                : eq(sessions.remoteHostId, expectedRemoteHostId),
+            ),
+          )
+          .run();
 
-      if (writeResult.changes === 0) {
-        const [existing] = await db
-          .select({ id: sessions.id })
-          .from(sessions)
-          .where(eq(sessions.id, sid));
-        if (!existing) throwIpcError('NOT_FOUND', 'Session 不存在');
-        return null;
-      }
+        if (writeResult.changes === 0) {
+          const [existing] = await db
+            .select({ id: sessions.id })
+            .from(sessions)
+            .where(eq(sessions.id, sid));
+          if (!existing) throwIpcError('NOT_FOUND', 'Session 不存在');
+          return null;
+        }
 
-      const row = await selectSessionWithCount(db, sid);
-      if (!row) throwIpcError('NOT_FOUND', 'Session 不存在');
-      const updated = sessionToCamel(row);
-      notifyAgentIslandSessionPatch(updated.id, {
-        status: updated.status,
-        title: updated.title,
-        workingDir: updated.workingDir,
-        workspaceKind: updated.workspaceKind,
+        const row = await selectSessionWithCount(db, sid);
+        if (!row) throwIpcError('NOT_FOUND', 'Session 不存在');
+        const updated = sessionToCamel(row);
+        notifyAgentIslandSessionPatch(updated.id, {
+          status: updated.status,
+          title: updated.title,
+          workingDir: updated.workingDir,
+          workspaceKind: updated.workspaceKind,
+        });
+        broadcastSessionPatched(sid, { status: 'active' });
+        scheduleWorktreeRecycleForStatusChange(sid, 'active');
+        notifyGhostSessionStatusChange(sid, 'active', updated.workingDir);
+        return updated;
       });
-      broadcastSessionPatched(sid, { status: 'active' });
-      scheduleWorktreeRecycleForStatusChange(sid, 'active');
-      notifyGhostSessionStatusChange(sid, 'active', updated.workingDir);
-      return updated;
     },
   );
 
@@ -1141,7 +1631,45 @@ export function registerSessionIpc(
     // 先记号后写库,代价只是写库失败时该会话本进程内不再自动起名 —— 用户毕竟确实
     // 按下过保存,这个方向的偏差是安全的。
     if (typeof p.title === 'string') noteUserTitleWritten(sid);
-    await db.update(sessions).set(setObj).where(eq(sessions.id, sid));
+    const wouldReviveDeleted = p.status === 'active' || p.status === 'archived';
+    const runtimeOwnerGuard =
+      p.status === undefined
+        ? undefined
+        : or(
+            isNull(sessions.runtimeOwnerId),
+            sql`${sessions.runtimeOwnerId} LIKE ${`${getSessionRuntimeOwnerPrefix()}:%`}`,
+          );
+    const writeResult = await commitSessionStatusTransition(
+      sid,
+      p.status,
+      () =>
+        db
+          .update(sessions)
+          .set(setObj)
+          .where(
+            and(
+              wouldReviveDeleted
+                ? and(eq(sessions.id, sid), ne(sessions.status, 'deleted'))
+                : eq(sessions.id, sid),
+              runtimeOwnerGuard,
+            ),
+          )
+          .run(),
+      (result) => result.changes > 0,
+    );
+    if (writeResult.changes === 0) {
+      if (p.status !== undefined) {
+        await assertSessionRuntimeOwnedLocallyOrUnclaimed(sid);
+      }
+      const existing = await getDbClient().queryOne<{ status: string }>(
+        'SELECT status FROM sessions WHERE id = ? LIMIT 1',
+        [sid],
+      );
+      if (!existing) throwIpcError('NOT_FOUND', 'Session 不存在');
+      if (wouldReviveDeleted && existing.status === 'deleted') {
+        throwIpcError('PRECONDITION_FAILED', 'Session 已永久删除，不能恢复');
+      }
+    }
     // session-git-pr-context:/clear 经此处写 clearedAt——边界之前的消息对用户
     // 不可见,PR 引用同步重算(fire-and-forget,内部按 clearedAt/rewindAt 过滤)。
     if (p.clearedAt !== undefined) {
@@ -1219,9 +1747,7 @@ export function registerSessionIpc(
       workingDir: updated.workingDir,
       workspaceKind: updated.workspaceKind,
     });
-    scheduleWorktreeRecycleForStatusChange(sid, p.status);
-    notifyGhostSessionStatusChange(sid, p.status, updated.workingDir);
-    removeHookAttachmentDir(sid, p.status);
+    applySessionStatusLifecycle(sid, p.status, updated.workingDir);
     return updated;
   });
 
@@ -1285,7 +1811,45 @@ export async function patchSessionMetaInDb(
   const setObj = sessionPatchToRow(patch, { bumpUpdatedAt: false });
   // 控制端远程改名走这条,与本机改名同口径(同样先记号后写库)。
   if (patch.title !== undefined) noteUserTitleWritten(sessionId);
-  await db.update(sessions).set(setObj).where(eq(sessions.id, sessionId));
+  const wouldReviveDeleted = patch.status === 'active' || patch.status === 'archived';
+  const runtimeOwnerGuard =
+    patch.status === undefined
+      ? undefined
+      : or(
+          isNull(sessions.runtimeOwnerId),
+          sql`${sessions.runtimeOwnerId} LIKE ${`${getSessionRuntimeOwnerPrefix()}:%`}`,
+        );
+  const writeResult = await commitSessionStatusTransition(
+    sessionId,
+    patch.status,
+    () =>
+      db
+        .update(sessions)
+        .set(setObj)
+        .where(
+          and(
+            wouldReviveDeleted
+              ? and(eq(sessions.id, sessionId), ne(sessions.status, 'deleted'))
+              : eq(sessions.id, sessionId),
+            runtimeOwnerGuard,
+          ),
+        )
+        .run(),
+    (result) => result.changes > 0,
+  );
+  if (writeResult.changes === 0) {
+    if (patch.status !== undefined) {
+      await assertSessionRuntimeOwnedLocallyOrUnclaimed(sessionId);
+    }
+    const existing = await getDbClient().queryOne<{ status: string }>(
+      'SELECT status FROM sessions WHERE id = ? LIMIT 1',
+      [sessionId],
+    );
+    if (!existing) throwIpcError('NOT_FOUND', 'Session 不存在');
+    if (wouldReviveDeleted && existing.status === 'deleted') {
+      throwIpcError('PRECONDITION_FAILED', 'Session 已永久删除，不能恢复');
+    }
+  }
   const row = await selectSessionWithCount(db, sessionId);
   if (!row) throwIpcError('NOT_FOUND', 'Session 不存在');
   const updated = sessionToCamel(row);
@@ -1295,44 +1859,7 @@ export async function patchSessionMetaInDb(
     workingDir: updated.workingDir,
     workspaceKind: updated.workspaceKind,
   });
-  if (patch.status === 'deleted') {
-    void imageCacheStore.removeSession(sessionId).catch((err) => {
-      log.warn('remote session image cleanup failed', {
-        sessionId,
-        err: err instanceof Error ? err.message : String(err),
-      });
-    });
-    // 媒体总仓对应清理:删本会话名下的媒体引用行(附件/导入/
-    // 消息出生引用;画廊等持久引用不动),引用归零的 blob 交回收器。
-    // fire-and-forget 与历史目录清理同语义:失败只警告,不阻塞删除。
-    void removeSessionMediaRefs(sessionId)
-      .then((n) => {
-        if (n > 0) log.info('session media refs removed', { sessionId, count: n });
-      })
-      .catch((err) => {
-        log.warn('session media ref cleanup failed', {
-          sessionId,
-          err: err instanceof Error ? err.message : String(err),
-        });
-      });
-    void removeWechatSessionAttachmentDir(sessionId).catch((err) => {
-      log.warn('WeChat session attachment cleanup failed', {
-        sessionId,
-        err: err instanceof Error ? err.message : String(err),
-      });
-    });
-    void listDeletableSessionPersistedChatAttachmentPaths(sessionId)
-      .then((filePaths) => cleanupStagedChatAttachments(filePaths))
-      .catch((err) => {
-        log.warn('staged chat attachment cleanup failed', {
-          sessionId,
-          err: err instanceof Error ? err.message : String(err),
-        });
-      });
-  }
-  removeHookAttachmentDir(sessionId, patch.status);
-  scheduleWorktreeRecycleForStatusChange(sessionId, patch.status);
-  notifyGhostSessionStatusChange(sessionId, patch.status, updated.workingDir);
+  applySessionStatusLifecycle(sessionId, patch.status, updated.workingDir);
   // 远程 / MCP 改动绕过 renderer 乐观更新,故主动广播 sessions:patched:
   //   - sessionsStore.onPatched → patchLocal,即时反映到 sidebar(删/归档移出 active 桶、改名/置顶刷新);
   //   - CCAgentSessionView.onPatched → 合并进 serverSession。
@@ -1447,16 +1974,29 @@ export async function setSessionsStatusInDb(
   status: 'active' | 'archived',
 ): Promise<SessionStatusChangeRow[]> {
   if (sessionIds.length === 0) return [];
-  const applied = await getDbClient()
-    .tx('sessions.setStatus', { sessionIds, status })
-    .catch((err) => {
-      const code = (err as { code?: string }).code;
-      const message = err instanceof Error ? err.message : String(err);
-      if (code === 'NOT_FOUND' || code === 'INVALID_PARAMS') {
-        throwIpcError(code, message);
-      }
-      throw err;
-    });
+  for (const sessionId of sessionIds) {
+    await assertSessionRuntimeOwnedLocallyOrUnclaimed(sessionId);
+  }
+  const locked = await withSessionLifecycleLocks(sessionIds, () =>
+    getDbClient()
+      .tx('sessions.setStatus', {
+        sessionIds,
+        status,
+        runtimeOwnerId: getSessionRuntimeOwnerPrefix(),
+      })
+      .catch((err) => {
+        const code = (err as { code?: string }).code;
+        const message = err instanceof Error ? err.message : String(err);
+        if (code === 'NOT_FOUND' || code === 'PRECONDITION_FAILED' || code === 'INVALID_PARAMS') {
+          throwIpcError(code, message);
+        }
+        throw err;
+      }),
+  );
+  if (!locked.acquired) {
+    throwIpcError('PRECONDITION_FAILED', 'One or more session lifecycles are busy or unavailable');
+  }
+  const applied = locked.value;
   for (const item of applied) {
     notifyAgentIslandSessionPatch(item.sessionId, {
       status: item.status,
@@ -1465,9 +2005,7 @@ export async function setSessionsStatusInDb(
       workspaceKind: item.workspaceKind,
     });
     broadcastSessionPatched(item.sessionId, { status: item.status });
-    scheduleWorktreeRecycleForStatusChange(item.sessionId, item.status);
-    notifyGhostSessionStatusChange(item.sessionId, item.status, item.workingDir);
-    removeHookAttachmentDir(item.sessionId, item.status);
+    applySessionStatusLifecycle(item.sessionId, item.status, item.workingDir);
   }
   return applied.map((item) => ({
     sessionId: item.sessionId,
@@ -1478,20 +2016,24 @@ export async function setSessionsStatusInDb(
 }
 
 /**
- * hook 入站附件目录回收(fire-and-forget): deleted/archived 都是终态,
- * 文件在 turn 送出后即无用。所有把 session 置为终态的路径都应调用。
+ * hook 入站附件目录回收:deleted 路径会 await 后复验状态,archived 路径由调用方
+ * fire-and-forget。文件在 turn 送出后即无用。所有把 session 置为终态的路径都应调用。
  */
-function removeHookAttachmentDir(sessionId: string, status: unknown): void {
-  if (status !== 'deleted' && status !== 'archived') return;
+async function removeHookAttachmentDir(sessionId: string, status: unknown): Promise<boolean> {
+  if (status !== 'deleted' && status !== 'archived') return true;
   const attachRoot = path.join(app.getPath('userData'), 'hook-attachments');
   const attachDir = path.join(attachRoot, sessionId);
-  if (!attachDir.startsWith(attachRoot + path.sep)) return;
-  void fs.rm(attachDir, { recursive: true, force: true }).catch((err) => {
+  if (!attachDir.startsWith(attachRoot + path.sep)) return false;
+  try {
+    await fs.rm(attachDir, { recursive: true, force: true });
+    return true;
+  } catch (err) {
     log.warn('hook attachment dir cleanup failed', {
       sessionId,
       err: err instanceof Error ? err.message : String(err),
     });
-  });
+    return false;
+  }
 }
 
 /** {@link selectSessionListRows} 的行形状——与 sessionToCamel 的入参对齐。 */
@@ -1667,7 +2209,10 @@ export async function setSessionProviderIdInDb(
 }
 
 /** Persist the provider-facing source for a newly-created shared IM session. */
-export async function setSessionSourceInDb(sessionId: string, source: 'telegram' | 'x'): Promise<void> {
+export async function setSessionSourceInDb(
+  sessionId: string,
+  source: 'telegram' | 'x',
+): Promise<void> {
   try {
     const db = getDbClient().drizzle;
     await db.update(sessions).set({ source }).where(eq(sessions.id, sessionId));

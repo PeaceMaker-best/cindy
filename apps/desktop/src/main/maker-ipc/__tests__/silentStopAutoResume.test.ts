@@ -4,6 +4,7 @@ import {
   SILENT_STOP_RESUME_BUDGET,
   SILENT_STOP_RESUME_MIN_INTERVAL_MS,
   SILENT_STOP_SESSION_BREAKER_LIMIT,
+  runScheduledSilentStopAutoResume,
   SilentStopAutoResumeGuard,
 } from '../silentStopAutoResume.js';
 
@@ -25,6 +26,40 @@ function createGuard(opts?: { enabled?: boolean }) {
 }
 
 const SID = 'session-1';
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function createRouteHarness() {
+  let active = true;
+  let tail = Promise.resolve();
+  const withActiveRoute = async (_sessionId: string, run: () => Promise<void>) => {
+    const previous = tail;
+    let release!: () => void;
+    tail = previous.then(() => new Promise<void>((resolve) => {
+      release = resolve;
+    }));
+    await previous;
+    try {
+      if (!active) return { admitted: false as const };
+      await run();
+      return { admitted: true as const };
+    } finally {
+      release();
+    }
+  };
+  const deleteSession = () => withActiveRoute(SID, async () => {
+    active = false;
+  });
+  return { withActiveRoute, deleteSession };
+}
 /** 一个完整的"turn 开始 → silent-stop 结束"周期,返回 done 时刻。 */
 function runSilentStopTurn(g: ReturnType<typeof createGuard>): number {
   g.guard.noteTurnStarted(SID);
@@ -178,5 +213,90 @@ describe('SilentStopAutoResumeGuard', () => {
     g.guard.noteSessionReset(SID);
     // 再来一个 done(stale 重播)→ superseded,不会注入清空的会话。
     expect(g.guard.onSilentStop(SID, doneAt)).toEqual({ action: 'skip', why: 'superseded' });
+  });
+});
+
+describe('scheduled silent-stop lifecycle admission', () => {
+  it('does not resume or persist when deletion wins admission first', async () => {
+    const route = createRouteHarness();
+    const session = { id: SID };
+    const handle = vi.fn(async () => undefined);
+    await route.deleteSession();
+
+    await runScheduledSilentStopAutoResume(session, {
+      withActiveRoute: route.withActiveRoute,
+      getCurrentSession: () => session,
+      handle,
+    });
+
+    expect(handle).not.toHaveBeenCalled();
+  });
+
+  it('keeps deletion waiting until the accepted resume send settles', async () => {
+    const route = createRouteHarness();
+    const session = { id: SID };
+    const sendSettled = deferred<void>();
+    const handleStarted = deferred<void>();
+    const handle = vi.fn(async () => {
+      handleStarted.resolve();
+      await sendSettled.promise;
+    });
+
+    const resume = runScheduledSilentStopAutoResume(session, {
+      withActiveRoute: route.withActiveRoute,
+      getCurrentSession: () => session,
+      handle,
+    });
+    await handleStarted.promise;
+    let deletionSettled = false;
+    const deletion = route.deleteSession().then(() => {
+      deletionSettled = true;
+    });
+    await Promise.resolve();
+    expect(deletionSettled).toBe(false);
+
+    sendSettled.resolve();
+    await resume;
+    await deletion;
+    expect(handle).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores a timer captured by a stale runtime generation', async () => {
+    const route = createRouteHarness();
+    const captured = { id: SID, generation: 1 };
+    const replacement = { id: SID, generation: 2 };
+    const handle = vi.fn(async () => undefined);
+
+    await runScheduledSilentStopAutoResume(captured, {
+      withActiveRoute: route.withActiveRoute,
+      getCurrentSession: () => replacement,
+      handle,
+    });
+
+    expect(handle).not.toHaveBeenCalled();
+  });
+
+  it('releases admission exactly once when resume sending rejects', async () => {
+    const route = createRouteHarness();
+    const session = { id: SID };
+    const sendStarted = deferred<void>();
+    const sendFailed = deferred<void>();
+    const handle = vi.fn(async () => {
+      sendStarted.resolve();
+      await sendFailed.promise;
+    });
+
+    const resume = runScheduledSilentStopAutoResume(session, {
+      withActiveRoute: route.withActiveRoute,
+      getCurrentSession: () => session,
+      handle,
+    });
+    await sendStarted.promise;
+    const deletion = route.deleteSession();
+    sendFailed.reject(new Error('send rejected'));
+
+    await expect(resume).rejects.toThrow('send rejected');
+    await deletion;
+    expect(handle).toHaveBeenCalledTimes(1);
   });
 });

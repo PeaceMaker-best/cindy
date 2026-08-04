@@ -25,7 +25,7 @@
  * 保证两边一致。
  */
 
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 
 import type {
   BindingChangeEvent,
@@ -167,6 +167,84 @@ export class SqliteBindingStore implements BindingStore<string> {
     return this.forward.get(keyOf(identity)) ?? null;
   }
 
+  /**
+   * Reconcile one identity from SQLite before routing. Multiple Cindy processes
+   * can share userData, so another process may detach, replace, or create a
+   * binding after this process preloaded its in-memory indexes.
+   */
+  refreshFromPersistence(identity: IdentityKey): Promise<string | null> {
+    return this.enqueueMutation(async () => {
+      const identityKey = keyOf(identity);
+      const oldSessionId = this.forward.get(identityKey) ?? null;
+      const rows = await getDbClient()
+        .drizzle.select({
+          targetSessionId: imBindings.targetSessionId,
+          attachedViaCardMessageId: imBindings.attachedViaCardMessageId,
+        })
+        .from(imBindings)
+        .where(
+          and(
+            eq(imBindings.channel, identity.channel),
+            eq(imBindings.botContextId, identity.botContextId),
+            eq(imBindings.userId, identity.userId),
+            eq(imBindings.scopeKey, identity.scopeKey ?? ''),
+          ),
+        )
+        .limit(1);
+      const row = rows[0];
+      const persistedSessionId = row?.targetSessionId ?? null;
+
+      if (persistedSessionId === oldSessionId) {
+        if (persistedSessionId) {
+          this.reverse.set(persistedSessionId, identity);
+          if (row?.attachedViaCardMessageId) {
+            this.attachCardIds.set(identityKey, row.attachedViaCardMessageId);
+          } else {
+            this.attachCardIds.delete(identityKey);
+          }
+        }
+        return persistedSessionId;
+      }
+
+      if (oldSessionId) {
+        const reverseIdentity = this.reverse.get(oldSessionId);
+        if (reverseIdentity && keyOf(reverseIdentity) === identityKey) {
+          this.reverse.delete(oldSessionId);
+        }
+      }
+
+      if (!persistedSessionId) {
+        this.forward.delete(identityKey);
+        this.attachCardIds.delete(identityKey);
+        if (oldSessionId) {
+          this.emit({ identity, value: null, prevValue: oldSessionId });
+        }
+        return null;
+      }
+
+      const displacedIdentity = this.reverse.get(persistedSessionId);
+      if (displacedIdentity && keyOf(displacedIdentity) !== identityKey) {
+        const displacedKey = keyOf(displacedIdentity);
+        this.forward.delete(displacedKey);
+        this.attachCardIds.delete(displacedKey);
+        this.emit({
+          identity: displacedIdentity,
+          value: null,
+          prevValue: persistedSessionId,
+        });
+      }
+      this.forward.set(identityKey, persistedSessionId);
+      this.reverse.set(persistedSessionId, identity);
+      if (row?.attachedViaCardMessageId) {
+        this.attachCardIds.set(identityKey, row.attachedViaCardMessageId);
+      } else {
+        this.attachCardIds.delete(identityKey);
+      }
+      this.emit({ identity, value: persistedSessionId, prevValue: oldSessionId });
+      return persistedSessionId;
+    });
+  }
+
   findByTarget(value: string): IdentityKey | null {
     return this.reverse.get(value) ?? null;
   }
@@ -229,12 +307,11 @@ export class SqliteBindingStore implements BindingStore<string> {
       const displacedIdentity = this.reverse.get(value);
       const displaced =
         displacedIdentity !== undefined && keyOf(displacedIdentity) !== identityKey
-        ? {
-            identity: displacedIdentity,
-            attachedViaCardMessageId:
-              this.attachCardIds.get(keyOf(displacedIdentity)) ?? null,
-          }
-        : null;
+          ? {
+              identity: displacedIdentity,
+              attachedViaCardMessageId: this.attachCardIds.get(keyOf(displacedIdentity)) ?? null,
+            }
+          : null;
 
       // 同一 identity 的旧 target 与同一 target 的旧 identity 必须在一个 worker
       // transaction 里替换。新 INSERT 失败时 SQLite 会恢复旧 binding；因此内存
@@ -296,10 +373,7 @@ export class SqliteBindingStore implements BindingStore<string> {
    * deletion is target-wide so stale duplicate owners left by a failed preload
    * repair cannot resurrect after the visible winner is revoked.
    */
-  detachIfTarget(
-    identity: IdentityKey,
-    expectedTargetSessionId?: string,
-  ): Promise<boolean> {
+  detachIfTarget(identity: IdentityKey, expectedTargetSessionId?: string): Promise<boolean> {
     return this.enqueueMutation(async () => {
       const k = keyOf(identity);
       const oldSessionId = this.forward.get(k);
@@ -316,10 +390,20 @@ export class SqliteBindingStore implements BindingStore<string> {
         );
         return false;
       }
-      const db = getDbClient().drizzle;
-      await db
-        .delete(imBindings)
-        .where(eq(imBindings.targetSessionId, oldSessionId));
+      const deleted = await getDbClient().tx('im.deleteBindingIfTarget', {
+        channel: identity.channel,
+        botContextId: identity.botContextId,
+        userId: identity.userId,
+        scopeKey: identity.scopeKey ?? '',
+        targetSessionId: oldSessionId,
+      });
+      if (!deleted) {
+        log.debug(
+          `detach noop (persisted target changed) channel=${identity.channel} ` +
+            `expected=...${oldSessionId.slice(-8)}`,
+        );
+        return false;
+      }
       this.forward.delete(k);
       const reverseIdentity = this.reverse.get(oldSessionId);
       if (reverseIdentity && keyOf(reverseIdentity) === k) {

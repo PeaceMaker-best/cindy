@@ -26,35 +26,25 @@
  */
 
 import type Database from 'better-sqlite3';
+import type { DbClient } from './client/DbClient.js';
 
 import { createLogger } from '../logger';
+import { withSessionLifecycleLocks } from '../sessionLifecycleLock.js';
+import { getDbClient } from './client/current.js';
 
 const log = createLogger('orca-stranded-lead-reconcile');
 
 /**
- * 同步执行:在 `ensureReady` 的 runMigrations + schemaDriftRepair + cleanupStaleOrcaLeadIndex
- * 之后调用(此时 schema 已是 HEAD,`orca_teams` / `orca_workers` 表一定存在)。三步写包在一个
- * 事务里,保证要么全成、要么全不动。不抛错 —— 任何异常都吞掉记日志,不让兜底修复把启动卡死。
+ * 启动早期同步执行的 metadata cleanup。在 `ensureReady` 的 runMigrations + schemaDriftRepair
+ * + cleanupStaleOrcaLeadIndex 之后调用(此时 schema 已是 HEAD,`orca_teams` / `orca_workers`
+ * 表一定存在)。这里故意不写 `sessions.status`:DbClient 尚未 takeover,无法与删除生命周期锁
+ * 协同；需要归档的 session 由 `reconcileStrandedOrcaSessions` 在 DbClient ready 后补齐。
+ * 不抛错 —— 任何异常都吞掉记日志,不让兜底修复把启动卡死。
  */
 export function reconcileStrandedOrcaLeads(db: Database.Database): void {
   try {
     const run = db.transaction(() => {
-      // 1) 归档「属于非 active team」且仍 active 的孤儿 worker session(对齐 archiveWorkersByTeam)。
-      //    只命中 status='active' —— 已 archived 的无需再动,已被用户软删除的 status='deleted'
-      //    必须原样保留(不能借 reconcile 复活用户删掉的记录)。
-      const archivedWorkerSessions = db
-        .prepare(
-          `UPDATE sessions SET status = 'archived'
-           WHERE orca_role = 'worker' AND status = 'active'
-             AND id IN (
-               SELECT w.session_id FROM orca_workers w
-               JOIN orca_teams t ON w.team_id = t.id
-               WHERE t.status != 'active'
-             )`,
-        )
-        .run().changes;
-
-      // 2) 把非 active team 的 orca_workers 收敛 done(对齐 markWorkersStatusByTeam)。
+      // 1) 把非 active team 的 orca_workers 收敛 done(对齐 markWorkersStatusByTeam)。
       const doneWorkers = db
         .prepare(
           `UPDATE orca_workers SET status = 'done'
@@ -63,7 +53,7 @@ export function reconcileStrandedOrcaLeads(db: Database.Database): void {
         )
         .run().changes;
 
-      // 3) 清掉「orca_role='lead' 且无 active team」的悬空 Lead。
+      // 2) 清掉「orca_role='lead' 且无 active team」的悬空 Lead。
       const clearedLeads = db
         .prepare(
           `UPDATE sessions SET orca_role = NULL
@@ -74,11 +64,11 @@ export function reconcileStrandedOrcaLeads(db: Database.Database): void {
         )
         .run().changes;
 
-      return { archivedWorkerSessions, doneWorkers, clearedLeads };
+      return { doneWorkers, clearedLeads };
     });
 
     const res = run();
-    if (res.archivedWorkerSessions > 0 || res.doneWorkers > 0 || res.clearedLeads > 0) {
+    if (res.doneWorkers > 0 || res.clearedLeads > 0) {
       log.warn(
         JSON.stringify({
           event: 'localDb.reconcile.strandedOrcaState.cleared',
@@ -96,4 +86,60 @@ export function reconcileStrandedOrcaLeads(db: Database.Database): void {
       }),
     );
   }
+}
+
+/**
+ * DbClient takeover 后的 session-status reconcile。每个 lead 的 worker session 集合先稳定
+ * 读取，再按逻辑 session lifecycle lock 串行化；事务内再次校验 team/status，并只更新这次
+ * snapshot 命中的行。这样启动 sweep 不会在账号切换或 deleted finalizer 期间复活/误归档 session。
+ */
+export async function reconcileStrandedOrcaSessions(options?: {
+  /** Capture the startup owner DbClient so an account switch cannot redirect writes. */
+  dbClient?: DbClient;
+  /** Return false when the startup owner/account boundary is no longer current. */
+  canContinue?: () => boolean;
+}): Promise<{ archivedWorkerSessions: number; stopped: boolean }> {
+  const canContinue = options?.canContinue ?? (() => true);
+  if (!canContinue()) return { archivedWorkerSessions: 0, stopped: true };
+  const client = options?.dbClient ?? getDbClient();
+  if (!canContinue()) return { archivedWorkerSessions: 0, stopped: true };
+  const rows = await client.query<{ leadSessionId: string; sessionId: string }>(
+    `SELECT DISTINCT ot.lead_session_id AS leadSessionId, ow.session_id AS sessionId
+     FROM orca_workers AS ow
+     INNER JOIN orca_teams AS ot ON ot.id = ow.team_id
+     WHERE ot.status != 'active'
+     ORDER BY ot.lead_session_id, ow.session_id`,
+  );
+  if (!canContinue()) return { archivedWorkerSessions: 0, stopped: true };
+  const byLead = new Map<string, string[]>();
+  for (const row of rows) {
+    const ids = byLead.get(row.leadSessionId) ?? [];
+    if (!ids.includes(row.sessionId)) ids.push(row.sessionId);
+    byLead.set(row.leadSessionId, ids);
+  }
+
+  let archivedWorkerSessions = 0;
+  for (const [leadSessionId, sessionIds] of byLead) {
+    if (!canContinue()) return { archivedWorkerSessions, stopped: true };
+    const locked = await withSessionLifecycleLocks(sessionIds, async () =>
+      canContinue()
+        ? client.tx('orca.reconcileInactiveTeamWorkersForLead', {
+            leadSessionId,
+            sessionIds,
+            now: Date.now(),
+          })
+        : null,
+    );
+    if (!canContinue()) return { archivedWorkerSessions, stopped: true };
+    if (!locked.acquired) {
+      log.warn('stranded Orca session reconcile skipped because lifecycle locks were unavailable', {
+        leadSessionId,
+        sessionIds,
+        reason: locked.reason,
+      });
+      continue;
+    }
+    if (locked.value) archivedWorkerSessions += locked.value.length;
+  }
+  return { archivedWorkerSessions, stopped: false };
 }

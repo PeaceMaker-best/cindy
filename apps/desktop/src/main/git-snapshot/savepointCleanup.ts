@@ -17,6 +17,7 @@ import path from 'node:path';
 import { inArray, isNotNull } from 'drizzle-orm';
 
 import { getDbClient } from '../localDb/client/current';
+import type { DbClient } from '../localDb/client/DbClient';
 import { sessions } from '../localDb/schema';
 import { createLogger } from '../logger';
 import { gitExec } from '../worktree/gitExec';
@@ -63,10 +64,25 @@ async function resolveSavepointRepoRoot(workingDir: string): Promise<string | nu
  * 无从定位,其残留 ref 留待该目录再次被会话使用时的下一轮对账。DB 查询失败
  * 整体跳过,宁可保留也不误删。
  */
-export async function reconcileSavepointRefsForDeletedSessions(): Promise<void> {
+export interface SavepointReconcileOptions {
+  /** Captured owner database for startup reconciliation. */
+  dbClient?: DbClient;
+  /** Fail closed when the account or current database handle changes. */
+  canContinue?: () => boolean | Promise<boolean>;
+}
+
+async function canContinue(options: SavepointReconcileOptions): Promise<boolean> {
+  return options.canContinue ? await options.canContinue() : true;
+}
+
+export async function reconcileSavepointRefsForDeletedSessions(
+  options: SavepointReconcileOptions = {},
+): Promise<void> {
+  if (!(await canContinue(options))) return;
+  const dbClient = options.dbClient ?? getDbClient();
   let rows: Array<{ id: string; status: string | null; workingDir: string | null }>;
   try {
-    const db = getDbClient().drizzle;
+    const db = dbClient.drizzle;
     rows = await db
       .select({ id: sessions.id, status: sessions.status, workingDir: sessions.workingDir })
       .from(sessions)
@@ -89,19 +105,28 @@ export async function reconcileSavepointRefsForDeletedSessions(): Promise<void> 
 
   const seenRepoRoots = new Set<string>();
   for (const workingDir of workDirs) {
+    if (!(await canContinue(options))) return;
     try {
       const repoRoot = await resolveSavepointRepoRoot(workingDir);
+      if (!(await canContinue(options))) return;
       if (!repoRoot || seenRepoRoots.has(repoRoot)) continue;
       seenRepoRoots.add(repoRoot);
 
       const refs = await listSavepointRefs(repoRoot);
+      if (!(await canContinue(options))) return;
       if (refs.length === 0) continue;
 
-      const db = getDbClient().drizzle;
+      const db = dbClient.drizzle;
       const owners = await db
         .select({ id: sessions.id, status: sessions.status })
         .from(sessions)
-        .where(inArray(sessions.id, refs.map((ref) => ref.sessionId)));
+        .where(
+          inArray(
+            sessions.id,
+            refs.map((ref) => ref.sessionId),
+          ),
+        );
+      if (!(await canContinue(options))) return;
       // 只删当前账号 DB 里能证明 status='deleted' 的 ref。行缺失**不是**孤儿
       // 证据:localDb 按账号隔离,同一仓库可能挂着另一账号会话的链,误删即
       // 永久丢那个账号的回退历史。代价是行被物理清除的会话 ref 无人回收——
@@ -111,6 +136,7 @@ export async function reconcileSavepointRefsForDeletedSessions(): Promise<void> 
       );
 
       for (const ref of refs) {
+        if (!(await canContinue(options))) return;
         if (!deletableIds.has(ref.sessionId)) continue;
         await deleteSavepointRef(repoRoot, ref.sessionId);
         log.info('[savepoint-cleanup] orphan savepoint chain removed', {

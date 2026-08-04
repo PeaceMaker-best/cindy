@@ -7,10 +7,11 @@
  */
 
 import { ipcMain, BrowserWindow } from 'electron';
-import { and, asc, eq, inArray, lt, gt, gte, desc, isNull, ne, or, sql, type SQL } from 'drizzle-orm';
+import { and, asc, eq, inArray, lt, gt, gte, desc, isNull, or, sql, type SQL } from 'drizzle-orm';
 import { createId } from '@paralleldrive/cuid2';
 
 import { getDbClient } from '../client/current';
+import type { DbClient } from '../client/DbClient';
 import { messages, sessions } from '../schema';
 import {
   messageToCamel,
@@ -28,10 +29,6 @@ import { importExternalClaudeCodeMessagesForSession } from '../../maker-host/cla
 import { isDeviceLinkInvoke } from '../../device-link/invoke-context';
 import { onMessageCreated as onChatMessageCreatedForEmbedding } from '../../embedders/chat-history-embedder';
 import { recomputePrRefsForSession, recordPrRefsForMessage } from '../../git-context/prRefsStore';
-import {
-  cleanupStagedChatAttachments,
-  extractChatAttachmentPathsFromPersistedContent,
-} from '../../file-browser/remote-file-cache';
 import {
   isSyntheticTriggerText,
   mergeDismissedIntoErrorContent,
@@ -58,11 +55,42 @@ const messageRowid = sql<number>`rowid`;
 type MessageRow = typeof messages.$inferSelect;
 type MessageRowWithRowid = MessageRow & { rowid: number };
 
-const PERSISTED_CHAT_ATTACHMENT_ROWS_SQL = `SELECT m.content
+// DbClient uses better-sqlite3 `.all()`: never return whole message bodies for
+// retention bookkeeping. JSON1 extracts only the distinct paths that startup
+// cleanup needs, while LIKE avoids invoking json_each for unrelated history.
+const PERSISTED_CHAT_ATTACHMENT_CONTENT_PATTERN = '%chat-attachment-cache%';
+const PERSISTED_CHAT_ATTACHMENT_PATHS_SQL = `SELECT DISTINCT
+         attachment.atom AS filePath
    FROM messages AS m
    JOIN sessions AS s ON s.id = m.session_id
+   JOIN json_tree(
+          CASE WHEN json_valid(m.content) THEN m.content ELSE '{}' END,
+          '$.files'
+        ) AS attachment
   WHERE s.status != 'deleted'
-    AND m.content LIKE '%chat-attachment-cache%'`;
+    AND m.content LIKE ?
+    AND attachment.key = 'path'
+    AND attachment.type = 'text'`;
+const DELETED_SESSION_CHAT_ATTACHMENT_PATHS_SQL = `WITH attachment_paths AS (
+  SELECT
+    m.session_id AS sessionId,
+    s.status AS sessionStatus,
+    attachment.atom AS filePath
+  FROM messages AS m
+  JOIN sessions AS s ON s.id = m.session_id
+  JOIN json_tree(
+         CASE WHEN json_valid(m.content) THEN m.content ELSE '{}' END,
+         '$.files'
+       ) AS attachment
+    ON attachment.key = 'path' AND attachment.type = 'text'
+  WHERE m.content LIKE ?
+)
+SELECT filePath
+FROM attachment_paths
+GROUP BY filePath
+HAVING SUM(CASE WHEN sessionId = ? AND sessionStatus = 'deleted' THEN 1 ELSE 0 END) > 0
+   AND SUM(CASE WHEN sessionId != ? AND sessionStatus != 'deleted' THEN 1 ELSE 0 END) = 0
+ORDER BY filePath`;
 
 export interface EstimatedSessionValueEntry {
   clientId: string;
@@ -91,64 +119,29 @@ const VALID_ROLES: ReadonlySet<MessageRole> = new Set([
   'thinking',
 ] as const);
 
-function uniqueStrings(values: readonly string[]): string[] {
-  return [...new Set(values)];
-}
-
-/** Return staged attachment paths persisted by a session's messages. */
-export async function listSessionPersistedChatAttachmentPaths(
-  sessionId: string,
-): Promise<string[]> {
-  const rows = await getDbClient().drizzle
-    .select({ content: messages.content })
-    .from(messages)
-    .where(eq(messages.sessionId, sessionId));
-  return uniqueStrings(
-    rows.flatMap((row) => extractChatAttachmentPathsFromPersistedContent(row.content)),
+/** Return all staged attachment paths retained by the current owner's message DB. */
+export async function listPersistedChatAttachmentPaths(): Promise<string[]> {
+  const rows = await getDbClient().query<{ filePath: unknown }>(
+    PERSISTED_CHAT_ATTACHMENT_PATHS_SQL,
+    [PERSISTED_CHAT_ATTACHMENT_CONTENT_PATTERN],
   );
+  return rows.flatMap((row) => (typeof row.filePath === 'string' ? [row.filePath] : []));
 }
 
 /**
- * Return the staged attachment paths that may be removed after deleting one
- * session. Forked sessions copy persisted message content, so a path remains
- * protected while any other non-deleted session still references it.
+ * Return only staged paths whose remaining references belong to this deleted
+ * session. SQLite keeps the message bodies and JSON traversal out of the JS
+ * heap; other live/archived sessions continue to protect shared files.
  */
-export async function listDeletableSessionPersistedChatAttachmentPaths(
+export async function listDeletedSessionChatAttachmentPaths(
   sessionId: string,
+  dbClient: DbClient = getDbClient(),
 ): Promise<string[]> {
-  const [sessionPaths, retainedPaths] = await Promise.all([
-    listSessionPersistedChatAttachmentPaths(sessionId),
-    listPersistedChatAttachmentPathsForOtherSessions(sessionId),
-  ]);
-  return sessionPaths.filter((filePath) => !retainedPaths.includes(filePath));
-}
-
-/** Return staged attachment paths referenced by other non-deleted sessions. */
-export async function listPersistedChatAttachmentPathsForOtherSessions(
-  sessionId: string,
-): Promise<string[]> {
-  const rows = await getDbClient().drizzle
-    .select({ content: messages.content })
-    .from(messages)
-    .innerJoin(sessions, eq(messages.sessionId, sessions.id))
-    .where(and(ne(messages.sessionId, sessionId), ne(sessions.status, 'deleted')));
-  return uniqueStrings(
-    rows.flatMap((row) => extractChatAttachmentPathsFromPersistedContent(row.content)),
+  const rows = await dbClient.query<{ filePath: unknown }>(
+    DELETED_SESSION_CHAT_ATTACHMENT_PATHS_SQL,
+    [PERSISTED_CHAT_ATTACHMENT_CONTENT_PATTERN, sessionId, sessionId],
   );
-}
-
-/** Return all staged attachment paths retained by the current owner's message DB. */
-export async function listPersistedChatAttachmentPaths(): Promise<string[]> {
-  const rows = await getDbClient().query<{ content: unknown }>(
-    PERSISTED_CHAT_ATTACHMENT_ROWS_SQL,
-  );
-  return uniqueStrings(
-    rows.flatMap((row) =>
-      typeof row.content === 'string'
-        ? extractChatAttachmentPathsFromPersistedContent(row.content)
-        : [],
-    ),
-  );
+  return rows.flatMap((row) => (typeof row.filePath === 'string' ? [row.filePath] : []));
 }
 
 export function registerMessageIpc(): void {
@@ -809,14 +802,6 @@ export async function commitMessageDeletion(
 }> {
   const now = Date.now();
   const db = getDbClient().drizzle;
-  const deletedAttachmentPaths = uniqueStrings(
-    (
-      await db
-        .select({ content: messages.content })
-        .from(messages)
-        .where(and(eq(messages.sessionId, sessionId), inArray(messages.clientId, clientIds)))
-    ).flatMap((row) => extractChatAttachmentPathsFromPersistedContent(row.content)),
-  );
   const result = await getDbClient().tx('message.delete', {
     sessionId,
     clientIds,
@@ -828,29 +813,6 @@ export async function commitMessageDeletion(
     },
     updatedAt: now,
   });
-
-  if (deletedAttachmentPaths.length > 0) {
-    try {
-      const remainingAttachmentPaths = new Set(
-        await listSessionPersistedChatAttachmentPaths(sessionId),
-      );
-      const retainedByOtherSessions = new Set(
-        await listPersistedChatAttachmentPathsForOtherSessions(sessionId),
-      );
-      await cleanupStagedChatAttachments(
-        deletedAttachmentPaths.filter(
-          (filePath) =>
-            !retainedByOtherSessions.has(filePath) && !remainingAttachmentPaths.has(filePath),
-        ),
-      );
-    } catch (error) {
-      log.warn('message staged attachment cleanup failed', {
-        sessionId,
-        deletedClientIds: clientIds,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }
 
   // 当前生产聊天附件主要是 session-attachment 粗粒度引用，不能因删除一轮
   // 误删同 session 其它气泡仍在用的 blob。这里只释放明确以消息 id/clientId
@@ -1198,7 +1160,36 @@ export async function createMessage(
   const now = Date.now();
   const insertRow = messageCreateToRow(id, sessionId, body, now);
   try {
-    await db.insert(messages).values(insertRow);
+    const inserted = await getDbClient().exec(
+      `INSERT INTO messages
+        (id, client_id, session_id, role, content, tool_use_id,
+         agent_meta, agent_kind, created_at, rewind_at)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL
+       WHERE EXISTS (
+         SELECT 1 FROM sessions WHERE id = ? AND status = 'active'
+       )`,
+      [
+        insertRow.id,
+        insertRow.clientId,
+        insertRow.sessionId,
+        insertRow.role,
+        insertRow.content,
+        insertRow.toolUseId,
+        insertRow.agentMeta,
+        insertRow.agentKind,
+        insertRow.createdAt,
+        sessionId,
+      ],
+    );
+    if (inserted.changes === 0) {
+      const after = await db
+        .select()
+        .from(messages)
+        .where(and(eq(messages.sessionId, sessionId), eq(messages.clientId, body.clientId)))
+        .limit(1);
+      if (after.length > 0) return messageToCamel(after[0]);
+      throw new Error(`Session ${sessionId} is not active; message write rejected`);
+    }
   } catch (err) {
     const after = await db
       .select()

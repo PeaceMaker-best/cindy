@@ -242,6 +242,18 @@ describe('removeSessionRefs(会话删除钩子)', () => {
       { hash: HASH_A, refKind: 'ghost-grant', refId: 'art', originKind: 'user', originSessionId: 'sess-1' },
       db,
     );
+    // Outbox 引用归投递事务，即使带上被删会话的来源标记也不能陪葬。
+    await ledger.addRef(
+      {
+        hash: HASH_A,
+        refKind: 'wechat-outbox',
+        refId: 'outbox-1',
+        originSessionId: 'sess-1',
+        originKind: 'integration',
+        originId: 'wechat',
+      },
+      db,
+    );
     // 无关会话 sess-2 的引用
     await ledger.addRef({ hash: HASH_B, refKind: 'session-attachment', refId: 'sess-2' }, db);
     await ledger.addRef(
@@ -257,6 +269,7 @@ describe('removeSessionRefs(会话删除钩子)', () => {
       'ghost-grant',
       'message',
       'session-attachment',
+      'wechat-outbox',
     ]);
     // 幸存的 message/session-attachment 都是 sess-2 的
     expect(

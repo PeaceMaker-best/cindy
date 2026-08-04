@@ -131,6 +131,10 @@ export interface LearnControllerDeps {
   persistUserMessage(sessionId: string, content: string): Promise<void>;
   /** 修正 sessions 行(source='learn' + acceptEdits + 继承的 providerId),失败仅 warn。 */
   backfillSessionMeta(sessionId: string): Promise<void>;
+  /** Hold logical session lifecycle admission through the first send acceptance. */
+  acquireSessionLifecycleLease?: (
+    sessionId: string,
+  ) => Promise<{ acquired: false } | { acquired: true; release: () => void }>;
   beforeDispatchUserTurn?: (sessionId: string) => void | Promise<void>;
   onUndispatchedUserTurn?: (sessionId: string) => void;
   peekPendingHandoff?: (sessionId: string) => Promise<string | null>;
@@ -476,38 +480,51 @@ export class LearnController {
       return;
     }
     const title = `[Learn] ${(run.input || run.hubSlug || '').slice(0, 40)}`;
-    const session = await this.deps.createSession({
-      id: randomUUID(),
-      workingDir: stagingDir,
-      title,
-      ...(run.originSessionId ? { originSessionId: run.originSessionId } : {}),
-    });
-    await this.deps.backfillSessionMeta(session.id);
-    const afterCreate = await this.update(run, { status: 'distilling', sessionId: session.id });
-    // createSession/backfill 的 await 窗口内仍可能被 cancel(Codex fresh evidence):
-    // update 的终态保护会拒绝 cancelled → distilling,此处按返回值收口,把刚建的
-    // 会话中止掉,不再白跑一轮模型调用。
-    if (afterCreate.status !== 'distilling' || this.disposed) {
-      void session.abort().catch(() => undefined);
-      // dispose 窗口里 'distilling' 已被持久化 —— 必须收口成终态,否则 runs.json
-      // 留着非终态 run,重启前 startLearn 永远 LEARN_BUSY(Codex review)。cancel
-      // 路径(afterCreate 非 distilling)本身已是终态,不动。
-      if (this.disposed && afterCreate.status === 'distilling') {
-        await this.update(afterCreate, {
-          status: 'cancelled',
-          error: 'learn host disposed (account switch)',
-        }).catch(() => undefined);
-      }
-      return;
+    const sessionId = randomUUID();
+    const lease = await this.deps.acquireSessionLifecycleLease?.(sessionId);
+    if (lease && !lease.acquired) {
+      throw new Error('learn session lifecycle admission failed');
     }
+    let releaseLifecycle = lease?.acquired ? lease.release : undefined;
+    try {
+      const session = await this.deps.createSession({
+        id: sessionId,
+        workingDir: stagingDir,
+        title,
+        ...(run.originSessionId ? { originSessionId: run.originSessionId } : {}),
+      });
+      await this.deps.backfillSessionMeta(session.id);
+      const afterCreate = await this.update(run, { status: 'distilling', sessionId: session.id });
+      // createSession/backfill 的 await 窗口内仍可能被 cancel(Codex fresh evidence):
+      // update 的终态保护会拒绝 cancelled → distilling,此处按返回值收口,把刚建的
+      // 会话中止掉,不再白跑一轮模型调用。
+      if (afterCreate.status !== 'distilling' || this.disposed) {
+        void session.abort().catch(() => undefined);
+        // dispose 窗口里 'distilling' 已被持久化 —— 必须收口成终态,否则 runs.json
+        // 留着非终态 run,重启前 startLearn 永远 LEARN_BUSY(Codex review)。cancel
+        // 路径(afterCreate 非 distilling)本身已是终态,不动。
+        if (this.disposed && afterCreate.status === 'distilling') {
+          await this.update(afterCreate, {
+            status: 'cancelled',
+            error: 'learn host disposed (account switch)',
+          }).catch(() => undefined);
+        }
+        return;
+      }
 
-    const cleanMessage =
-      run.sourceKind === 'hub'
-        ? `/learn hub:${run.hubSlug}`
-        : run.sourceKind === 'session'
-          ? '/learn (distill current conversation)'
-          : `/learn ${run.input}`;
-    await this.runDistillTurn(runId, session, prompt, cleanMessage);
+      const cleanMessage =
+        run.sourceKind === 'hub'
+          ? `/learn hub:${run.hubSlug}`
+          : run.sourceKind === 'session'
+            ? '/learn (distill current conversation)'
+            : `/learn ${run.input}`;
+      await this.runDistillTurn(runId, session, prompt, cleanMessage, () => {
+        releaseLifecycle?.();
+        releaseLifecycle = undefined;
+      });
+    } finally {
+      releaseLifecycle?.();
+    }
   }
 
   /**
@@ -520,6 +537,7 @@ export class LearnController {
     session: LearnSessionLike,
     prompt: string,
     cleanMessage: string,
+    releaseLifecycle?: () => void,
   ): Promise<void> {
     let assistantText = '';
     const turnFinished = new Promise<void>((resolve, reject) => {
@@ -557,6 +575,7 @@ export class LearnController {
 
     let baselineStarted = false;
     try {
+      try {
       const pendingHandoff = await this.deps.peekPendingHandoff?.(session.id) ?? null;
       const outgoingMessage = pendingHandoff
         ? (prependHandoffToUserMessage({ type: 'user', content: prompt }, pendingHandoff) as { type: 'user'; content: string })
@@ -586,6 +605,9 @@ export class LearnController {
         this.deps.consumePendingHandoff?.(session.id);
       }
       baselineStarted = false;
+      } finally {
+        releaseLifecycle?.();
+      }
       await Promise.race([turnFinished, timedOut]);
     } catch (err) {
       if (baselineStarted) {

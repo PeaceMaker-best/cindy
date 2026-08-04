@@ -2443,12 +2443,6 @@ function ExpandedView({
           // RSB 布局偏好(fraction / treeWidth / collapsed)走 localStorage 是
           // 本机概念,本地 + 远程 session 都要清(被控端的 localStorage 由被控端自己处理)。
           cleanupSessionLayoutPrefs(session.id);
-          // 图片缓存清理是本机概念;远程会话的图在被控端,由被控端自己的删除流程处理。
-          if (!session.deviceLinkDeviceId) {
-            void window.electronAPI.cleanupSessionImages(session.id).catch((err: unknown) => {
-              log.warn('[bulk session delete] cleanup images failed', err);
-            });
-          }
         } catch (err) {
           log.error('[bulk session delete]', err);
           failed.push(session.id);

@@ -20,6 +20,7 @@ import { createMessage } from '../localDb/ipc/messages.js';
 import { readGoalSettings, writeGoalSettings } from '../maker-host/goal-settings-store.js';
 import { readClaudeAccountUsageSnapshot } from '../usage/claudeAccountUsage.js';
 import { readCodexAccountUsageSnapshot } from '../usageBroadcaster.js';
+import { withActiveSessionLifecycleLock } from '../sessionLifecycleLock.js';
 import { GoalController } from './controller';
 import { restoreSessionForGoal } from './sessionRestore.js';
 import { GoalStorage, type GoalDrizzleDb } from './storage';
@@ -50,6 +51,12 @@ export function startGoalController(deps: StartGoalControllerDeps): GoalControll
         maker: deps.maker,
         warn: (message, meta) => logger.warn(message, meta),
       }),
+    withActiveSessionLifecycle: async (id, run) => {
+      const result = await withActiveSessionLifecycleLock(id, run);
+      return result.admitted
+        ? { admitted: true, value: result.value }
+        : { admitted: false };
+    },
     acquirePendingAgentSwitch: acquirePendingAgentSwitchForDirectSend,
     isSessionInTurn,
     stopActiveGoalTurn: stopActiveGoalTurnForClear,

@@ -16,9 +16,12 @@ const h = vi.hoisted(() => ({
   tapWindowBroadcast: vi.fn(),
   webContentsSend: vi.fn(),
   closeSession: vi.fn(),
-  withSendToSessionLock: vi.fn(
-    async (_sessionId: string, task: () => Promise<unknown>) => task(),
-  ),
+  assertSessionRuntimeOwnedLocallyOrUnclaimed: vi.fn(async () => undefined),
+  withSessionLifecycleLocks: vi.fn(async (_sessionIds: string[], task: () => Promise<unknown>) => ({
+    acquired: true as const,
+    value: await task(),
+  })),
+  withSendToSessionLock: vi.fn(async (_sessionId: string, task: () => Promise<unknown>) => task()),
   isSessionStillRemovable: vi.fn(),
   recycleWorktreeForRemovedSession: vi.fn(),
   userDataPath: '',
@@ -38,6 +41,13 @@ vi.mock('../logger', () => ({
   createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
 }));
 vi.mock('../localDb/client/current', () => ({ getDbClient: () => ({ tx: h.tx }) }));
+vi.mock('../sessionRuntimeOwnership.js', () => ({
+  assertSessionRuntimeOwnedLocallyOrUnclaimed: h.assertSessionRuntimeOwnedLocallyOrUnclaimed,
+  getSessionRuntimeOwnerPrefix: () => 'test-runtime-owner',
+}));
+vi.mock('../sessionLifecycleLock.js', () => ({
+  withSessionLifecycleLocks: h.withSessionLifecycleLocks,
+}));
 vi.mock('../localDb/dialogueWorkspace', () => ({ ensureDialogueWorkspaceDir: vi.fn() }));
 vi.mock('../git-context/prRefsStore', () => ({ recomputePrRefsForSession: vi.fn() }));
 vi.mock('../localDb/ipc/recentWorkdirs', () => ({ upsertRecentWorkdir: vi.fn() }));
@@ -51,6 +61,20 @@ vi.mock('../maker-host/index.js', () => ({
 }));
 vi.mock('../maker-ipc/register.js', () => ({
   withSendToSessionLock: h.withSendToSessionLock,
+}));
+vi.mock('../maker-ipc/sessionRouteLock.js', () => ({
+  withSendToSessionLock: h.withSendToSessionLock,
+}));
+vi.mock('../localDb/ipc/sessionLifecycleRuntime.js', () => ({
+  getSessionLifecycleRuntime: () => ({
+    prepareSessionRuntimeForPermanentDeletion: vi.fn(),
+    getMakerIfReady: () => ({ closeSession: h.closeSession }),
+    getGoalController: () => null,
+    isSessionStillRemovable: h.isSessionStillRemovable,
+    recycleWorktreeForRemovedSession: h.recycleWorktreeForRemovedSession,
+    drainPersistQueue: vi.fn(),
+    notifyGhostSessionEvent: vi.fn(),
+  }),
 }));
 vi.mock('../worktree/sessionRemovalRecycle.js', () => ({
   isSessionStillRemovable: h.isSessionStillRemovable,
@@ -74,8 +98,20 @@ afterEach(() => {
 describe('setSessionsStatusInDb', () => {
   it('runs one sessions.setStatus tx and broadcasts per session after commit', async () => {
     h.tx.mockResolvedValueOnce([
-      { sessionId: 's1', title: 'T1', workingDir: '/repo', workspaceKind: 'project', status: 'archived' },
-      { sessionId: 's2', title: 'T2', workingDir: null, workspaceKind: 'dialogue', status: 'archived' },
+      {
+        sessionId: 's1',
+        title: 'T1',
+        workingDir: '/repo',
+        workspaceKind: 'project',
+        status: 'archived',
+      },
+      {
+        sessionId: 's2',
+        title: 'T2',
+        workingDir: null,
+        workspaceKind: 'dialogue',
+        status: 'archived',
+      },
     ]);
 
     const result = await setSessionsStatusInDb(['s1', 's2'], 'archived');
@@ -83,6 +119,7 @@ describe('setSessionsStatusInDb', () => {
     expect(h.tx).toHaveBeenCalledWith('sessions.setStatus', {
       sessionIds: ['s1', 's2'],
       status: 'archived',
+      runtimeOwnerId: 'test-runtime-owner',
     });
     // 提交后逐个广播
     expect(h.tapWindowBroadcast).toHaveBeenCalledTimes(2);
@@ -109,6 +146,21 @@ describe('setSessionsStatusInDb', () => {
     expect(h.webContentsSend).not.toHaveBeenCalled();
   });
 
+  it('maps deleted-session revival rejection without broadcasting a partial batch', async () => {
+    h.tx.mockRejectedValueOnce(
+      Object.assign(new Error('Session 已永久删除，不能恢复: s2'), {
+        code: 'PRECONDITION_FAILED',
+      }),
+    );
+
+    await expect(setSessionsStatusInDb(['s1', 's2'], 'active')).rejects.toThrow(
+      'PRECONDITION_FAILED',
+    );
+
+    expect(h.tapWindowBroadcast).not.toHaveBeenCalled();
+    expect(h.webContentsSend).not.toHaveBeenCalled();
+  });
+
   it('short-circuits empty input without touching the db', async () => {
     const result = await setSessionsStatusInDb([], 'active');
     expect(result).toEqual([]);
@@ -117,7 +169,13 @@ describe('setSessionsStatusInDb', () => {
 
   it('does not schedule recycle when batch restores sessions to active', async () => {
     h.tx.mockResolvedValueOnce([
-      { sessionId: 's1', title: 'T1', workingDir: '/repo', workspaceKind: 'project', status: 'active' },
+      {
+        sessionId: 's1',
+        title: 'T1',
+        workingDir: '/repo',
+        workspaceKind: 'project',
+        status: 'active',
+      },
     ]);
 
     await setSessionsStatusInDb(['s1'], 'active');
@@ -128,7 +186,13 @@ describe('setSessionsStatusInDb', () => {
 
   it('rechecks current status before closing a session from a delayed archive task', async () => {
     h.tx.mockResolvedValueOnce([
-      { sessionId: 's1', title: 'T1', workingDir: '/repo', workspaceKind: 'project', status: 'archived' },
+      {
+        sessionId: 's1',
+        title: 'T1',
+        workingDir: '/repo',
+        workspaceKind: 'project',
+        status: 'archived',
+      },
     ]);
     h.isSessionStillRemovable.mockResolvedValueOnce(false);
 
@@ -144,7 +208,13 @@ describe('setSessionsStatusInDb', () => {
 
   it('serializes archive-driven close with the session route lock', async () => {
     h.tx.mockResolvedValueOnce([
-      { sessionId: 's1', title: 'T1', workingDir: '/repo', workspaceKind: 'project', status: 'archived' },
+      {
+        sessionId: 's1',
+        title: 'T1',
+        workingDir: '/repo',
+        workspaceKind: 'project',
+        status: 'archived',
+      },
     ]);
 
     await setSessionsStatusInDb(['s1'], 'archived');
@@ -161,7 +231,13 @@ describe('setSessionsStatusInDb', () => {
     // renderer 的 WorktreeContext 靠这条推送才能拿到回收后的快照 —— 回收是异步链,
     // 状态 IPC 返回时 store 条目还在,归档动作里那次「顺手 refresh」必然是旧的。
     h.tx.mockResolvedValueOnce([
-      { sessionId: 's1', title: 'T1', workingDir: '/repo', workspaceKind: 'project', status: 'archived' },
+      {
+        sessionId: 's1',
+        title: 'T1',
+        workingDir: '/repo',
+        workspaceKind: 'project',
+        status: 'archived',
+      },
     ]);
     let finishRecycle!: () => void;
     h.recycleWorktreeForRemovedSession.mockImplementationOnce(
@@ -188,9 +264,17 @@ describe('setSessionsStatusInDb', () => {
   it('still broadcasts worktree:changed when the recycle chain fails', async () => {
     // 回收失败/跳过时条目仍在 store 里，重拉拿到「徽标还在」也是真实状态。
     h.tx.mockResolvedValueOnce([
-      { sessionId: 's1', title: 'T1', workingDir: '/repo', workspaceKind: 'project', status: 'archived' },
+      {
+        sessionId: 's1',
+        title: 'T1',
+        workingDir: '/repo',
+        workspaceKind: 'project',
+        status: 'archived',
+      },
     ]);
-    h.recycleWorktreeForRemovedSession.mockRejectedValueOnce(new Error('git worktree remove failed'));
+    h.recycleWorktreeForRemovedSession.mockRejectedValueOnce(
+      new Error('git worktree remove failed'),
+    );
 
     await setSessionsStatusInDb(['s1'], 'archived');
 
@@ -201,7 +285,13 @@ describe('setSessionsStatusInDb', () => {
 
   it('does not broadcast worktree:changed when restoring to active', async () => {
     h.tx.mockResolvedValueOnce([
-      { sessionId: 's1', title: 'T1', workingDir: '/repo', workspaceKind: 'project', status: 'active' },
+      {
+        sessionId: 's1',
+        title: 'T1',
+        workingDir: '/repo',
+        workspaceKind: 'project',
+        status: 'active',
+      },
     ]);
 
     await setSessionsStatusInDb(['s1'], 'active');
@@ -210,13 +300,12 @@ describe('setSessionsStatusInDb', () => {
   });
 
   it('keeps batch archived status wired to worktree recycle scheduling', () => {
-    const source = fs.readFileSync(
-      new URL('../localDb/ipc/sessions.ts', import.meta.url),
-      'utf8',
-    );
+    const source = fs.readFileSync(new URL('../localDb/ipc/sessions.ts', import.meta.url), 'utf8');
     const batchBody = source.match(
       /export async function setSessionsStatusInDb[\s\S]*?return applied\.map/,
     )?.[0];
-    expect(batchBody).toContain('scheduleWorktreeRecycleForStatusChange(item.sessionId, item.status)');
+    expect(batchBody).toContain(
+      'applySessionStatusLifecycle(item.sessionId, item.status, item.workingDir)',
+    );
   });
 });

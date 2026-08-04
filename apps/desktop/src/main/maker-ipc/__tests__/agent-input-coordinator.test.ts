@@ -2558,6 +2558,27 @@ describe('AgentInputCoordinator send transaction', () => {
     expect(h.onUserEnqueue).not.toHaveBeenCalled();
   });
 
+  it('reports whether enqueue inserted so attachment cleanup follows the real commit', async () => {
+    const h = createHarness();
+    const sid = 'enqueue-receipt';
+    h.setRunning(true);
+
+    expect(h.coordinator.isDuplicateEnqueue(sid, 'q-1')).toBe(false);
+    const first = h.coordinator.enqueueWithReceipt(sid, makeItem('q-1', 'first'));
+    expect(first.inserted).toBe(true);
+    expect(h.coordinator.isDuplicateEnqueue(sid, 'q-1')).toBe(true);
+
+    h.onUserEnqueue.mockClear();
+    const duplicate = h.coordinator.enqueueWithReceipt(sid, makeItem('q-1', 'first'));
+    expect(duplicate.inserted).toBe(false);
+    expect(duplicate.projection.pendingQueue.map((item) => item.clientId)).toEqual(['q-1']);
+    expect(h.onUserEnqueue).not.toHaveBeenCalled();
+
+    const second = h.coordinator.enqueueWithReceipt(sid, makeItem('q-2', 'second'));
+    expect(second.inserted).toBe(true);
+    expect(second.projection.pendingQueue.map((item) => item.clientId)).toEqual(['q-1', 'q-2']);
+  });
+
   it('does not signal a UI retry when there is nothing to recover', async () => {
     const h = createHarness();
     await h.coordinator.retryLastError('retry-signal-noop');

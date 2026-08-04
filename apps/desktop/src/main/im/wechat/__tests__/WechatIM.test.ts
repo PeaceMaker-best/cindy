@@ -12,6 +12,11 @@ import { __testing, sessionIdFor, WechatIM, type WechatIMDeps } from '../WechatI
 
 const mediaMocks = vi.hoisted(() => ({
   removeReleasedWechatFiles: vi.fn(async () => undefined),
+  readOutboundWechatFile: vi.fn(async (_absPath: string, displayName?: string) => ({
+    bytes: new Uint8Array([1, 2, 3]),
+    fileName: displayName ?? 'legacy-hash.png',
+    kind: 'image' as const,
+  })),
 }));
 
 vi.mock('../mediaStaging', async (importOriginal) => {
@@ -19,12 +24,14 @@ vi.mock('../mediaStaging', async (importOriginal) => {
   return {
     ...actual,
     removeReleasedWechatFiles: mediaMocks.removeReleasedWechatFiles,
+    readOutboundWechatFile: mediaMocks.readOutboundWechatFile,
   };
 });
 
 describe('WechatIM host boundary', () => {
   beforeEach(() => {
     mediaMocks.removeReleasedWechatFiles.mockClear();
+    mediaMocks.readOutboundWechatFile.mockClear();
   });
 
   it('derives a stable session id without exposing either platform identifier', () => {
@@ -104,6 +111,29 @@ describe('WechatIM host boundary', () => {
         new WechatIlinkError('NETWORK_ERROR', 'temporary network failure', true),
       ),
     ).toEqual({ code: 'NETWORK_ERROR', retryable: true });
+  });
+
+  it('keeps legacy pending outbox media deliverable after upgrading', async () => {
+    const absPath = pathForCurrentPlatform('legacy-hash.png');
+    const parsed = __testing.parseOutboxMedia(
+      JSON.stringify([{ absPath, clientId: 'legacy-client' }]),
+    );
+
+    expect(parsed).toEqual([{ absPath, clientId: 'legacy-client' }]);
+    await __testing.readOutboxMedia(parsed[0]!);
+    expect(mediaMocks.readOutboundWechatFile).toHaveBeenCalledWith(absPath, undefined);
+  });
+
+  it('uploads new outbox media with its persisted original filename', async () => {
+    const absPath = pathForCurrentPlatform('content-hash.png');
+    const parsed = __testing.parseOutboxMedia(
+      JSON.stringify([
+        { absPath, fileName: '原始报告.png', clientId: 'new-client' },
+      ]),
+    );
+
+    await __testing.readOutboxMedia(parsed[0]!);
+    expect(mediaMocks.readOutboundWechatFile).toHaveBeenCalledWith(absPath, '原始报告.png');
   });
 
   it('stops every active peer before an epoch can finish shutting down', async () => {
@@ -367,6 +397,10 @@ function deps(overrides: Partial<WechatIMDeps> & { host?: IMHost } = {}): Wechat
     isCompatibilityDisabled: overrides.isCompatibilityDisabled ?? (() => false),
     now: overrides.now ?? (() => 100),
   };
+}
+
+function pathForCurrentPlatform(fileName: string): string {
+  return process.platform === 'win32' ? `C:\\cindy-media\\${fileName}` : `/cindy-media/${fileName}`;
 }
 
 function host(

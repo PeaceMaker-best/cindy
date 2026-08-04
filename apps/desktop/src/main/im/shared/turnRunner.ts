@@ -87,6 +87,7 @@ import {
   noteSilentStopUserSend,
   noteSilentStopSessionReset,
   onSilentStopSettled,
+  withSendToSessionLock,
 } from '../../maker-ipc/register';
 import {
   beginInteractionRoute,
@@ -407,6 +408,10 @@ export interface ImTurnRunner {
 export interface ImTurnRunnerDeps {
   /** 锁住 session 并落实 deferred switch；IM 在刷新 live session + send 后 release。 */
   acquirePendingAgentSwitch?: (sessionId: string) => Promise<() => void>;
+  withActiveSessionLifecycle?<T>(
+    sessionId: string,
+    run: () => Promise<T>,
+  ): Promise<{ admitted: false; reason: string } | { admitted: true; value: T }>;
 }
 
 export function createTurnRunner(
@@ -428,6 +433,12 @@ export function createTurnRunner(
   const CARD_PATCH_THROTTLE_MS = 1500;
 
   const log = createLogger(`im:${channel}:turn`);
+  const withActiveSessionLifecycle =
+    deps.withActiveSessionLifecycle ??
+    (async <T>(_sessionId: string, run: () => Promise<T>) => ({
+      admitted: true as const,
+      value: await run(),
+    }));
 
   const sessionStates = new Map<string /* localSessionId */, SessionState>();
   /** In-flight `ensureSessionWired` promises (keyed by sessionId). Prevents the
@@ -489,15 +500,18 @@ export function createTurnRunner(
     userId: string,
     scopeKey?: string,
   ): Promise<RouteTarget | null> {
-    // 优先查 binding 是否命中 — bindingStore.get 走进程内 Map, 同步且 O(1)。
+    // 优先查 binding 是否命中。每条入站消息先与 SQLite 真相对齐，避免共享
+    // userData 的另一个 Cindy 进程更新 binding 后仍按旧内存快照路由。
     // threadScoped 渠道的 binding 按 (identity, scopeKey) 维度存(多重接管)。
-    const targetSessionId = bindingStore.get({
+    const identity = {
       channel,
       botContextId,
       userId,
       ...(scopeKey ? { scopeKey } : {}),
-    });
-    if (targetSessionId) {
+    };
+    for (;;) {
+      const targetSessionId = await bindingStore.refreshFromPersistence(identity);
+      if (!targetSessionId) break;
       // 接管模式: 拉 desktop session 的 row 信息构造 ImSessionRow shape
       const db = getDbClient().drizzle;
       const rows = await db
@@ -506,7 +520,10 @@ export function createTurnRunner(
         .where(eq(sessionsTable.id, targetSessionId))
         .limit(1);
       const row = rows[0];
-      if (row?.workingDir) {
+      if (row?.status === 'active' && row.workingDir) {
+        // DB 查询期间 binding 可能已经切到另一任务；把路由决策线性化在
+        // 这次同步复核上，旧快照不能继续承接本条消息。
+        if ((await bindingStore.refreshFromPersistence(identity)) !== targetSessionId) continue;
         return {
           row: {
             id: row.id,
@@ -523,18 +540,15 @@ export function createTurnRunner(
           scopeKey,
         };
       }
-      // Binding 命中但 row 缺失 / workingDir 空 — 数据异常, fallback 到默认并清掉
-      // 该 binding 避免反复异常 (FK CASCADE 应该已经处理 session 删除场景, 这里
-      // 兜底处理 workingDir 缺失等怪状态)。
+      // 归档/软删除不会触发 FK cascade；缺行 / 空 workingDir 也属于不可路由的
+      // 陈旧 binding。按 expected target 做 CAS detach，避免查询期间用户已切到
+      // 新任务时把新 binding 一并删掉。CAS 未命中则按最新 binding 重新解析。
       log.warn(
-        `binding hit but target session=...${targetSessionId.slice(-8)} missing/invalid — auto-detaching`,
+        `binding hit but target session=...${targetSessionId.slice(-8)} ` +
+          `${row?.status ?? 'missing/invalid'} — auto-detaching`,
       );
-      void bindingStore.detach({
-        channel,
-        botContextId,
-        userId,
-        ...(scopeKey ? { scopeKey } : {}),
-      });
+      if ((await bindingStore.refreshFromPersistence(identity)) !== targetSessionId) continue;
+      await bindingStore.detachIfTarget(identity, targetSessionId);
     }
     // 未接管: 走渠道默认 session 路径(threadScoped 渠道按 scopeKey 一 thread
     // 一 session — 顶层消息的 own ts 必然查不到既有行, 自然落到新建)
@@ -593,6 +607,9 @@ export function createTurnRunner(
         return { kind: 'rejected', reason: 'missing_auth' };
       }
     }
+    const admitted = await withActiveSessionLifecycle(
+      row.id,
+      async (): Promise<ImTurnDispatch> => {
     // onRouteResolved 必须在鉴权通过之后才算"路由解析成功" —— 群窗口游标的
     // commit 挂在它上面, 鉴权失败被拒的消息若先触发它, 这批群上下文会被游标
     // 永久跳过(prepareAgentTurnText 的契约: 路由失败不推进游标)。
@@ -702,14 +719,16 @@ export function createTurnRunner(
         void operation();
       });
     if (target.attached && text.trim().length > 0) {
-      startBackgroundTask(() =>
-        maybeGenerateFbotTitleOnFirstMessage(row.id, text, {
-          botContextId,
-          userId,
-          scopeKey: target.scopeKey,
-          workingDir: row.workingDir,
-        }),
-      );
+      startBackgroundTask(async () => {
+        await withActiveSessionLifecycle(row.id, () =>
+          maybeGenerateFbotTitleOnFirstMessage(row.id, text, {
+            botContextId,
+            userId,
+            scopeKey: target.scopeKey,
+            workingDir: row.workingDir,
+          }),
+        );
+      });
     } else if (
       text.trim().length > 0 &&
       (adapter.threadScoped
@@ -721,14 +740,16 @@ export function createTurnRunner(
       // 非 threadScoped 渠道(feishu/discord, 一 (bot,user) 一行长期复用):
       // 每条"新对话"的首条消息重新起名 —— sdkSessionId == null 即新上下文
       // (首次建行 / /new 重置后), 标题跟随当前话题而不是永远停在第一次。
-      startBackgroundTask(() => maybeGenerateImSessionTitle(row.id, text, threadHeaderCardId));
+      startBackgroundTask(async () => {
+        await withActiveSessionLifecycle(row.id, () =>
+          maybeGenerateImSessionTitle(row.id, text, threadHeaderCardId),
+        );
+      });
     }
 
     const turnPermissionPolicy =
-      args.turnPermissionPolicyForRoute?.(
-        row,
-        getMaker().getCapabilities(row.agentKind),
-      ) ?? args.turnPermissionPolicy;
+      args.turnPermissionPolicyForRoute?.(row, getMaker().getCapabilities(row.agentKind)) ??
+      args.turnPermissionPolicy;
     const item: QueuedSend = {
       turn,
       userMessage: buildImUserMessage(args.agentText ?? text, attachments, target.attached),
@@ -766,7 +787,7 @@ export function createTurnRunner(
       return { kind: 'busy', reason: 'queued_internally' };
     }
 
-    const dispatch = await dispatchQueuedSend(state, userId, item);
+    const dispatch = await dispatchQueuedSendAdmitted(state, userId, item);
     if (dispatch.kind !== 'accepted') return dispatch;
     return {
       kind: 'accepted',
@@ -774,6 +795,12 @@ export function createTurnRunner(
       acceptedAt: dispatch.acceptedAt,
       terminal: turn.terminalPromise,
     };
+      },
+    );
+    if (!admitted.admitted) {
+      return { kind: 'rejected', reason: `session_${admitted.reason}` };
+    }
+    return admitted.value;
   }
 
   /**
@@ -792,6 +819,41 @@ export function createTurnRunner(
    * 退回队首, 等下一个 done/error 或 retry timer 再派发, 不报错。
    */
   async function dispatchQueuedSend(
+    state: SessionState,
+    userId: string,
+    item: QueuedSend,
+  ): Promise<
+    { kind: 'accepted'; acceptedAt: number } | { kind: 'busy' | 'rejected'; reason: string }
+  > {
+    const admitted = await withActiveSessionLifecycle(item.rowId, () =>
+      dispatchQueuedSendAdmitted(state, userId, item),
+    );
+    if (!admitted.admitted) {
+      await settleInactiveQueuedSend(state, item);
+      return { kind: 'rejected', reason: `session_${admitted.reason}` };
+    }
+    return admitted.value;
+  }
+
+  async function dispatchQueuedSendAdmitted(
+    state: SessionState,
+    userId: string,
+    item: QueuedSend,
+  ): Promise<
+    { kind: 'accepted'; acceptedAt: number } | { kind: 'busy' | 'rejected'; reason: string }
+  > {
+    // Production injects acquirePendingAgentSwitchForDirectSend, which owns the
+    // same send/route lease through switch apply, live-session refresh, and send.
+    // Only the dependency-free test/fallback path needs to acquire it here.
+    if (deps.acquirePendingAgentSwitch) {
+      return dispatchQueuedSendUnlocked(state, userId, item);
+    }
+    return withSendToSessionLock(item.rowId, () =>
+      dispatchQueuedSendUnlocked(state, userId, item),
+    );
+  }
+
+  async function dispatchQueuedSendUnlocked(
     state: SessionState,
     userId: string,
     item: QueuedSend,
@@ -1083,6 +1145,21 @@ export function createTurnRunner(
     }, DISPATCH_RETRY_MS);
   }
 
+  async function settleInactiveQueuedSend(state: SessionState, item: QueuedSend): Promise<void> {
+    if (state.dispatchRetryTimer) {
+      clearTimeout(state.dispatchRetryTimer);
+      state.dispatchRetryTimer = null;
+    }
+    const activeIndex = state.queue.indexOf(item.turn);
+    if (activeIndex >= 0) state.queue.splice(activeIndex, 1);
+    await completeTurnCallbackAfterAck(item.turn);
+    const pending = state.sendQueue.splice(0, state.sendQueue.length);
+    for (const queued of pending) {
+      await completeTurnCallbackAfterAck(queued.turn);
+    }
+    finishDeferredDetachIfIdle(state);
+  }
+
   /** 入队提示 — 每条消息只发一次(竞态 requeue 不重复提示)。失败 swallow。 */
   async function notifyQueuedPosition(
     userId: string,
@@ -1103,7 +1180,10 @@ export function createTurnRunner(
 
   // ── per-session wiring (idempotent) ─────────────────────────────────────────
 
-  async function ensureSessionWired(target: RouteTarget, userId: string): Promise<SessionState> {
+  async function ensureSessionWiredUnlocked(
+    target: RouteTarget,
+    userId: string,
+  ): Promise<SessionState> {
     const existing = sessionStates.get(target.row.id);
     if (existing) {
       if (existing.detachDrainPromise) {
@@ -1111,7 +1191,7 @@ export function createTurnRunner(
         if (outcome === 'cancelled') {
           throw new Error(`session wiring cancelled during cleanup: ${target.row.id}`);
         }
-        return ensureSessionWired(target, userId);
+        return ensureSessionWiredUnlocked(target, userId);
       }
       return existing;
     }
@@ -1127,6 +1207,12 @@ export function createTurnRunner(
     })();
     wiringInFlight.set(target.row.id, promise);
     return promise;
+  }
+
+  async function ensureSessionWired(target: RouteTarget, userId: string): Promise<SessionState> {
+    return withSendToSessionLock(target.row.id, () =>
+      ensureSessionWiredUnlocked(target, userId),
+    );
   }
 
   /**
@@ -1149,7 +1235,7 @@ export function createTurnRunner(
     const target = await resolveExistingRouteTarget(botContextId, userId, scopeKey);
     if (!target) return;
     if (!target.attached) return;
-    await ensureSessionWired(target, userId);
+    await withActiveSessionLifecycle(target.row.id, () => ensureSessionWired(target, userId));
   }
 
   async function replyMissingAuth(
@@ -2106,10 +2192,7 @@ export function createTurnRunner(
     if (failure.turn.queueMode === 'internal') {
       try {
         const message = `❌ 启动 agent 失败：${failure.reason}`;
-        if (
-          output.kind === 'chunked-text' &&
-          failure.turn.chunkedReplyBegun
-        ) {
+        if (output.kind === 'chunked-text' && failure.turn.chunkedReplyBegun) {
           await output.commitFinal({
             userId,
             text: message,

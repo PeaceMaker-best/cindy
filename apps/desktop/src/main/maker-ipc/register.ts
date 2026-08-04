@@ -200,6 +200,13 @@ import {
 import { messages, orcaTeams, orcaWorkers, sessions } from '../localDb/schema.js';
 import { t } from '../i18n.js';
 import { createLogger } from '../logger.js';
+import { withSessionLifecycleLock } from '../sessionLifecycleLock.js';
+import {
+  acquireSendToSessionLock,
+  sendToSessionLocks,
+  withSendToSessionLock,
+  withSessionRouteLock,
+} from './sessionRouteLock.js';
 import { desktopClaudeAuthAdapter, desktopCodexAuthAdapter, readClaudeApiKey } from '../maker-host/auth-adapters.js';
 import { prepareSharedProjectSkillLinks } from '../maker-host/shared-global-skills.js';
 import { setRemoteCodexLiveTurnChecker, setRemoteSessionStartEnsure, getRemoteCcTurnSettledHandler, getRemoteCcStaleQuery } from '../maker-host/remote-session-start-ensure.js';
@@ -403,7 +410,7 @@ import { registerMakerMessageDeleteHandler } from './messageDeleteHandler.js';
 import {
   normalizeUserMessage,
   materializeDirectSendOssAttachments,
-  materializeQueuedOssAttachments,
+  stageQueuedOssAttachments,
 } from './normalizeAttachments.js';
 import { AGENT_ISLAND_DISPLAY_CONFIG } from '../agent-island/displayConfig.js';
 import {
@@ -607,6 +614,7 @@ import {
   scheduleSessionAutoTitle,
 } from './sessionAutoTitle.js';
 import {
+  runScheduledSilentStopAutoResume,
   SILENT_STOP_RESUME_PROMPT,
   SilentStopAutoResumeGuard,
 } from './silentStopAutoResume.js';
@@ -2078,49 +2086,36 @@ const pendingFailedTurnAssistantPersistId = new Map<string, string>();
  * Session.getStatus() 的 lifecycle (active/closed)，也不同于 terminal 后短暂保留的
  * background-throttling keepalive。
  */
-const sendToSessionLocks = new Map<string, Promise<unknown>>();
+export { acquireSendToSessionLock, withSendToSessionLock, withSessionRouteLock } from './sessionRouteLock.js';
 
-/**
- * Acquire the per-session send/route lock until the returned release callback runs.
- *
- * Direct-send callers need this lease form because applying a deferred agent switch,
- * refreshing the resulting live Session, and calling Session.send happen in different
- * modules but must remain one atomic route decision.
- */
-async function acquireSendToSessionLock(sessionId: string): Promise<() => void> {
-  const previous = sendToSessionLocks.get(sessionId);
-  const waitPrevious = previous ? previous.catch(() => undefined) : Promise.resolve();
-  let releaseGate!: () => void;
-  const gate = new Promise<void>((resolve) => {
-    releaseGate = resolve;
-  });
-  const run = waitPrevious.then(() => gate);
-  const tracked = run.finally(() => {
-    if (sendToSessionLocks.get(sessionId) === tracked) {
-      sendToSessionLocks.delete(sessionId);
-    }
-  });
-  sendToSessionLocks.set(sessionId, tracked);
-  await waitPrevious;
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    releaseGate();
-  };
-}
+export type ActiveSessionRouteResult<T> =
+  | { admitted: true; value: T }
+  | { admitted: false; status: 'missing' | 'archived' | 'deleted' };
 
-/** Serialize every local send / runtime release / route mutation for one session. */
-export async function withSendToSessionLock<T>(
+/** Admit one producer only while the persisted generation is still active. */
+export async function withActiveSessionRouteLock<T>(
   sessionId: string,
   task: () => Promise<T>,
-): Promise<T> {
-  const release = await acquireSendToSessionLock(sessionId);
-  try {
-    return await task();
-  } finally {
-    release();
-  }
+): Promise<ActiveSessionRouteResult<T>> {
+  return withSessionRouteLock(sessionId, async () => {
+    const row = await getDbClient().queryOne<{ status: string }>(
+      'SELECT status FROM sessions WHERE id = ? LIMIT 1',
+      [sessionId],
+    );
+    if (!row) return { admitted: false, status: 'missing' };
+    if (row.status === 'deleted') return { admitted: false, status: 'deleted' };
+    if (row.status !== 'active') return { admitted: false, status: 'archived' };
+    return { admitted: true, value: await task() };
+  });
+}
+
+function throwInactiveSessionRoute(
+  sessionId: string,
+  status: Exclude<ActiveSessionRouteResult<never>, { admitted: true }>['status'],
+): never {
+  if (status === 'missing') throwIpcError('NOT_FOUND', `Session ${sessionId} does not exist`);
+  if (status === 'deleted') throwIpcError('PRECONDITION_FAILED', `Session ${sessionId} is deleted`);
+  throwIpcError('PRECONDITION_FAILED', `Session ${sessionId} is archived`);
 }
 
 let agentInputCoordinatorHolder: AgentInputCoordinator | null = null;
@@ -2161,7 +2156,7 @@ function settlePendingCredentialSwitch(sessionId: string, source: string): void 
 let refreshRemoteCodexMcpOnTurnSettledHolder: ((sessionId: string) => void) | null = null;
 let deferredCodexRestartHolder: DeferredCodexRestartService | null = null;
 let pendingAgentSwitchApplyHolder:
-  ((sessionId: string, signal?: AbortSignal) => Promise<() => void>) | null = null;
+  ((sessionId: string, signal?: AbortSignal) => Promise<void>) | null = null;
 let cancelPendingAgentSwitchHolder: ((sessionId: string) => void) | null = null;
 let gitSnapshotCoordinator: GitSnapshotCoordinator | null = null;
 const sessionTurnActivityTracker = new SessionTurnActivityTracker();
@@ -2282,15 +2277,22 @@ export function clearDeferredCodexRestartForOwnerBoundary(): void {
  * Goal / IM / scheduler 直发 `Session.send()` 的 deferred agent-switch 锁桥。
  *
  * 与 renderer 的 makerSendTransaction 不同,这些调用方没有后续 lazy-create 阶段;
- * holder 因此先在 session 锁内同步 bootstrap 新引擎,调用方重新读取 live session
- * 并完成 send 后才 release。启动期 holder 尚未就绪时不可能已有进程内 pending
- * intent,返回 no-op release 即可。
+ * 本入口先取得 session 锁,再让 holder 同步 bootstrap 新引擎;调用方重新读取 live
+ * session 并完成 send 后才 release。启动期 holder 尚未就绪时仍保留锁保护,
+ * 让直发与删除 finalizer 继续互斥。
  */
 export async function acquirePendingAgentSwitchForDirectSend(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<() => void> {
-  return pendingAgentSwitchApplyHolder?.(sessionId, signal) ?? (() => {});
+  const release = await acquireSendToSessionLock(sessionId);
+  try {
+    await pendingAgentSwitchApplyHolder?.(sessionId, signal);
+    return release;
+  } catch (err) {
+    release();
+    throw err;
+  }
 }
 
 /** Later successful model/provider picks supersede an earlier cross-engine intent. */
@@ -2366,6 +2368,36 @@ export function clearPendingCredentialSwitchForSession(
   if (opts?.wake !== false) {
     agentInputCoordinatorHolder?.wakeSession(sessionId, 'pending-credential-switch-cancelled');
   }
+}
+
+/**
+ * Seal every in-process producer that could otherwise recreate or send on a
+ * permanently deleted session after its Maker runtime closes.
+ */
+export async function prepareSessionRuntimeForPermanentDeletion(
+  sessionId: string,
+): Promise<() => Promise<void>> {
+  resetAutomaticRecoveryForExplicitStop(sessionId);
+  cancelPendingAgentSwitchHolder?.(sessionId);
+  pendingCredentialSwitchHolder?.clear(sessionId);
+  agentHandoffPending.sealClearBoundary(sessionId);
+  agentInputCoordinatorHolder?.sealSession(sessionId);
+  let rolledBack = false;
+  const rollback = async (): Promise<void> => {
+    if (rolledBack) return;
+    rolledBack = true;
+    agentInputCoordinatorHolder?.unsealSession(sessionId);
+    agentHandoffPending.clear(sessionId);
+  };
+  // Coordinator persistence is per-session chained. Awaiting one final empty
+  // write guarantees no earlier snapshot can land after durable deletion prep.
+  try {
+    await saveAgentInputQueueSnapshot(sessionId, []);
+  } catch (error) {
+    await rollback();
+    throw error;
+  }
+  return rollback;
 }
 
 export function wakeSessionInputAfterCredentialSwitch(sessionId: string): void {
@@ -3235,7 +3267,17 @@ export function wireSessionToIpc(session: ReturnType<Maker['getSession']>): void
         const silentStopDoneAt = Date.now();
         const silentStopTurnOrigin = event.turnOrigin;
         setTimeout(() => {
-          void handleSilentStopTurnEnd(session, silentStopDoneAt, silentStopTurnOrigin);
+          void runScheduledSilentStopAutoResume(session, {
+            withActiveRoute: withActiveSessionRouteLock,
+            getCurrentSession: (sessionId) => getMaker().getSession(sessionId),
+            handle: (current) =>
+              handleSilentStopTurnEnd(current, silentStopDoneAt, silentStopTurnOrigin),
+          }).catch((err) => {
+            log.warn('silent-stop auto-resume lifecycle check failed', {
+              sessionId: session.id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
         }, 1_500);
       }
     }
@@ -5464,44 +5506,57 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     teamId: string;
     leadSessionId: string;
     sessionId: string;
-  }): Promise<boolean> {
-    const live = maker.getSession(target.sessionId);
-    if (live) return false;
+  }, onReady?: () => Promise<void>): Promise<{ available: boolean; resumed: boolean }> {
+    const routed = await withActiveSessionRouteLock(target.sessionId, async () => {
+      const live = maker.getSession(target.sessionId);
+      if (live) {
+        await onReady?.();
+        return false;
+      }
 
-    const db = getDbClient().drizzle;
-    const [row] = await db.select().from(sessions).where(eq(sessions.id, target.sessionId)).limit(1);
-    if (!row) return false;
+      const db = getDbClient().drizzle;
+      const [row] = await db
+        .select()
+        .from(sessions)
+        .where(eq(sessions.id, target.sessionId))
+        .limit(1);
+      if (!row || row.status !== 'active') return false;
 
-    const workerVendorOptions = {
-      orcaRole: 'worker' as const,
-      orcaWorkflowId: target.teamId,
-      orcaLeadSessionId: target.leadSessionId,
-      orcaWorkerId: target.id,
-      orcaWorkerSessionId: target.sessionId,
-    };
-    const extraDirs = await readSessionExtraDirsFromDb(target.sessionId);
-    const opts = buildCreateOptsWithStderr({
-      id: row.id,
-      agentKind: dbToMakerAgentKind(row.agentKind),
-      workingDir: row.workingDir ?? '',
-      model: row.model,
-      effort: row.effort as CreateOpts['effort'],
-      fastMode: !!row.fastMode,
-      permissionMode: row.permissionMode as CreateOpts['permissionMode'],
-      title: row.title,
-      resumeSessionId: row.sdkSessionId ?? undefined,
-      orcaRole: row.orcaRole as 'worker' | null,
-      vendorOptions: workerVendorOptions,
-      // 远端 worker 唤醒必须带上 remoteHostId 并走 ensure (SSH 重连 / agent
-      // 安装 / codex daemon MCP 注入), 否则会以远端 workingDir 在本机 spawn,
-      // 且远端 daemon 的协同 MCP 通道不就绪。
-      remoteHostId: row.remoteHostId ?? undefined,
-      ...(extraDirs.length > 0 ? { extraDirs } : {}),
+      const workerVendorOptions = {
+        orcaRole: 'worker' as const,
+        orcaWorkflowId: target.teamId,
+        orcaLeadSessionId: target.leadSessionId,
+        orcaWorkerId: target.id,
+        orcaWorkerSessionId: target.sessionId,
+      };
+      const extraDirs = await readSessionExtraDirsFromDb(target.sessionId);
+      const opts = buildCreateOptsWithStderr({
+        id: row.id,
+        agentKind: dbToMakerAgentKind(row.agentKind),
+        workingDir: row.workingDir ?? '',
+        model: row.model,
+        effort: row.effort as CreateOpts['effort'],
+        fastMode: !!row.fastMode,
+        permissionMode: row.permissionMode as CreateOpts['permissionMode'],
+        title: row.title,
+        resumeSessionId: row.sdkSessionId ?? undefined,
+        orcaRole: row.orcaRole as 'worker' | null,
+        vendorOptions: workerVendorOptions,
+        // 远端 worker 唤醒必须带上 remoteHostId 并走 ensure (SSH 重连 / agent
+        // 安装 / codex daemon MCP 注入), 否则会以远端 workingDir 在本机 spawn,
+        // 且远端 daemon 的协同 MCP 通道不就绪。
+        remoteHostId: row.remoteHostId ?? undefined,
+        ...(extraDirs.length > 0 ? { extraDirs } : {}),
+      });
+      await ensureRemoteReadyForSessionStart({ createOpts: opts });
+      const { session: resumedSession } = await bootstrapSession(opts);
+      await markOrcaRoleIfNeeded(resumedSession.id, 'worker');
+      await onReady?.();
+      return true;
     });
-    await ensureRemoteReadyForSessionStart({ createOpts: opts });
-    const { session: resumedSession } = await bootstrapSession(opts);
-    await markOrcaRoleIfNeeded(resumedSession.id, 'worker');
-    return true;
+    return routed.admitted
+      ? { available: true, resumed: routed.value }
+      : { available: false, resumed: false };
   }
 
   // sessionId → remoteHostId 的进程内缓存 reader(lazy resume 路径每次 send 都
@@ -5774,7 +5829,20 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       allocateDialogueWorkspace: ensureDialogueWorkspaceDir,
       createSessionId: createId,
       now: Date.now,
-      withSessionLock: withSendToSessionLock,
+      withSessionLock: (sessionId, task) =>
+        withSessionRouteLock(sessionId, async () => {
+          const row = await getDbClient().queryOne<{ status: string }>(
+            'SELECT status FROM sessions WHERE id = ? LIMIT 1',
+            [sessionId],
+          );
+          if (row && row.status !== 'active') {
+            throwIpcError(
+              'PRECONDITION_FAILED',
+              `Session ${sessionId} is ${row.status} and cannot be created in place`,
+            );
+          }
+          return task();
+        }),
       sendWorkerReadyMessage: (session) => {
         // Orca worker 首次创建时发一条初始化消息，强制 codex 写 rollout 文件，
         // 避免 app 重启后 thread/resume 因 rollout 缺失而失败。
@@ -6013,17 +6081,10 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     log,
   });
   pendingAgentSwitchApplyHolder = async (sessionId, signal) => {
-    const release = await acquireSendToSessionLock(sessionId);
-    try {
-      await applyPendingAgentSwitchIfIdle(agentSwitchDeps, sessionId, {
-        bootstrapAfterSwitch: true,
-        signal,
-      });
-      return release;
-    } catch (err) {
-      release();
-      throw err;
-    }
+    await applyPendingAgentSwitchIfIdle(agentSwitchDeps, sessionId, {
+      bootstrapAfterSwitch: true,
+      signal,
+    });
   };
 
   ipcMain.handle(MAKER_INVOKE.MARK_ORCA_ROLE, async (_e, sessionId: unknown, role: unknown) => {
@@ -6427,9 +6488,10 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       }
     }
 
-    const prev = sendToSessionLocks.get(targetSessionId);
-    const waitPrev = prev ? prev.catch(() => undefined) : Promise.resolve();
-    const run = waitPrev.then(async () => {
+    const lifecycleRoute = await withSessionLifecycleLock(targetSessionId, async () => {
+      const prev = sendToSessionLocks.get(targetSessionId);
+      const waitPrev = prev ? prev.catch(() => undefined) : Promise.resolve();
+      const run = waitPrev.then(async () => {
       const [meta, dbRow] = await Promise.all([
         maker.getSessionMeta(targetSessionId).catch(() => null),
         getSessionRowSnapshot(targetSessionId),
@@ -6750,13 +6812,22 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       }
     });
 
-    const tracked = run.finally(() => {
-      if (sendToSessionLocks.get(targetSessionId) === tracked) {
-        sendToSessionLocks.delete(targetSessionId);
-      }
+      const tracked = run.finally(() => {
+        if (sendToSessionLocks.get(targetSessionId) === tracked) {
+          sendToSessionLocks.delete(targetSessionId);
+        }
+      });
+      sendToSessionLocks.set(targetSessionId, tracked);
+      return tracked;
     });
-    sendToSessionLocks.set(targetSessionId, tracked);
-    return tracked;
+    if (!lifecycleRoute.acquired) {
+      return {
+        ok: false,
+        errorCode: 'BUSY',
+        message: `session ${targetSessionId} lifecycle is busy`,
+      };
+    }
+    return lifecycleRoute.value;
   }
 
   // Ghost 的 Agent 槽只负责验证权限和整理 prompt；真正的新回合仍走
@@ -7105,15 +7176,13 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     getSessionRowSnapshot,
     getLiveSession: (sessionId) => maker.getSession(sessionId),
     shouldQueueNewTurn: (sessionId): boolean => inputCoordinator.shouldQueueNewTurn(sessionId),
-    hasSendToSessionLock: (sessionId) => sendToSessionLocks.has(sessionId),
+    withSessionLock: withSessionRouteLock,
     buildCreateOptsForQueuedSession,
-    enqueueQueuedMessage: (sessionId, item) => {
+    enqueueQueuedMessage: async (sessionId, item) => {
       // 先 await 恢复再 enqueue:确保恢复的排队 prompt 在新消息之前,且恢复后
       // 队列处于 paused 态不会被新消息的 getDrainableHead 立刻 drain。
-      void (async () => {
-        await inputCoordinator.ensureQueueRestored(sessionId).catch(() => undefined);
-        inputCoordinator.enqueue(sessionId, item);
-      })();
+      await inputCoordinator.ensureQueueRestored(sessionId).catch(() => undefined);
+      inputCoordinator.enqueue(sessionId, item);
     },
     sendToSessionInternal,
     createDbMessage,
@@ -7329,21 +7398,31 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     const target = findFocusTargetWorker(workers, b.workerIdOrLabel);
     if (!target) throwIpcError('WORKER_NOT_FOUND', `no worker matching "${b.workerIdOrLabel}"`);
 
-    // focused 切换: clear 旧 + set 新, 原子化 (review F4)
-    await setWorkerFocus(target.teamId, target.id);
-
     // idle worker → resume session (so it's ready for tasks), but don't set status
     // to 'running' — that only happens when actual work is dispatched via sendToWorker.
     if (target.status === 'idle') {
       try {
-        const didResume = await resumeOrcaWorkerSessionIfMissing(target);
-        if (didResume) {
+        const resume = await resumeOrcaWorkerSessionIfMissing(target, () =>
+          setWorkerFocus(target.teamId, target.id),
+        );
+        if (!resume.available) {
+          throwIpcError('PRECONDITION_FAILED', `worker session ${target.sessionId} is inactive`);
+        }
+        if (resume.resumed) {
           log.info('switchFocus: resumed idle worker (session only, no status change)', { workerId: target.id, sessionId: target.sessionId });
         }
       } catch (err) {
         log.warn('switchFocus: resume failed', {
           workerId: target.id, err: err instanceof Error ? err.message : String(err),
         });
+        throw err;
+      }
+    } else {
+      const focused = await withActiveSessionRouteLock(target.sessionId, () =>
+        setWorkerFocus(target.teamId, target.id),
+      );
+      if (!focused.admitted) {
+        throwIpcError('PRECONDITION_FAILED', `worker session ${target.sessionId} is inactive`);
       }
     }
 
@@ -7882,14 +7961,24 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         const target = findFocusTargetWorker(workers, workerIdOrLabel);
         if (!target) return { ok: false, errorCode: 'WORKER_NOT_FOUND', message: `no worker matching "${workerIdOrLabel}"` };
 
-        await setWorkerFocus(target.teamId, target.id);
-
         // Resume closed session so it's ready to receive tasks, but DON'T change
         // worker status — status only transitions to 'running' when actual work is
         // dispatched (sendToWorker). Setting 'running' here without a task causes
         // the icon to flash indefinitely (no turn → turn-done never fires).
         if (target.status === 'idle') {
-          await resumeOrcaWorkerSessionIfMissing(target);
+          const resume = await resumeOrcaWorkerSessionIfMissing(target, () =>
+            setWorkerFocus(target.teamId, target.id),
+          );
+          if (!resume.available) {
+            throw new Error(`worker session ${target.sessionId} is inactive`);
+          }
+        } else {
+          const focused = await withActiveSessionRouteLock(target.sessionId, () =>
+            setWorkerFocus(target.teamId, target.id),
+          );
+          if (!focused.admitted) {
+            throw new Error(`worker session ${target.sessionId} is inactive`);
+          }
         }
         broadcastToAllWindows(MAKER_PUSH.ORCA_WORKER_CHANGED, { leadSessionId });
         return { ok: true, workerId: target.id };
@@ -8090,7 +8179,11 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
   const sendToAgentAccepted: typeof sendToAgentAcceptedUnlocked = async (...args) => {
     const [sessionId] = args;
     if (typeof sessionId !== 'string') return await sendToAgentAcceptedUnlocked(...args);
-    return await withSendToSessionLock(sessionId, () => sendToAgentAcceptedUnlocked(...args));
+    const routed = await withActiveSessionRouteLock(sessionId, () =>
+      sendToAgentAcceptedUnlocked(...args),
+    );
+    if (!routed.admitted) return throwInactiveSessionRoute(sessionId, routed.status);
+    return routed.value;
   };
   /**
    * Same-turn steer contract: resolved STEER means maker-core accepted the
@@ -8101,7 +8194,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
    * vendor start failures are hard pre-accept failures so renderer rolls back
    * the optimistic bubble instead of resurrecting the message as a new turn.
    */
-  const steerToAgentAccepted = async (sessionId: unknown, message: unknown, sendOpts?: unknown): Promise<void> => {
+  const steerToAgentAcceptedUnlocked = async (sessionId: unknown, message: unknown, sendOpts?: unknown): Promise<void> => {
     if (typeof sessionId !== 'string') throwIpcError('INVALID_PARAMS', 'sessionId required');
     const sess = maker.getSession(sessionId);
     if (!sess) {
@@ -8188,6 +8281,20 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     }
   };
 
+  const steerToAgentAccepted = async (
+    sessionId: unknown,
+    message: unknown,
+    sendOpts?: unknown,
+  ): Promise<void> => {
+    if (typeof sessionId !== 'string') {
+      return steerToAgentAcceptedUnlocked(sessionId, message, sendOpts);
+    }
+    const routed = await withActiveSessionRouteLock(sessionId, () =>
+      steerToAgentAcceptedUnlocked(sessionId, message, sendOpts),
+    );
+    if (!routed.admitted) return throwInactiveSessionRoute(sessionId, routed.status);
+  };
+
   registerMakerSessionSendHandler(
     makerSessionRegistry,
     { sendToAgentAccepted },
@@ -8208,7 +8315,8 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     if (typeof sessionId !== 'string' || sessionId.length === 0) {
       throwIpcError('INVALID_PARAMS', 'sessionId required');
     }
-    let sess = maker.getSession(sessionId);
+    const routed = await withActiveSessionRouteLock(sessionId, async () => {
+      let sess = maker.getSession(sessionId);
     if (!sess) {
       if (!createOpts) {
         throwIpcError('NOT_FOUND', `Session ${sessionId} is not running`);
@@ -8263,8 +8371,11 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       if (err instanceof Error && err.name === 'NotSupportedError') {
         throwIpcError('UNSUPPORTED_CAPABILITY', err.message);
       }
-      throwIpcError('INTERNAL', err instanceof Error ? err.message : 'context usage query failed');
-    }
+        throwIpcError('INTERNAL', err instanceof Error ? err.message : 'context usage query failed');
+      }
+    });
+    if (!routed.admitted) return throwInactiveSessionRoute(sessionId, routed.status);
+    return routed.value;
   });
 
   /**
@@ -8582,10 +8693,10 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
               // 与**接管态**(enqueue / clearError / teardown 会清掉接管态,recovery 未必),
               // autoRetryLastError 内部复核后会 no-op 并返回非 resumed —— 此时必须回滚
               // pendingResume。
-              const outcome = await inputCoordinator.autoRetryLastError(
-                sessionId,
-                decision.attemptToken,
+              const routedRetry = await withActiveSessionRouteLock(sessionId, () =>
+                inputCoordinator.autoRetryLastError(sessionId, decision.attemptToken),
               );
+              const outcome = routedRetry.admitted ? routedRetry.value : 'superseded';
               if (!attempt.isCurrent()) {
                 log.debug('interrupted-turn auto-resume completion superseded', {
                   sessionId,
@@ -8917,8 +9028,9 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         sessionId,
         (item) => item.origin?.kind === 'scheduler' && item.origin.scheduleId === scheduleId,
         { includeRecovery: true },
-      ),
+    ),
     enqueuePrompt: async (req) => {
+      const routed = await withActiveSessionRouteLock(req.sessionId, async () => {
       const [meta, dbRow] = await Promise.all([
         maker.getSessionMeta(req.sessionId).catch(() => null),
         getSessionRowSnapshot(req.sessionId),
@@ -8975,6 +9087,11 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         throw err;
       }
       return { clientId };
+      });
+      if (!routed.admitted) {
+        throw new Error(`scheduler enqueue: session ${req.sessionId} is ${routed.status}`);
+      }
+      return routed.value;
     },
     removeQueuedPrompt: (sessionId, clientId) => {
       // remove 只作用于 pending 行;已进入派发(activeTurn)的项 no-op —— 调用方
@@ -9264,6 +9381,15 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     };
   };
 
+  const requireActiveInputRoute = async <T>(
+    sessionId: string,
+    task: () => Promise<T>,
+  ): Promise<T> => {
+    const routed = await withActiveSessionRouteLock(sessionId, task);
+    if (!routed.admitted) throwInactiveSessionRoute(sessionId, routed.status);
+    return routed.value;
+  };
+
   ipcMain.handle(MAKER_INVOKE.INPUT_GET_PROJECTION, async (_e, sessionId: unknown) => {
     const sid = requireSessionId(sessionId);
     // 崩溃恢复(issue #761):renderer 打开会话首次取 projection 前,先把持久化的
@@ -9275,41 +9401,56 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
 
   // device-link 出方向:远程入队消息的 OSS 引用(files[] + persistedContent)在入队前一次性物化成本地
   // 临时文件(共用下载、用后删 OSS),保证喂 agent 的 files[] 与落库的 persistedContent 都是本地路径。
-  // 本机会话无 OSS 引用 → materializeQueuedOssAttachments 原样返回,零开销。
+  // 本机会话无 OSS 引用 → stageQueuedOssAttachments 原样返回,零开销。
   ipcMain.handle(MAKER_INVOKE.INPUT_ENQUEUE, async (_e, sessionId: unknown, item: unknown, opts?: unknown) => {
     const sid = requireSessionId(sessionId);
+    return requireActiveInputRoute(sid, async () => {
     // 恢复先于入队:普通新输入保持 FIFO；「继续任务」由 coordinator 在完整旧队列
     // 恢复后再明确插到队首，避免恢复竞态把它重新压到后面。
     await inputCoordinator.ensureQueueRestored(sid).catch(() => undefined);
-    const queuedWithAttachments = (await materializeQueuedOssAttachments(
-      sid,
-      requireQueuedMessage(item),
-    )) as AgentInputQueuedMessage;
-    // 手机来源在**入队这一刻**盖章:drain 派发时已脱离本 invoke 的 async context。
-    // 无条件覆盖 —— item 来自 wire,客户端自填的 fromMobileClient 一律不生效。
-    const queued = stampMobileClientOrigin(
-      await hydrateQueuedAgentReferences(queuedWithAttachments),
-      isMobileControllerInvoke(),
-    );
-    const commitAutoTitle = await prepareDeviceLinkAutoTitle(sid, queued);
+    const parsed = requireQueuedMessage(item);
+    // 弱网丢 ack 会重发同一 clientId。去重必须早于 OSS 下载/入仓：
+    // 首次已受理后远端对象可能已删，重传不应再做任何附件 IO。
+    if (inputCoordinator.isDuplicateEnqueue(sid, parsed.clientId)) {
+      return inputCoordinator.getProjection(sid);
+    }
+    const staged = await stageQueuedOssAttachments(sid, parsed);
+    let committed = false;
+    try {
+      // 手机来源在**入队这一刻**盖章:drain 派发时已脱离本 invoke 的 async context。
+      // 无条件覆盖 —— item 来自 wire,客户端自填的 fromMobileClient 一律不生效。
+      const queued = stampMobileClientOrigin(
+        await hydrateQueuedAgentReferences(staged.item as AgentInputQueuedMessage),
+        isMobileControllerInvoke(),
+      );
+      const commitAutoTitle = await prepareDeviceLinkAutoTitle(sid, queued);
 
-    // 「继续任务」durable ack 延后到 vendor dispatch 成功（onDispatchedUserTurn）：
-    // 排队可取消时旧中断提示必须能恢复；accepted 但仍可能 cancelled-before-dispatch
-    // 时也不能提前 ack。续跑项本身由 coordinator 插到队首（普通输入仍 FIFO）。
-    const projection = inputCoordinator.enqueue(sid, queued, {
-      ...(opts && typeof opts === 'object' ? opts as { sendAtMs?: number } : undefined),
-      // INPUT_ENQUEUE 只承载显式用户输入(composer 发送 / UI trigger / device-link
-      // 被控端转投的用户消息):崩溃恢复出的暂停队列遇到显式输入即放行,解开
-      // 「继续任务/新消息全部排队直到重启」的死锁。Orca 自动投递走 main 侧直调
-      // enqueue,不带此 flag,恢复暂停语义不变。
-      resumeRestorePausedQueue: true,
+      // 「继续任务」durable ack 延后到 vendor dispatch 成功（onDispatchedUserTurn）：
+      // 排队可取消时旧中断提示必须能恢复；accepted 但仍可能 cancelled-before-dispatch
+      // 时也不能提前 ack。续跑项本身由 coordinator 插到队首（普通输入仍 FIFO）。
+      const receipt = inputCoordinator.enqueueWithReceipt(sid, queued, {
+        ...(opts && typeof opts === 'object' ? opts as { sendAtMs?: number } : undefined),
+        // INPUT_ENQUEUE 只承载显式用户输入(composer 发送 / UI trigger / device-link
+        // 被控端转投的用户消息):崩溃恢复出的暂停队列遇到显式输入即放行,解开
+        // 「继续任务/新消息全部排队直到重启」的死锁。Orca 自动投递走 main 侧直调
+        // enqueue,不带此 flag,恢复暂停语义不变。
+        resumeRestorePausedQueue: true,
+      });
+      if (receipt.inserted) {
+        committed = true;
+        staged.cleanupAfterAcceptance?.();
+        commitAutoTitle();
+      }
+      return receipt.projection;
+    } finally {
+      if (!committed) await staged.cleanupBeforeAcceptance?.();
+    }
     });
-    commitAutoTitle();
-    return projection;
   });
 
   ipcMain.handle(MAKER_INVOKE.INPUT_COMPACT, async (_e, sessionId: unknown, createOpts: unknown, opts?: unknown) => {
     const sid = requireSessionId(sessionId);
+    return requireActiveInputRoute(sid, async () => {
     await inputCoordinator.ensureQueueRestored(sid).catch(() => undefined);
     if (!createOpts || typeof createOpts !== 'object') {
       throwIpcError('INVALID_PARAMS', 'createOpts required');
@@ -9323,15 +9464,17 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       typedCreateOpts,
       opts && typeof opts === 'object' ? opts as { userName?: string } : undefined,
     );
+    });
   });
 
   ipcMain.handle(MAKER_INVOKE.INPUT_STEER, async (_e, sessionId: unknown, item: unknown, opts?: unknown) => {
     const sid = requireSessionId(sessionId);
+    return requireActiveInputRoute(sid, async () => {
     await inputCoordinator.ensureQueueRestored(sid).catch(() => undefined);
     const steerOpts = opts && typeof opts === 'object'
       ? opts as { removeFromQueue?: boolean; touchUserSend?: boolean }
       : undefined;
-    const queuedWithAttachments = (await materializeQueuedOssAttachments(
+    const staged = await stageQueuedOssAttachments(
       sid,
       requireQueuedMessage(item, {
         // A device-link projection intentionally omits the trusted snapshot.
@@ -9339,26 +9482,32 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         // the main-owned row; all other IPC paths remain fail-closed here.
         allowMissingTrustedContexts: isDeviceLinkInvoke() && steerOpts?.removeFromQueue === true,
       }),
-    )) as AgentInputQueuedMessage;
-    // 与 enqueue 同:steer 投递也在本 invoke 的 async context 之外发生。
-    const queued = stampMobileClientOrigin(
-      await hydrateQueuedAgentReferences(queuedWithAttachments),
-      isMobileControllerInvoke(),
     );
-    // 插话也补起名:远控用户完全可能趁这一轮还在跑就写下第一句话,只认入队的话
-    // 标题会一直停在首条纯附件消息的合成占位上(PR #510 review P1)。是否真的该
-    // 改名由 runSessionAutoTitle 权威判定。
-    const commitAutoTitle = await prepareDeviceLinkAutoTitle(sid, queued);
-    // steer 与 enqueue 不同:它会因同会话已有在飞 steer / Stop 边界 / 输入锁而
-    // 返回 false。必须等它落定、受理了才改名 —— 被拒的文本改掉默认名 / 合成占位 /
-    // fork 占位就是凭空改名(review P1)。
-    const accepted = await inputCoordinator.steer(
-      sid,
-      queued,
-      steerOpts,
-    );
-    if (accepted) commitAutoTitle();
-    return accepted;
+    let committed = false;
+    try {
+      // 与 enqueue 同:steer 投递也在本 invoke 的 async context 之外发生。
+      const queued = stampMobileClientOrigin(
+        await hydrateQueuedAgentReferences(staged.item as AgentInputQueuedMessage),
+        isMobileControllerInvoke(),
+      );
+      // 插话也补起名:远控用户完全可能趁这一轮还在跑就写下第一句话,只认入队的话
+      // 标题会一直停在首条纯附件消息的合成占位上(PR #510 review P1)。是否真的该
+      // 改名由 runSessionAutoTitle 权威判定。
+      const commitAutoTitle = await prepareDeviceLinkAutoTitle(sid, queued);
+      // steer 与 enqueue 不同:它会因同会话已有在飞 steer / Stop 边界 / 输入锁而
+      // 返回 false。必须等它落定、受理了才改名 —— 被拒的文本改掉默认名 / 合成占位 /
+      // fork 占位就是凭空改名(review P1)。
+      const accepted = await inputCoordinator.steer(sid, queued, steerOpts);
+      if (accepted) {
+        committed = true;
+        staged.cleanupAfterAcceptance?.();
+        commitAutoTitle();
+      }
+      return accepted;
+    } finally {
+      if (!committed) await staged.cleanupBeforeAcceptance?.();
+    }
+    });
   });
 
   ipcMain.handle(MAKER_INVOKE.INPUT_STOP, async (_e, sessionId: unknown, opts?: unknown) => {
@@ -9420,7 +9569,7 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     return result;
   });
 
-  ipcMain.handle(MAKER_INVOKE.INPUT_UPDATE_TEXT, (
+  ipcMain.handle(MAKER_INVOKE.INPUT_UPDATE_TEXT, async (
     _e,
     sessionId: unknown,
     clientId: unknown,
@@ -9435,33 +9584,51 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     if (remote && (refs?.length ?? 0) > 0 && !contexts) {
       throwIpcError('SESSION_REFERENCE_UNAVAILABLE', 'remote session references were not resolved by the controller');
     }
-    return inputCoordinator.updateText(
-      requireSessionId(sessionId),
+    const sid = requireSessionId(sessionId);
+    return requireActiveInputRoute(sid, async () => inputCoordinator.updateText(
+      sid,
       requireClientId(clientId),
       newText,
       refs,
       contexts,
       remote,
-    );
+    ));
   });
 
   // 与 enqueue/steer 同一套物化:远程编辑保存的新附件可能是 OSS 引用,入队前物化成本地文件。
   ipcMain.handle(MAKER_INVOKE.INPUT_UPDATE_CONTENT, async (_e, sessionId: unknown, clientId: unknown, item: unknown) => {
     const sid = requireSessionId(sessionId);
+    return requireActiveInputRoute(sid, async () => {
     const cid = requireClientId(clientId);
     const remote = isDeviceLinkInvoke();
     const parsed = requireQueuedMessage(item);
-    const queuedWithAttachments = (await materializeQueuedOssAttachments(
-      sid,
-      parsed,
-    )) as AgentInputQueuedMessage;
-    const queued = await hydrateQueuedAgentReferences(queuedWithAttachments);
-    // 旧 device-link update-content 调用没有 side-channel sessionRefs；显式
-    // 传空数组，避免 updateQueuedMessageContent 从完整文本重新解析控制端坐标。
-    const update = remote && parsed.sessionRefs === undefined
-      ? { ...queued, sessionRefs: [] }
-      : queued;
-    return inputCoordinator.updateContent(sid, cid, update);
+    await inputCoordinator.ensureQueueRestored(sid).catch(() => undefined);
+    // 队列项已派发/删除时直接返回，不为无法提交的编辑下载 OSS。
+    if (!inputCoordinator.canUpdateQueuedItemContent(sid, cid)) {
+      return inputCoordinator.getProjection(sid);
+    }
+    const staged = await stageQueuedOssAttachments(sid, parsed);
+    let committed = false;
+    try {
+      const queued = await hydrateQueuedAgentReferences(staged.item as AgentInputQueuedMessage);
+      // 物化/引用 hydrate 期间队首可能已经派发或进入 steering。此时不能消费
+      // OSS 重试源，也不能把刚落下的本地副本留成无主附件。
+      if (!inputCoordinator.canUpdateQueuedItemContent(sid, cid)) {
+        return inputCoordinator.getProjection(sid);
+      }
+      // 旧 device-link update-content 调用没有 side-channel sessionRefs；显式
+      // 传空数组，避免 updateQueuedMessageContent 从完整文本重新解析控制端坐标。
+      const update = remote && parsed.sessionRefs === undefined
+        ? { ...queued, sessionRefs: [] }
+        : queued;
+      const projection = inputCoordinator.updateContent(sid, cid, update);
+      committed = true;
+      staged.cleanupAfterAcceptance?.();
+      return projection;
+    } finally {
+      if (!committed) await staged.cleanupBeforeAcceptance?.();
+    }
+    });
   });
 
   ipcMain.handle(MAKER_INVOKE.INPUT_MOVE, (_e, sessionId: unknown, clientId: unknown, targetIndex: unknown) => {
@@ -10065,9 +10232,13 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
     if (typeof sessionId !== 'string' || sessionId.length === 0) {
       throwIpcError('INVALID_PARAMS', 'sessionId required');
     }
-    const sess = await getOrResumeSessionTreeSession(sessionId);
-    if (!sess || !sess.capabilities.sessionTree?.supported) return null;
-    return sess.getSessionTree();
+    const routed = await withActiveSessionRouteLock(sessionId, async () => {
+      const sess = await getOrResumeSessionTreeSession(sessionId);
+      if (!sess || !sess.capabilities.sessionTree?.supported) return null;
+      return sess.getSessionTree();
+    });
+    if (!routed.admitted) return null;
+    return routed.value;
   });
 
   ipcMain.handle(
@@ -10092,8 +10263,6 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       if (parsed.customInstructions !== undefined && typeof parsed.customInstructions !== 'string') {
         throwIpcError('INVALID_PARAMS', 'customInstructions must be string');
       }
-      const sess = await getOrResumeSessionTreeSession(sessionId);
-      if (!sess || !sess.capabilities.sessionTree?.supported) return null;
       // 整个「原生分支导航 → 捕获 result.messages → session.treeRehydrate 重建 SQLite」窗口
       // 必须与 maker:send 走同一把 per-session 锁(acquireSendToSessionLock)。否则另一窗口 /
       // device-link 在 navigate 捕获 result.messages 之后、rehydrate 之前发一个 turn:Pi 把它
@@ -10101,7 +10270,9 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
       // 在 JSONL 里有、SQLite 里被旧快照覆盖/隐藏(hiddenClientIds 只修复 Renderer 删除广播,
       // 修不了 JSONL 与 DB 的这处分叉,codex review P1)。summarize turn 是 Pi 内部 RPC,不经
       // maker:send IPC,故不与本锁重入。
-      const { result, hiddenClientIds, now } = await withSendToSessionLock(sessionId, async () => {
+      const routed = await withActiveSessionRouteLock(sessionId, async () => {
+        const sess = await getOrResumeSessionTreeSession(sessionId);
+        if (!sess || !sess.capabilities.sessionTree?.supported) return null;
         const result = await sess.navigateSessionTree(entryId, {
           summarize: parsed.summarize === true,
           ...(typeof parsed.customInstructions === 'string'
@@ -10128,6 +10299,8 @@ export function registerMakerIpc(maker: Maker, options: RegisterMakerIpcOptions)
         });
         return { result, hiddenClientIds, now };
       });
+      if (!routed.admitted || !routed.value) return null;
+      const { result, hiddenClientIds, now } = routed.value;
       resetTurnPersistState(sessionId);
 
       // 多窗口与 device-link 控制端先清旧投影，再按 DB 真相补当前活动路径。

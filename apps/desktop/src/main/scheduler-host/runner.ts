@@ -232,6 +232,9 @@ export interface MakerScheduleRunnerDeps {
    * runner 在 Session.send 返回后 release。
    */
   acquirePendingAgentSwitch?: (sessionId: string, signal?: AbortSignal) => Promise<() => void>;
+  acquireSessionLifecycleLease?: (
+    sessionId: string,
+  ) => Promise<{ acquired: false; reason?: string } | { acquired: true; release: () => void }>;
   /** 新建可见会话落库后通知本机窗口与 device-link 列表订阅者。 */
   onSessionCreated?: (sessionId: string) => void;
   /** 可选:撞忙排队桥。未注入时心跳撞忙回退为顺延(deferFire)旧行为。 */
@@ -402,6 +405,7 @@ export class MakerScheduleRunner implements ScheduleRunner {
     } finally {
       holder.releaseAgentSwitchLock?.();
       holder.releaseAgentSwitchLock = undefined;
+      releaseSessionLifecycleLease(holder);
       holder.headlessGhostSetupTurn?.close();
       if (
         holder.sessionId &&
@@ -540,6 +544,15 @@ export class MakerScheduleRunner implements ScheduleRunner {
     // 持续会话当前选定的来源(供应商)id —— schedule.providerId 留空时沿用它
     // （与 model 留空沿用 meta.model 对称）。取自 sessions.provider_id 快照,null=未选。
     let heartbeatProviderId: string | null = null;
+    const acquireLifecycleLease = async (id: string): Promise<void> => {
+      const lease = await (this.deps.acquireSessionLifecycleLease?.(id) ??
+        Promise.resolve({ acquired: true as const, release: () => undefined }));
+      if (!lease.acquired) {
+        throw new Error(`session lifecycle admission failed: ${lease.reason}`);
+      }
+      holder.releaseSessionLifecycleLock = lease.release;
+    };
+    await acquireLifecycleLease(sessionId);
 
     // 2. heartbeat archived/missing 兜底
     if (isHeartbeat) {
@@ -570,7 +583,9 @@ export class MakerScheduleRunner implements ScheduleRunner {
             this.deps.logger.warn?.('[runner] persistent rebind clear failed', err);
           }
           isHeartbeat = false;
+          releaseSessionLifecycleLease(holder);
           sessionId = randomUUID();
+          await acquireLifecycleLease(sessionId);
           // resumeSessionId / heartbeatWorkingDir / heartbeatModel 仍是 undefined,
           // 下方 workingDir 解析自然走 schedule.workingDir + schedule.useWorktree 分支
         } else {
@@ -598,6 +613,7 @@ export class MakerScheduleRunner implements ScheduleRunner {
         if (recentlyUserDriven && isSessionInTurn(sessionId) && this.canDefer(schedule)) {
           holder.releaseAgentSwitchLock?.();
           holder.releaseAgentSwitchLock = undefined;
+          releaseSessionLifecycleLease(holder);
           return this.deferFire(schedule, sessionId, 'user-active');
         }
         // B1.5 撞忙排队(替代旧的"盲发 → SESSION_RUNNING → 顺延"路径):会话忙
@@ -614,6 +630,7 @@ export class MakerScheduleRunner implements ScheduleRunner {
           if (this.deps.schedulerQueue.hasQueuedPrompt(sessionId, schedule.id)) {
             holder.releaseAgentSwitchLock?.();
             holder.releaseAgentSwitchLock = undefined;
+            releaseSessionLifecycleLease(holder);
             return await this.settleDuplicateQueuedFire(schedule, ctx, sessionId);
           }
           holder.releaseAgentSwitchLock?.();
@@ -623,6 +640,8 @@ export class MakerScheduleRunner implements ScheduleRunner {
             effort: meta?.effort,
             fastMode: meta?.fastMode,
             providerId: row?.providerId ?? null,
+          }, {
+            releaseLifecycleAdmission: () => releaseSessionLifecycleLease(holder),
           });
         }
         resumeSessionId = meta?.sdkSessionId;
@@ -1083,6 +1102,7 @@ export class MakerScheduleRunner implements ScheduleRunner {
         },
         {
           sessionAlreadyBound: true,
+          releaseLifecycleAdmission: () => releaseSessionLifecycleLease(holder),
           onAccepted: !isHeartbeat
             ? () => {
                 try {
@@ -1336,6 +1356,7 @@ export class MakerScheduleRunner implements ScheduleRunner {
     } finally {
       holder.releaseAgentSwitchLock?.();
       holder.releaseAgentSwitchLock = undefined;
+      releaseSessionLifecycleLease(holder);
     }
 
     // 7. 等 turn end，组装 run，主动 notify
@@ -1446,7 +1467,11 @@ export class MakerScheduleRunner implements ScheduleRunner {
       fastMode?: boolean;
       providerId: string | null;
     },
-    options?: { sessionAlreadyBound?: boolean; onAccepted?: () => void },
+    options?: {
+      sessionAlreadyBound?: boolean;
+      onAccepted?: () => void;
+      releaseLifecycleAdmission?: () => void;
+    },
   ): Promise<FireResult> {
     const headlessTurn = {
       closed: false,
@@ -1485,7 +1510,11 @@ export class MakerScheduleRunner implements ScheduleRunner {
       providerId: string | null;
     },
     markHeadlessTurnDispatched: () => void,
-    options?: { sessionAlreadyBound?: boolean; onAccepted?: () => void },
+    options?: {
+      sessionAlreadyBound?: boolean;
+      onAccepted?: () => void;
+      releaseLifecycleAdmission?: () => void;
+    },
   ): Promise<FireResult> {
     const sq = this.deps.schedulerQueue;
     if (!sq) throw new Error('fireHeartbeatViaQueue requires schedulerQueue dep');
@@ -1604,12 +1633,14 @@ export class MakerScheduleRunner implements ScheduleRunner {
       );
     };
 
-    const enqueueResult = await sq.enqueuePrompt({
-      sessionId,
-      text: promptToSend,
-      persistedContent: schedule.prompt,
-      origin,
-      onAccepted: async () => {
+    let enqueueResult: Awaited<ReturnType<SchedulerQueueDeps['enqueuePrompt']>>;
+    try {
+      enqueueResult = await sq.enqueuePrompt({
+        sessionId,
+        text: promptToSend,
+        persistedContent: schedule.prompt,
+        origin,
+        onAccepted: async () => {
         dispatched = true;
         // Queue admission happens while another (possibly user-driven)
         // Desktop turn still owns the session. Only the accepted scheduler
@@ -1712,18 +1743,24 @@ export class MakerScheduleRunner implements ScheduleRunner {
           });
         });
         settleDispatch();
-      },
-      onAcceptedRollback: () => {
-        const err = new Error('queued heartbeat dispatch rolled back after accept');
-        failAfterAccept(err);
-        failDispatch(err);
-      },
-      onDiscarded: () => {
-        // 排队项未派发即被移除(用户删队列行 / stop 清队列 / pause-delete 撤项)
-        // → run 按 aborted 收尾(引擎按 /abort/i 识别错误文案)。
-        failDispatch(new Error('queued heartbeat prompt removed before dispatch (aborted)'));
-      },
-    });
+        },
+        onAcceptedRollback: () => {
+          const err = new Error('queued heartbeat dispatch rolled back after accept');
+          failAfterAccept(err);
+          failDispatch(err);
+        },
+        onDiscarded: () => {
+          // 排队项未派发即被移除(用户删队列行 / stop 清队列 / pause-delete 撤项)
+          // → run 按 aborted 收尾(引擎按 /abort/i 识别错误文案)。
+          failDispatch(new Error('queued heartbeat prompt removed before dispatch (aborted)'));
+        },
+      });
+    } finally {
+      // Admission only protects the queue mutation. Once enqueuePrompt has
+      // committed, rejected, or returned duplicate/retry, deletion may proceed;
+      // the later queue wait and vendor turn are governed by their own lifecycle.
+      options?.releaseLifecycleAdmission?.();
+    }
     if ('retry' in enqueueResult) {
       // 崩溃恢复快照尚未成功读回 → 持久化去重做不了,顺延本次 fire(90s 后重试,
       // 届时恢复多半已完成);一次性任务无法顺延,按可见失败收口。
@@ -2461,6 +2498,13 @@ interface EphemeralSessionHolder {
   keepAlive?: boolean;
   /** heartbeat direct-send route lock; released immediately after Session.send settles. */
   releaseAgentSwitchLock?: () => void;
+  /** logical session deletion/archive lock; released at queue admission or send settlement. */
+  releaseSessionLifecycleLock?: () => void;
+}
+
+function releaseSessionLifecycleLease(holder: EphemeralSessionHolder): void {
+  holder.releaseSessionLifecycleLock?.();
+  holder.releaseSessionLifecycleLock = undefined;
 }
 
 interface HeadlessGhostSetupTurnGuard {

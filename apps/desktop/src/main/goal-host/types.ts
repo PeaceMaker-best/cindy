@@ -177,6 +177,11 @@ export interface GoalControllerDeps {
    * goal 设了却发不出第一轮"的关键。
    */
   ensureSession(sessionId: string): Promise<SessionLike | undefined>;
+  /** Serialize one producer against archive/delete on the logical session id. */
+  withActiveSessionLifecycle?<T>(
+    sessionId: string,
+    run: () => Promise<T>,
+  ): Promise<{ admitted: false } | { admitted: true; value: T }>;
   /**
    * 锁住本 session、落实 deferred agent switch 并 bootstrap 新 live session。
    * 调用方在重新读取 live session 且 Session.send 返回后执行 release。

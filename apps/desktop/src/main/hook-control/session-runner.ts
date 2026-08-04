@@ -417,8 +417,28 @@ async function collectOutboundForFinalText(
 
 export function createMakerHookSessionRunner(deps: {
   log: { info(msg: string): void; warn(msg: string): void };
+  withSessionLifecycle?<T>(
+    sessionId: string,
+    run: () => Promise<T>,
+  ): Promise<{ acquired: false; reason: string } | { acquired: true; value: T }>;
+  withActiveSessionLifecycle?<T>(
+    sessionId: string,
+    run: () => Promise<T>,
+  ): Promise<{ admitted: false; reason: string } | { admitted: true; value: T }>;
 }): HookSessionRunner {
   const { log } = deps;
+  const withSessionLifecycle =
+    deps.withSessionLifecycle ??
+    (async <T>(_sessionId: string, run: () => Promise<T>) => ({
+      acquired: true as const,
+      value: await run(),
+    }));
+  const withActiveSessionLifecycle =
+    deps.withActiveSessionLifecycle ??
+    (async <T>(_sessionId: string, run: () => Promise<T>) => ({
+      admitted: true as const,
+      value: await run(),
+    }));
 
   return {
     isBusy: (sessionId) => isSessionInTurn(sessionId),
@@ -553,7 +573,6 @@ export function createMakerHookSessionRunner(deps: {
       //     不带上它 agent 首轮凭证形态会按默认 fallback 判断)。
       const providerId = req.isNew ? (resolved?.providerId ?? null) : rowProviderId;
 
-      let session: Awaited<ReturnType<ReturnType<typeof getMaker>['createSession']>>;
       const createOpts: Parameters<ReturnType<typeof getMaker>['createSession']>[0] = {
         id: req.sessionId,
         agentKind: effectiveAgentKind,
@@ -591,6 +610,14 @@ export function createMakerHookSessionRunner(deps: {
           : {}),
         resumeSessionId,
       };
+      type PreparedHookTurn = {
+        observer: HookTurnObserver;
+        finalizeInteractions: () => void;
+        extraImageAbsPaths: string[];
+        inboundAttachmentFailures: number;
+      };
+      const prepareAndDispatch = async (): Promise<PreparedHookTurn | HookRunOutcome> => {
+      let session: Awaited<ReturnType<ReturnType<typeof getMaker>['createSession']>>;
       try {
         session = await maker.createSession(createOpts);
       } catch (err) {
@@ -1027,6 +1054,38 @@ export function createMakerHookSessionRunner(deps: {
         releaseTelegramGroupTurn();
         return fail(err instanceof Error ? err.message : String(err));
       }
+
+      return {
+        observer,
+        finalizeInteractions,
+        extraImageAbsPaths,
+        inboundAttachmentFailures,
+      };
+      };
+
+      let prepared: PreparedHookTurn | HookRunOutcome;
+      if (req.isNew) {
+        const locked = await withSessionLifecycle(req.sessionId, async () => {
+          const row = await getSessionRowSnapshot(req.sessionId);
+          if (row && row.status !== 'active') return fail(`session is ${row.status}`);
+          return prepareAndDispatch();
+        });
+        if (!locked.acquired) return fail(`session lifecycle admission failed: ${locked.reason}`);
+        prepared = locked.value;
+      } else {
+        const admitted = await withActiveSessionLifecycle(req.sessionId, prepareAndDispatch);
+        if (!admitted.admitted) {
+          return fail(`session lifecycle admission failed: ${admitted.reason}`);
+        }
+        prepared = admitted.value;
+      }
+      if ('status' in prepared) return prepared;
+      const {
+        observer,
+        finalizeInteractions,
+        extraImageAbsPaths,
+        inboundAttachmentFailures,
+      } = prepared;
 
       // turn 不设时长上限(见常量注释): 收口全靠 observer, 兜底在 maker-core
       // 的 turn stall 看门狗。

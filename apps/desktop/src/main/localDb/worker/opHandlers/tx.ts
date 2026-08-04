@@ -3,7 +3,7 @@
 
 import type Database from 'better-sqlite3';
 
-import type { DbTxName } from '../../client/tx/types.js';
+import type { DbTxName, SessionImportShareResult } from '../../client/tx/types.js';
 import { normalizeWorkingDirForStorage } from '../../../../shared/workingDir.js';
 import {
   wechatActivateBindingEpoch,
@@ -67,16 +67,26 @@ export function tx(db: Database.Database, args: unknown): unknown {
       return orcaRemoveWorker(db, txArgs);
     case 'orca.cancelStaleTeams':
       return orcaCancelStaleTeams(db, txArgs);
+    case 'orca.archiveWorkersByTeam':
+      return orcaArchiveWorkersByTeam(db, txArgs);
+    case 'orca.reconcileInactiveTeamWorkersForLead':
+      return orcaReconcileInactiveTeamWorkersForLead(db, txArgs);
     case 'sessions.renameTitles':
       return sessionsRenameTitles(db, txArgs);
     case 'sessions.setStatus':
       return sessionsSetStatus(db, txArgs);
+    case 'session.prepareDeletedLifecycle':
+      return sessionPrepareDeletedLifecycle(db, txArgs);
+    case 'session.replaceDeletedGeneration':
+      return sessionReplaceDeletedGeneration(db, txArgs);
     case 'session.agentSwitchFallback':
       return sessionAgentSwitchFallback(db, txArgs);
     case 'message.delete':
       return messageDelete(db, txArgs);
     case 'im.deleteBindings':
       return imDeleteBindings(db, txArgs);
+    case 'im.deleteBindingIfTarget':
+      return imDeleteBindingIfTarget(db, txArgs);
     case 'im.replaceBinding':
       return imReplaceBinding(db, txArgs);
     case 'wechatActivateBindingEpoch':
@@ -149,6 +159,29 @@ function imDeleteBindings(db: Database.Database, args: unknown): void {
   transaction();
 }
 
+/** Compare-and-delete one exact owner before purging legacy duplicate owners. */
+function imDeleteBindingIfTarget(db: Database.Database, args: unknown): boolean {
+  const payload = asRecord(args, 'im.deleteBindingIfTarget args');
+  const channel = expectString(payload.channel, 'channel');
+  const botContextId = expectString(payload.botContextId, 'botContextId');
+  const userId = expectString(payload.userId, 'userId');
+  const scopeKey = expectString(payload.scopeKey, 'scopeKey');
+  const targetSessionId = expectString(payload.targetSessionId, 'targetSessionId');
+  const transaction = db.transaction(() => {
+    const deleted = db
+      .prepare(
+        `DELETE FROM im_bindings
+         WHERE channel = ? AND bot_context_id = ? AND user_id = ?
+           AND scope_key = ? AND target_session_id = ?`,
+      )
+      .run(channel, botContextId, userId, scopeKey, targetSessionId);
+    if (deleted.changes === 0) return false;
+    db.prepare('DELETE FROM im_bindings WHERE target_session_id = ?').run(targetSessionId);
+    return true;
+  });
+  return transaction() as boolean;
+}
+
 /**
  * IM takeover replacement must not expose the delete-before-insert gap: if
  * the insert fails, SQLite restores both the previous target owner and this
@@ -195,15 +228,17 @@ function sessionAgentSwitchFallback(db: Database.Database, args: unknown): void 
   const boundaryContent = expectString(payload.boundaryContent, 'boundaryContent');
   const updatedAt = expectNumber(payload.updatedAt, 'updatedAt');
   const transaction = db.transaction(() => {
-    const sessionResult = db.prepare(
-      'UPDATE sessions SET sdk_session_id = NULL, updated_at = ? WHERE id = ?',
-    ).run(updatedAt, sessionId);
+    const sessionResult = db
+      .prepare('UPDATE sessions SET sdk_session_id = NULL, updated_at = ? WHERE id = ?')
+      .run(updatedAt, sessionId);
     if (sessionResult.changes !== 1) {
       throw Object.assign(new Error(`Session 不存在: ${sessionId}`), { code: 'NOT_FOUND' });
     }
-    const boundaryResult = db.prepare(
-      "UPDATE messages SET content = ? WHERE session_id = ? AND client_id = ? AND role = 'agent_switch' AND rewind_at IS NULL",
-    ).run(boundaryContent, sessionId, boundaryClientId);
+    const boundaryResult = db
+      .prepare(
+        "UPDATE messages SET content = ? WHERE session_id = ? AND client_id = ? AND role = 'agent_switch' AND rewind_at IS NULL",
+      )
+      .run(boundaryContent, sessionId, boundaryClientId);
     if (boundaryResult.changes !== 1) {
       throw Object.assign(new Error(`Agent switch boundary 不存在: ${boundaryClientId}`), {
         code: 'NOT_FOUND',
@@ -220,11 +255,11 @@ function messageDelete(
 ): { messages: Array<{ messageId: string; clientId: string }> } {
   const payload = asRecord(args, 'message.delete args');
   const sessionId = expectString(payload.sessionId, 'sessionId');
-  const clientIds = [...new Set(
-    expectArray(payload.clientIds, 'clientIds').map((value) =>
-      expectString(value, 'clientId'),
+  const clientIds = [
+    ...new Set(
+      expectArray(payload.clientIds, 'clientIds').map((value) => expectString(value, 'clientId')),
     ),
-  )];
+  ];
   if (clientIds.length === 0) {
     throw Object.assign(new Error('message.delete requires at least one clientId'), {
       code: 'INVALID_ARGS',
@@ -243,8 +278,7 @@ function messageDelete(
     );
     const targets = clientIds.map((clientId) => {
       const target = selectTarget.get(sessionId, clientId) as
-        | { id: string; clientId: string }
-        | undefined;
+        { id: string; clientId: string } | undefined;
       if (!target) {
         throw Object.assign(new Error(`Message 不存在或不可删除: ${clientId}`), {
           code: 'NOT_FOUND',
@@ -254,13 +288,19 @@ function messageDelete(
     });
 
     for (const target of targets) {
-      const jobs = db.prepare(
-        "SELECT rowid, vec_table AS vecTable FROM embedding_jobs WHERE source = 'chat' AND source_id = ?",
-      ).all(target.id) as Array<{ rowid: number; vecTable: string }>;
+      const jobs = db
+        .prepare(
+          "SELECT rowid, vec_table AS vecTable FROM embedding_jobs WHERE source = 'chat' AND source_id = ?",
+        )
+        .all(target.id) as Array<{ rowid: number; vecTable: string }>;
       const deleteVecByTable = new Map<string, Database.Statement>();
       for (const job of jobs) {
         assertIdentifier(job.vecTable);
-        if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(job.vecTable)) {
+        if (
+          !db
+            .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+            .get(job.vecTable)
+        ) {
           continue;
         }
         let stmt = deleteVecByTable.get(job.vecTable);
@@ -270,12 +310,16 @@ function messageDelete(
         }
         stmt.run(job.rowid);
       }
-      db.prepare("DELETE FROM embedding_jobs WHERE source = 'chat' AND source_id = ?").run(target.id);
+      db.prepare("DELETE FROM embedding_jobs WHERE source = 'chat' AND source_id = ?").run(
+        target.id,
+      );
     }
 
     // 旧重建标记的 handoff 可能包含本次目标消息；先删旧标记，只保留基于
     // 当前有效历史重新生成的最新版本，避免隐藏派生记录把内容留在本地。
-    db.prepare("DELETE FROM messages WHERE role = 'context_rebuild' AND session_id = ?").run(sessionId);
+    db.prepare("DELETE FROM messages WHERE role = 'context_rebuild' AND session_id = ?").run(
+      sessionId,
+    );
     const scrubTarget = db.prepare(
       "UPDATE messages SET role = 'message_tombstone', content = 'null', tool_use_id = NULL, agent_meta = NULL, agent_kind = NULL, rewind_at = ? WHERE id = ? AND session_id = ? AND client_id = ? AND role IN ('user', 'assistant', 'tool_use', 'tool_result', 'ask_user', 'plan_review', 'thinking', 'error') AND rewind_at IS NULL",
     );
@@ -287,9 +331,9 @@ function messageDelete(
         });
       }
     }
-    const sessionResult = db.prepare(
-      'UPDATE sessions SET sdk_session_id = NULL, updated_at = ? WHERE id = ?',
-    ).run(updatedAt, sessionId);
+    const sessionResult = db
+      .prepare('UPDATE sessions SET sdk_session_id = NULL, updated_at = ? WHERE id = ?')
+      .run(updatedAt, sessionId);
     if (sessionResult.changes !== 1) {
       throw Object.assign(new Error(`Session 不存在: ${sessionId}`), { code: 'NOT_FOUND' });
     }
@@ -306,7 +350,10 @@ function messageDelete(
   return transaction();
 }
 
-function sessionsRenameTitles(db: Database.Database, args: unknown): Array<{
+function sessionsRenameTitles(
+  db: Database.Database,
+  args: unknown,
+): Array<{
   sessionId: string;
   currentTitle: string | null;
   newTitle: string;
@@ -336,14 +383,13 @@ function sessionsRenameTitles(db: Database.Database, args: unknown): Array<{
       const existing = selectSession.get(sessionId) as
         | { id: string; title: string | null; workingDir: string | null; updatedAt: number }
         | undefined;
-      if (!existing) throw Object.assign(new Error(`Session 不存在: ${sessionId}`), { code: 'NOT_FOUND' });
+      if (!existing)
+        throw Object.assign(new Error(`Session 不存在: ${sessionId}`), { code: 'NOT_FOUND' });
 
-      const expectedCurrentTitle = typeof change.expectedCurrentTitle === 'string'
-        ? change.expectedCurrentTitle
-        : null;
-      const expectedUpdatedAt = typeof change.expectedUpdatedAt === 'string'
-        ? change.expectedUpdatedAt
-        : null;
+      const expectedCurrentTitle =
+        typeof change.expectedCurrentTitle === 'string' ? change.expectedCurrentTitle : null;
+      const expectedUpdatedAt =
+        typeof change.expectedUpdatedAt === 'string' ? change.expectedUpdatedAt : null;
       const expectedUpdatedAtMs = expectedUpdatedAt === null ? null : Date.parse(expectedUpdatedAt);
       if (expectedUpdatedAt !== null && !Number.isFinite(expectedUpdatedAtMs)) {
         throw Object.assign(new Error(`Session expected_updated_at 非法: ${sessionId}`), {
@@ -360,7 +406,9 @@ function sessionsRenameTitles(db: Database.Database, args: unknown): Array<{
         expectedCurrentTitle,
         expectedUpdatedAtMs,
         expectedUpdatedAtMs,
-      ) as { id: string; title: string | null; workingDir: string | null; updatedAt: number } | undefined;
+      ) as
+        | { id: string; title: string | null; workingDir: string | null; updatedAt: number }
+        | undefined;
       if (!updated) {
         throw Object.assign(new Error(`Session 标题或 updatedAt 已变化: ${sessionId}`), {
           code: 'PRECONDITION_FAILED',
@@ -389,7 +437,10 @@ function sessionsRenameTitles(db: Database.Database, args: unknown): Array<{
 // 批量归档 / 取消归档:存在性预检 + 状态更新放进同一事务,任一 id 缺失整批回滚(全有才写)。
 // 本文件是 inproc 回滚口;默认热路径走 file worker 的同名 handler(client/WorkerThreadTransport.ts)。
 // 两份实现必须同步,typecheck 抓不到 drift。
-function sessionsSetStatus(db: Database.Database, args: unknown): Array<{
+function sessionsSetStatus(
+  db: Database.Database,
+  args: unknown,
+): Array<{
   sessionId: string;
   title: string | null;
   workingDir: string | null;
@@ -401,14 +452,15 @@ function sessionsSetStatus(db: Database.Database, args: unknown): Array<{
     expectString(id, 'sessionId'),
   );
   const status = expectString(payload.status, 'status');
+  const runtimeOwnerId = expectString(payload.runtimeOwnerId, 'runtimeOwnerId');
   if (status !== 'active' && status !== 'archived') {
     throw invalidArgs(`invalid status: ${status}`);
   }
   const selectSession = db.prepare(
-    'SELECT id, title, working_dir AS workingDir, workspace_kind AS workspaceKind FROM sessions WHERE id = ? LIMIT 1',
+    'SELECT id, title, working_dir AS workingDir, workspace_kind AS workspaceKind, status, runtime_owner_id AS runtimeOwnerId FROM sessions WHERE id = ? LIMIT 1',
   );
   const updateSession = db.prepare(
-    'UPDATE sessions SET status = ?, updated_at = ? WHERE id = ? RETURNING id, title, working_dir AS workingDir, workspace_kind AS workspaceKind',
+    "UPDATE sessions SET status = ?, updated_at = ? WHERE id = ? AND (runtime_owner_id IS NULL OR runtime_owner_id LIKE ? || ':%') RETURNING id, title, working_dir AS workingDir, workspace_kind AS workspaceKind",
   );
   const transaction = db.transaction(() => {
     const applied: Array<{
@@ -420,15 +472,34 @@ function sessionsSetStatus(db: Database.Database, args: unknown): Array<{
     }> = [];
     const now = Date.now();
     for (const sessionId of sessionIds) {
-      const existing = selectSession.get(sessionId);
+      const existing = selectSession.get(sessionId) as
+        | { status: string; runtimeOwnerId: string | null }
+        | undefined;
       if (!existing) {
         throw Object.assign(new Error(`Session 不存在: ${sessionId}`), { code: 'NOT_FOUND' });
       }
-      const updated = updateSession.get(status, now, sessionId) as
-        | { id: string; title: string | null; workingDir: string | null; workspaceKind: string | null }
+      if (existing.status === 'deleted') {
+        throw Object.assign(new Error(`Session 已永久删除，不能恢复: ${sessionId}`), {
+          code: 'PRECONDITION_FAILED',
+        });
+      }
+      if (existing.runtimeOwnerId && !existing.runtimeOwnerId.startsWith(`${runtimeOwnerId}:`)) {
+        throw Object.assign(new Error(`Session 正由另一个 Cindy 实例运行: ${sessionId}`), {
+          code: 'PRECONDITION_FAILED',
+        });
+      }
+      const updated = updateSession.get(status, now, sessionId, runtimeOwnerId) as
+        | {
+            id: string;
+            title: string | null;
+            workingDir: string | null;
+            workspaceKind: string | null;
+          }
         | undefined;
       if (!updated) {
-        throw Object.assign(new Error(`Session 不存在: ${sessionId}`), { code: 'NOT_FOUND' });
+        throw Object.assign(new Error(`Session 状态或 runtime owner 已变化: ${sessionId}`), {
+          code: 'PRECONDITION_FAILED',
+        });
       }
       applied.push({
         sessionId: updated.id,
@@ -449,6 +520,146 @@ function sessionsSetStatus(db: Database.Database, args: unknown): Array<{
   }>;
 }
 
+function prepareDeletedSessionRelations(
+  db: Database.Database,
+  sessionId: string,
+  now: number,
+): boolean {
+  const current = db.prepare('SELECT status FROM sessions WHERE id = ? LIMIT 1').get(sessionId) as
+    { status: string } | undefined;
+  if (current?.status !== 'deleted') return false;
+
+  db.prepare(
+    `UPDATE sessions
+        SET runtime_owner_id = NULL,
+            runtime_owner_pid = NULL,
+            runtime_owner_process_start = NULL,
+            runtime_owner_heartbeat_at = NULL
+      WHERE id = ?`,
+  ).run(sessionId);
+  db.prepare('UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?').run(
+    sessionId,
+  );
+  db.prepare('DELETE FROM orca_teams WHERE lead_session_id = ?').run(sessionId);
+  db.prepare('DELETE FROM orca_workers WHERE session_id = ?').run(sessionId);
+  db.prepare('DELETE FROM im_bindings WHERE target_session_id = ?').run(sessionId);
+  db.prepare('DELETE FROM session_goals WHERE session_id = ?').run(sessionId);
+  db.prepare('DELETE FROM agent_input_queue_snapshots WHERE session_id = ?').run(sessionId);
+  db.prepare('DELETE FROM right_sidebar_tabs WHERE session_id = ?').run(sessionId);
+  db.prepare('DELETE FROM session_pr_refs WHERE session_id = ?').run(sessionId);
+  db.prepare(
+    'UPDATE schedules SET target_session_id = NULL, updated_at = ? WHERE target_session_id = ?',
+  ).run(now, sessionId);
+  db.prepare(
+    'UPDATE schedules SET skip_log_session_id = NULL, updated_at = ? WHERE skip_log_session_id = ?',
+  ).run(now, sessionId);
+  db.prepare('UPDATE schedule_runs SET session_id = NULL WHERE session_id = ?').run(sessionId);
+  db.prepare(
+    `UPDATE wechat_inbox
+     SET status = 'cancelled', lease_until = NULL, last_error_code = 'SESSION_DELETED'
+     WHERE session_id = ? AND status IN ('pending', 'dispatching')`,
+  ).run(sessionId);
+  db.prepare(
+    `UPDATE wechat_inbox
+     SET status = 'interrupted', lease_until = NULL, last_error_code = 'SESSION_DELETED'
+     WHERE session_id = ? AND status IN ('accepted_running', 'waiting_desktop')`,
+  ).run(sessionId);
+  db.prepare(
+    `DELETE FROM media_refs
+     WHERE ref_kind IN ('im-inbox', 'wechat-inbox')
+       AND ref_id IN (
+         SELECT id FROM wechat_inbox
+         WHERE session_id = ? AND status IN ('cancelled', 'interrupted')
+       )`,
+  ).run(sessionId);
+  db.prepare(
+    `UPDATE wechat_file_attachments
+     SET status = 'released'
+     WHERE session_id = ? AND status = 'staged'
+       AND task_id IN (
+         SELECT id FROM wechat_inbox
+         WHERE session_id = ? AND status IN ('cancelled', 'interrupted')
+       )`,
+  ).run(sessionId, sessionId);
+  db.prepare('DELETE FROM skill_usage_exposures WHERE session_id = ?').run(sessionId);
+  db.prepare('DELETE FROM skill_usage_sources WHERE session_id = ?').run(sessionId);
+  db.prepare('DELETE FROM ghost_cards WHERE session_id = ?').run(sessionId);
+  return true;
+}
+
+function sessionPrepareDeletedLifecycle(db: Database.Database, args: unknown): boolean {
+  const payload = asRecord(args, 'session.prepareDeletedLifecycle args');
+  const sessionId = expectString(payload.sessionId, 'sessionId');
+  const now = expectNumber(payload.now, 'now');
+  return db.transaction(() => prepareDeletedSessionRelations(db, sessionId, now))() as boolean;
+}
+
+function sessionReplaceDeletedGeneration(db: Database.Database, args: unknown): string | null {
+  const payload = asRecord(args, 'session.replaceDeletedGeneration args');
+  const oldSessionId = expectString(payload.oldSessionId, 'oldSessionId');
+  const newSessionId = expectString(payload.newSessionId, 'newSessionId');
+  const logicalSessionId = expectString(payload.logicalSessionId, 'logicalSessionId');
+  const generation = expectNumber(payload.generation, 'generation');
+  const now = expectNumber(payload.now, 'now');
+  const nullableText = (key: string): string | null => nullableString(payload[key]);
+  const transaction = db.transaction(() => {
+    const latest = db
+      .prepare(
+        `SELECT id, status, im_generation AS generation FROM sessions
+         WHERE COALESCE(im_logical_session_id, id) = ?
+         ORDER BY im_generation DESC, created_at DESC, id DESC LIMIT 1`,
+      )
+      .get(logicalSessionId) as { id: string; status: string; generation: number } | undefined;
+    if (latest?.status !== 'deleted') return latest?.id ?? null;
+    if (
+      latest.id !== oldSessionId ||
+      generation !== latest.generation + 1 ||
+      !prepareDeletedSessionRelations(db, oldSessionId, now)
+    ) {
+      return null;
+    }
+
+    db.prepare(
+      `INSERT OR IGNORE INTO sessions (
+         id, title, working_dir, workspace_kind, model, effort, permission_mode,
+         provider_id, fast_mode, agent_kind, status, source, feishu_open_id,
+         feishu_bot_app_id, im_bot_context_id, im_user_id, im_logical_session_id,
+         im_generation, sdk_session_id, cleared_at, user_send_at, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)`,
+    ).run(
+      newSessionId,
+      expectString(payload.title, 'title'),
+      expectString(payload.workingDir, 'workingDir'),
+      expectString(payload.workspaceKind, 'workspaceKind'),
+      expectString(payload.model, 'model'),
+      expectString(payload.effort, 'effort'),
+      expectString(payload.permissionMode, 'permissionMode'),
+      nullableText('providerId'),
+      payload.fastMode === true ? 1 : 0,
+      expectString(payload.agentKind, 'agentKind'),
+      expectString(payload.source, 'source'),
+      nullableText('feishuOpenId'),
+      nullableText('feishuBotAppId'),
+      nullableText('imBotContextId'),
+      nullableText('imUserId'),
+      logicalSessionId,
+      generation,
+      now,
+      now,
+      now,
+    );
+    const created = db
+      .prepare(
+        `SELECT id FROM sessions
+         WHERE im_logical_session_id = ? AND status != 'deleted'
+         ORDER BY im_generation DESC LIMIT 1`,
+      )
+      .get(logicalSessionId) as { id: string } | undefined;
+    return created?.id ?? null;
+  });
+  return transaction.immediate() as string | null;
+}
+
 function codexImportMessages(db: Database.Database, args: unknown): { changed: number } {
   const payload = asRecord(args, 'codex.importMessages args');
   const sessionId = expectString(payload.sessionId, 'sessionId');
@@ -457,7 +668,11 @@ function codexImportMessages(db: Database.Database, args: unknown): { changed: n
   const model = expectString(payload.model, 'model');
   const rows = expectArray(payload.rows, 'rows');
   const existing = readExistingMessageFingerprints(db, sessionId, importClientIdPrefix);
-  const existingImportedClientIds = readExistingImportedClientIds(db, sessionId, importClientIdPrefix);
+  const existingImportedClientIds = readExistingImportedClientIds(
+    db,
+    sessionId,
+    importClientIdPrefix,
+  );
   const upsert = db.prepare(`
     INSERT INTO messages
       (id, client_id, session_id, role, content, tool_use_id, agent_meta, created_at, rewind_at)
@@ -561,19 +776,25 @@ function rewindCommit(db: Database.Database, args: unknown): void {
   const payload = asRecord(args, 'rewind.commit args');
   const sessionId = expectString(payload.sessionId, 'sessionId');
   const targetCreatedAt = expectNumber(payload.targetCreatedAt, 'targetCreatedAt');
-  const targetMessageId = typeof payload.targetMessageId === 'string' ? payload.targetMessageId : null;
+  const targetMessageId =
+    typeof payload.targetMessageId === 'string' ? payload.targetMessageId : null;
   const targetClientId = typeof payload.targetClientId === 'string' ? payload.targetClientId : null;
-  const targetMessageUuid = typeof payload.targetMessageUuid === 'string' ? payload.targetMessageUuid : null;
-  const preserveMessageUuid = typeof payload.preserveMessageUuid === 'string' ? payload.preserveMessageUuid : null;
-  const sdkSessionId = typeof payload.sdkSessionId === 'string' && payload.sdkSessionId ? payload.sdkSessionId : null;
+  const targetMessageUuid =
+    typeof payload.targetMessageUuid === 'string' ? payload.targetMessageUuid : null;
+  const preserveMessageUuid =
+    typeof payload.preserveMessageUuid === 'string' ? payload.preserveMessageUuid : null;
+  const sdkSessionId =
+    typeof payload.sdkSessionId === 'string' && payload.sdkSessionId ? payload.sdkSessionId : null;
   const requireLatestUser = payload.requireLatestUser === true;
   const now = expectNumber(payload.now, 'now');
-  const rows = db.prepare(
-    `SELECT id, client_id, role, created_at, agent_meta
+  const rows = db
+    .prepare(
+      `SELECT id, client_id, role, created_at, agent_meta
        FROM messages
       WHERE session_id = ?
         AND rewind_at IS NULL`,
-  ).all(sessionId) as RewindMessageRow[];
+    )
+    .all(sessionId) as RewindMessageRow[];
   // edit-last-message 原子守卫(requireLatestUser):与软删同一同步临界区内
   // 断言 target 之后没有更新的可见 user 消息(worker 单线程 + better-sqlite3
   // 同步执行,本函数内不可能被其它写操作打断)。命中 → 抛错,软删不发生,
@@ -583,7 +804,9 @@ function rewindCommit(db: Database.Database, args: unknown): void {
       if (row.role !== 'user') continue;
       const isNewer =
         row.created_at > targetCreatedAt ||
-        (row.created_at === targetCreatedAt && targetMessageId !== null && row.id > targetMessageId);
+        (row.created_at === targetCreatedAt &&
+          targetMessageId !== null &&
+          row.id > targetMessageId);
       if (isNewer) {
         throw new Error('REWIND_TARGET_NOT_LATEST: newer visible user message exists');
       }
@@ -630,7 +853,7 @@ function parsedObjectJson(value: string | null): Record<string, unknown> | null 
   try {
     const parsed = JSON.parse(value) as unknown;
     return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
+      ? (parsed as Record<string, unknown>)
       : null;
   } catch {
     return null;
@@ -750,12 +973,15 @@ function sessionTreeRehydrate(
   );
   const transaction = db.transaction((): string[] => {
     const session = db.prepare('SELECT id FROM sessions WHERE id = ? LIMIT 1').get(sessionId);
-    if (!session) throw Object.assign(new Error(`Session 不存在: ${sessionId}`), { code: 'NOT_FOUND' });
+    if (!session)
+      throw Object.assign(new Error(`Session 不存在: ${sessionId}`), { code: 'NOT_FOUND' });
     // 在隐藏前冻结附件来源。历史投影行(含已 rewind 的其它分支)按稳定 clientId / Pi
     // entry uuid 精确复用；首次导航按发送时持久化的 piEntryId 关联。旧 live 行没有关联时，
     // 只允许“可见公共前缀中
     // 文本和原始时间戳都一致”的保守回退，避免相同文字的另一分支附件串线。
-    const attachmentSources = selectUserAttachmentSources.all(sessionId) as TreeAttachmentSourceRow[];
+    const attachmentSources = selectUserAttachmentSources.all(
+      sessionId,
+    ) as TreeAttachmentSourceRow[];
     const byClientId = new Map(attachmentSources.map((row) => [row.client_id, row]));
     const byUuid = new Map<string, TreeAttachmentSourceRow>();
     const byLinkedPiEntryId = new Map<string, TreeAttachmentSourceRow>();
@@ -771,27 +997,30 @@ function sessionTreeRehydrate(
 
     // 原子快照当前可见集,再隐藏:导航期间(带摘要可等数分钟)并发落库的消息也在其中,
     // 交给调用方作删除广播的权威集 —— 避免用导航前的陈旧快照漏掉这条(codex review)。
-    const hiddenClientIds = (selectVisibleClientIds.all(sessionId) as { client_id: string }[])
-      .map((row) => row.client_id);
+    const hiddenClientIds = (selectVisibleClientIds.all(sessionId) as { client_id: string }[]).map(
+      (row) => row.client_id,
+    );
     hideVisible.run(now, sessionId);
     for (const row of rows) {
       let content = row.content;
       let agentMeta = row.agentMeta;
       if (row.role === 'user') {
         const uuid = treeEntryUuid(row.agentMeta);
-        let source = byClientId.get(row.clientId)
-          ?? (uuid ? byUuid.get(uuid) : undefined)
-          ?? (uuid ? byLinkedPiEntryId.get(uuid) : undefined)
-          ?? null;
+        let source =
+          byClientId.get(row.clientId) ??
+          (uuid ? byUuid.get(uuid) : undefined) ??
+          (uuid ? byLinkedPiEntryId.get(uuid) : undefined) ??
+          null;
         const candidate = visibleUserSources[visiblePrefixIndex] ?? null;
         if (source && visiblePrefixIntact && source !== candidate) {
           // 已经精确命中另一个历史分支，说明公共可见前缀在这里结束；后续消息不能
           // 再退回按文本/时间猜附件，否则会把旧活动分支的附件串到新分支。
           visiblePrefixIntact = false;
         } else if (!source && visiblePrefixIntact) {
-          const samePrefix = !!candidate
-            && candidate.created_at === row.createdAt
-            && normalizedTreeUserText(candidate.content) === normalizedTreeUserText(row.content);
+          const samePrefix =
+            !!candidate &&
+            candidate.created_at === row.createdAt &&
+            normalizedTreeUserText(candidate.content) === normalizedTreeUserText(row.content);
           if (samePrefix) source = candidate;
           else visiblePrefixIntact = false;
         }
@@ -852,12 +1081,17 @@ function selectRewindMessageIds(rows: RewindMessageRow[], opts: RewindSelectOpts
       if (selected.has(row.id)) continue;
       const meta = parseRewindAgentMeta(row.agent_meta);
       if (opts.preserveMessageUuid && meta.uuid === opts.preserveMessageUuid) continue;
-      const isTarget = (opts.targetClientId !== null && row.client_id === opts.targetClientId) ||
+      const isTarget =
+        (opts.targetClientId !== null && row.client_id === opts.targetClientId) ||
         (opts.targetMessageUuid !== null && meta.uuid === opts.targetMessageUuid);
-      const isBranchDescendant = Boolean(meta.transcriptParentUuid && branchUuids.has(meta.transcriptParentUuid));
-      const isSameTimestampTail = row.created_at === opts.targetCreatedAt &&
+      const isBranchDescendant = Boolean(
+        meta.transcriptParentUuid && branchUuids.has(meta.transcriptParentUuid),
+      );
+      const isSameTimestampTail =
+        row.created_at === opts.targetCreatedAt &&
         (opts.targetMessageId === null || row.id >= opts.targetMessageId);
-      const isLegacyTail = (row.created_at > opts.targetCreatedAt || isSameTimestampTail) &&
+      const isLegacyTail =
+        (row.created_at > opts.targetCreatedAt || isSameTimestampTail) &&
         (!hasTranscriptBranch || !meta.transcriptParentUuid);
       if (!isTarget && !isBranchDescendant && !isLegacyTail) continue;
       selected.add(row.id);
@@ -871,7 +1105,10 @@ function selectRewindMessageIds(rows: RewindMessageRow[], opts: RewindSelectOpts
   return [...selected];
 }
 
-function parseRewindAgentMeta(raw: string | null): { uuid?: string; transcriptParentUuid?: string } {
+function parseRewindAgentMeta(raw: string | null): {
+  uuid?: string;
+  transcriptParentUuid?: string;
+} {
   if (!raw || raw === 'null') return {};
   try {
     const parsed = JSON.parse(raw) as { uuid?: unknown; transcriptParentUuid?: unknown };
@@ -902,8 +1139,9 @@ function forkSession(db: Database.Database, args: unknown): { messageCount: numb
   const detachAgentSwitchSessions = payload.detachAgentSwitchSessions === true;
   const resetHandoffBoundaryClientId = nullableString(payload.resetHandoffBoundaryClientId);
   const newMessageIds = normalizeNewMessageIds(payload.newMessageIds);
-  const sourceMessages = db.prepare(
-    `SELECT client_id, role, content, tool_use_id, agent_meta, agent_kind, created_at
+  const sourceMessages = db
+    .prepare(
+      `SELECT client_id, role, content, tool_use_id, agent_meta, agent_kind, created_at
        FROM messages
       WHERE session_id = ?
         AND (? IS NULL OR created_at > ?)
@@ -913,15 +1151,16 @@ function forkSession(db: Database.Database, args: unknown): { messageCount: numb
         )
         AND rewind_at IS NULL
       ORDER BY created_at ASC, rowid ASC`,
-  ).all(
-    sourceSessionId,
-    sourceClearedAt,
-    sourceClearedAt,
-    targetCreatedAt,
-    targetRowid,
-    targetCreatedAt,
-    targetRowid,
-  ) as Array<{
+    )
+    .all(
+      sourceSessionId,
+      sourceClearedAt,
+      sourceClearedAt,
+      targetCreatedAt,
+      targetRowid,
+      targetCreatedAt,
+      targetRowid,
+    ) as Array<{
     client_id: string;
     role: string;
     content: string;
@@ -993,7 +1232,12 @@ function forkSession(db: Database.Database, args: unknown): { messageCount: numb
           resetHandoffBoundaryClientId,
         }),
         message.tool_use_id,
-        remapAgentMetaUuid(message.agent_meta, uuidMap, legacyTranscriptParentUuids, toolParentUuids),
+        remapAgentMetaUuid(
+          message.agent_meta,
+          uuidMap,
+          legacyTranscriptParentUuids,
+          toolParentUuids,
+        ),
         message.agent_kind,
         message.created_at,
       );
@@ -1025,28 +1269,102 @@ function sanitizeForkedMessageContent(
   }
 }
 
-// 会话分享(.xdtshare)导入落库:单事务插 session 行 + 全量 messages(含 rewind 链)。
+// 会话分享(.xdtshare)导入落库:单事务 CAS 软删覆盖目标 + 插 session 行 + 全量
+// messages(含 rewind 链)。
 // 行级校验放在事务体内,任一行非法 → 整体回滚零写入(导入编排的"DB 是最后一步"
 // 依赖这个原子性做免回滚)。session 已存在按 ALREADY_EXISTS 抛,编排层在
 // 冲突预检后理论上不会命中,这里是并发双导入的兜底。
 // 本文件是 inproc 回滚口;默认热路径走 file worker 的同名 handler
 // (client/WorkerThreadTransport.ts)。两份实现必须同步,typecheck 抓不到 drift。
-function sessionImportShare(db: Database.Database, args: unknown): { messageCount: number } {
+function sessionImportShare(db: Database.Database, args: unknown): SessionImportShareResult {
   const payload = asRecord(args, 'session.importShare args');
   const session = asRecord(payload.session, 'session');
   const messages = expectArray(payload.messages, 'messages');
+  const overwriteExisting =
+    payload.overwriteExisting === undefined
+      ? null
+      : asRecord(payload.overwriteExisting, 'overwriteExisting');
   const sessionId = expectString(session.id, 'session.id');
   const insertMessage = db.prepare(
     `INSERT INTO messages
       (id, client_id, session_id, role, content, tool_use_id, agent_meta, agent_kind, created_at, rewind_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
-  const transaction = db.transaction(() => {
+  const transaction = db.transaction((): SessionImportShareResult => {
     const existing = db.prepare('SELECT id FROM sessions WHERE id = ? LIMIT 1').get(sessionId);
     if (existing) {
       throw Object.assign(new Error(`session already exists: ${sessionId}`), {
         code: 'ALREADY_EXISTS',
       });
+    }
+    const agentKind = expectString(session.agentKind, 'session.agentKind');
+    const sdkSessionId = nullableString(session.sdkSessionId);
+    let replacedSession: SessionImportShareResult['replacedSession'] = null;
+    if (overwriteExisting) {
+      const runtimeOwnerId = expectString(payload.runtimeOwnerId, 'runtimeOwnerId');
+      const overwriteSessionId = expectString(
+        overwriteExisting.sessionId,
+        'overwriteExisting.sessionId',
+      );
+      const expectedStatus = expectString(
+        overwriteExisting.expectedStatus,
+        'overwriteExisting.expectedStatus',
+      );
+      if (expectedStatus !== 'active' && expectedStatus !== 'archived') {
+        throw invalidArgs(`invalid overwriteExisting.expectedStatus: ${expectedStatus}`);
+      }
+      if (!sdkSessionId) {
+        throw invalidArgs('overwriteExisting requires session.sdkSessionId');
+      }
+      const replacementUpdatedAt = expectNumber(session.updatedAt, 'session.updatedAt');
+      const replaced = db
+        .prepare(
+          `UPDATE sessions
+           SET status = 'deleted', updated_at = ?
+           WHERE id = ? AND status = ? AND agent_kind = ? AND sdk_session_id = ?
+             AND (runtime_owner_id IS NULL OR runtime_owner_id LIKE ? || ':%')
+           RETURNING id, title, working_dir AS workingDir, workspace_kind AS workspaceKind`,
+        )
+        .get(
+          replacementUpdatedAt,
+          overwriteSessionId,
+          expectedStatus,
+          agentKind,
+          sdkSessionId,
+          runtimeOwnerId,
+        ) as
+        | {
+            id: string;
+            title: string | null;
+            workingDir: string | null;
+            workspaceKind: string | null;
+          }
+        | undefined;
+      if (!replaced) {
+        throw Object.assign(new Error(`overwrite target changed: ${overwriteSessionId}`), {
+          code: 'PRECONDITION_FAILED',
+        });
+      }
+      replacedSession = {
+        sessionId: replaced.id,
+        title: replaced.title,
+        workingDir: replaced.workingDir,
+        workspaceKind: replaced.workspaceKind,
+      };
+    }
+    if (sdkSessionId) {
+      const competing = db
+        .prepare(
+          `SELECT id FROM sessions
+           WHERE agent_kind = ? AND sdk_session_id = ? AND status != 'deleted'
+           LIMIT 1`,
+        )
+        .get(agentKind, sdkSessionId);
+      if (competing) {
+        throw Object.assign(new Error(`another live session owns resume id: ${sdkSessionId}`), {
+          code: 'PRECONDITION_FAILED',
+        });
+      }
     }
     db.prepare(
       `INSERT INTO sessions (
@@ -1073,7 +1391,7 @@ function sessionImportShare(db: Database.Database, args: unknown): { messageCoun
       expectNumber(session.contextWindow, 'session.contextWindow'),
       session.fastMode ? 1 : 0,
       session.planModeEnabled ? 1 : 0,
-      expectString(session.agentKind, 'session.agentKind'),
+      agentKind,
       expectString(session.source, 'session.source'),
       expectString(session.extraDirs, 'session.extraDirs'),
       session.codexHistoryHasProductPrompt == null
@@ -1101,15 +1419,17 @@ function sessionImportShare(db: Database.Database, args: unknown): { messageCoun
         nullableNumber(m.rewindAt),
       );
     }
-    return messages.length;
+    return { messageCount: messages.length, replacedSession };
   });
-  return { messageCount: transaction() as number };
+  return transaction.immediate();
 }
 
 function embeddingMarkDone(db: Database.Database, args: unknown): void {
   const payload = asRecord(args, 'embedding.markDone args');
   const rowids = expectArray(payload.rowids, 'rowids');
-  const stmt = db.prepare(`UPDATE embedding_jobs SET status = 'done', last_error = NULL WHERE rowid = ?`);
+  const stmt = db.prepare(
+    `UPDATE embedding_jobs SET status = 'done', last_error = NULL WHERE rowid = ?`,
+  );
   const transaction = db.transaction(() => {
     for (const rowid of rowids) stmt.run(expectNumber(rowid, 'rowid'));
   });
@@ -1207,7 +1527,10 @@ function embeddingRecordFailures(db: Database.Database, args: unknown): { failCo
   return { failCount: transaction() as number };
 }
 
-function embeddingEnqueue(db: Database.Database, args: unknown): { inserted: number; skipped: number } {
+function embeddingEnqueue(
+  db: Database.Database,
+  args: unknown,
+): { inserted: number; skipped: number } {
   const payload = asRecord(args, 'embedding.enqueue args');
   const source = expectString(payload.source, 'source');
   const now = expectNumber(payload.now, 'now');
@@ -1245,7 +1568,9 @@ function orcaSetWorkerFocus(db: Database.Database, args: unknown): void {
   const teamId = expectString(payload.teamId, 'teamId');
   const workerId = expectString(payload.workerId, 'workerId');
   const now = expectNumber(payload.now, 'now');
-  const clearOthers = db.prepare('UPDATE orca_workers SET focused = 0, updated_at = ? WHERE team_id = ? AND focused = 1');
+  const clearOthers = db.prepare(
+    'UPDATE orca_workers SET focused = 0, updated_at = ? WHERE team_id = ? AND focused = 1',
+  );
   const setOne = db.prepare('UPDATE orca_workers SET focused = 1, updated_at = ? WHERE id = ?');
   db.transaction(() => {
     clearOthers.run(now, teamId);
@@ -1256,16 +1581,40 @@ function orcaSetWorkerFocus(db: Database.Database, args: unknown): void {
 function orcaRemoveWorker(db: Database.Database, args: unknown): string | null {
   const payload = asRecord(args, 'orca.removeWorker args');
   const workerId = expectString(payload.workerId, 'workerId');
+  const expectedSessionId =
+    payload.expectedSessionId === undefined
+      ? undefined
+      : expectString(payload.expectedSessionId, 'expectedSessionId');
   const now = expectNumber(payload.now, 'now');
-  const selectWorker = db.prepare('SELECT session_id AS sessionId FROM orca_workers WHERE id = ? LIMIT 1');
+  const selectWorker = db.prepare(
+    `SELECT ow.session_id AS sessionId, s.status AS sessionStatus
+     FROM orca_workers AS ow
+     LEFT JOIN sessions AS s ON s.id = ow.session_id
+     WHERE ow.id = ? LIMIT 1`,
+  );
   const deleteWorker = db.prepare('DELETE FROM orca_workers WHERE id = ?');
-  const archiveSession = db.prepare("UPDATE sessions SET status = 'archived', orca_role = NULL, updated_at = ? WHERE id = ?");
+  const archiveSession = db.prepare(
+    `UPDATE sessions
+     SET status = CASE WHEN status = 'deleted' THEN status ELSE 'archived' END,
+         orca_role = NULL,
+         updated_at = ?
+     WHERE id = ?`,
+  );
   const transaction = db.transaction(() => {
-    const row = selectWorker.get(workerId) as { sessionId: string } | undefined;
+    const row = selectWorker.get(workerId) as
+      { sessionId: string; sessionStatus: string | null } | undefined;
     if (!row) return null;
-    deleteWorker.run(workerId);
-    archiveSession.run(now, row.sessionId);
-    return row.sessionId;
+    if (expectedSessionId !== undefined && row.sessionId !== expectedSessionId) return null;
+    if (expectedSessionId !== undefined) {
+      const deleted = db
+        .prepare('DELETE FROM orca_workers WHERE id = ? AND session_id = ?')
+        .run(workerId, expectedSessionId);
+      if (deleted.changes === 0) return null;
+    } else {
+      deleteWorker.run(workerId);
+    }
+    const archived = archiveSession.run(now, row.sessionId);
+    return row.sessionStatus === 'deleted' || archived.changes === 0 ? null : row.sessionId;
   });
   return transaction() as string | null;
 }
@@ -1275,10 +1624,133 @@ function orcaCancelStaleTeams(db: Database.Database, args: unknown): void {
   const leadSessionId = expectString(payload.leadSessionId, 'leadSessionId');
   const keepTeamId = expectString(payload.keepTeamId, 'keepTeamId');
   const now = expectNumber(payload.now, 'now');
-  const cancel = db.prepare("UPDATE orca_teams SET status = 'cancelled', completed_at = ?, updated_at = ? WHERE lead_session_id = ? AND status = 'active' AND id != ?");
+  const cancel = db.prepare(
+    "UPDATE orca_teams SET status = 'cancelled', completed_at = ?, updated_at = ? WHERE lead_session_id = ? AND status = 'active' AND id != ?",
+  );
   db.transaction(() => {
     cancel.run(now, now, leadSessionId, keepTeamId);
   })();
+}
+
+function orcaArchiveWorkersByTeam(db: Database.Database, args: unknown): string[] {
+  const payload = asRecord(args, 'orca.archiveWorkersByTeam args');
+  const teamId = expectString(payload.teamId, 'teamId');
+  const sessionIds =
+    payload.sessionIds === undefined
+      ? undefined
+      : expectArray(payload.sessionIds, 'sessionIds').map((value, index) =>
+          expectString(value, `sessionIds.${index}`),
+        );
+  const now = expectNumber(payload.now, 'now');
+  return db.transaction(() => {
+    const sessionPredicate =
+      sessionIds === undefined
+        ? ''
+        : sessionIds.length === 0
+          ? ' AND 0'
+          : ` AND sessions.id IN (${sessionIds.map(() => '?').join(', ')})`;
+    const sessionParams = sessionIds ?? [];
+    db.prepare(
+      `UPDATE sessions
+       SET status = 'archived', updated_at = ?
+       WHERE status != 'deleted'
+         ${sessionPredicate}
+         AND EXISTS (
+           SELECT 1 FROM orca_teams AS ot
+           WHERE ot.id = ? AND ot.status != 'active'
+         )
+         AND EXISTS (
+           SELECT 1 FROM orca_workers AS ow
+           WHERE ow.team_id = ? AND ow.session_id = sessions.id
+         )`,
+    ).run(now, ...sessionParams, teamId, teamId);
+    const resultWhere =
+      sessionIds === undefined
+        ? ''
+        : sessionIds.length === 0
+          ? ' AND 0'
+          : ` AND s.id IN (${sessionIds.map(() => '?').join(', ')})`;
+    const rows = db
+      .prepare(
+        `SELECT DISTINCT s.id AS sessionId
+       FROM sessions AS s
+       INNER JOIN orca_workers AS ow ON ow.session_id = s.id
+       WHERE ow.team_id = ? AND s.status = 'archived'
+         AND EXISTS (
+           SELECT 1 FROM orca_teams AS ot
+           WHERE ot.id = ? AND ot.status != 'active'
+         )
+         ${resultWhere}
+       ORDER BY s.id`,
+      )
+      .all(teamId, teamId, ...sessionParams) as Array<{ sessionId: string }>;
+    return rows.map((row) => row.sessionId);
+  })() as string[];
+}
+
+function orcaReconcileInactiveTeamWorkersForLead(db: Database.Database, args: unknown): string[] {
+  const payload = asRecord(args, 'orca.reconcileInactiveTeamWorkersForLead args');
+  const leadSessionId = expectString(payload.leadSessionId, 'leadSessionId');
+  const sessionIds =
+    payload.sessionIds === undefined
+      ? undefined
+      : expectArray(payload.sessionIds, 'sessionIds').map((value, index) =>
+          expectString(value, `sessionIds.${index}`),
+        );
+  const now = expectNumber(payload.now, 'now');
+  return db.transaction(() => {
+    const sessionPredicate =
+      sessionIds === undefined
+        ? ''
+        : sessionIds.length === 0
+          ? ' AND 0'
+          : ` AND s.id IN (${sessionIds.map(() => '?').join(', ')})`;
+    const sessionParams = sessionIds ?? [];
+    const rows = db
+      .prepare(
+        `SELECT DISTINCT s.id AS sessionId
+       FROM sessions AS s
+       INNER JOIN orca_workers AS ow ON ow.session_id = s.id
+       INNER JOIN orca_teams AS ot ON ot.id = ow.team_id
+       WHERE ot.lead_session_id = ? AND ot.status != 'active' AND s.status = 'active'
+         ${sessionPredicate}
+       ORDER BY s.id`,
+      )
+      .all(leadSessionId, ...sessionParams) as Array<{ sessionId: string }>;
+    const workerSessionPredicate =
+      sessionIds === undefined
+        ? ''
+        : sessionIds.length === 0
+          ? ' AND 0'
+          : ` AND orca_workers.session_id IN (${sessionIds.map(() => '?').join(', ')})`;
+    db.prepare(
+      `UPDATE sessions
+       SET status = 'archived', updated_at = ?
+       WHERE status = 'active'
+         ${sessionIds === undefined ? '' : sessionIds.length === 0 ? ' AND 0' : ` AND sessions.id IN (${sessionIds.map(() => '?').join(', ')})`}
+         AND EXISTS (
+           SELECT 1
+           FROM orca_workers AS ow
+           INNER JOIN orca_teams AS ot ON ot.id = ow.team_id
+           WHERE ow.session_id = sessions.id
+             AND ot.lead_session_id = ?
+             AND ot.status != 'active'
+         )`,
+    ).run(now, ...(sessionIds ?? []), leadSessionId);
+    db.prepare(
+      `UPDATE orca_workers
+       SET status = 'done', updated_at = ?
+       WHERE 1 = 1
+         ${workerSessionPredicate}
+         AND EXISTS (
+         SELECT 1 FROM orca_teams AS ot
+         WHERE ot.id = orca_workers.team_id
+           AND ot.lead_session_id = ?
+           AND ot.status != 'active'
+       )`,
+    ).run(now, ...(sessionIds ?? []), leadSessionId);
+    return rows.map((row) => row.sessionId);
+  })() as string[];
 }
 
 function orcaUpsertWorker(db: Database.Database, args: unknown): void {
@@ -1289,40 +1761,63 @@ function orcaUpsertWorker(db: Database.Database, args: unknown): void {
   const now = expectNumber(payload.now, 'now');
   db.transaction(() => {
     if (payload.focused === true) {
-      db.prepare('UPDATE orca_workers SET focused = 0, updated_at = ? WHERE team_id = ? AND focused = 1').run(now, teamId);
+      db.prepare(
+        'UPDATE orca_workers SET focused = 0, updated_at = ? WHERE team_id = ? AND focused = 1',
+      ).run(now, teamId);
     }
-    const existing = db.prepare('SELECT * FROM orca_workers WHERE id = ? LIMIT 1').get(id) as Record<string, unknown> | undefined;
+    const existing = db.prepare('SELECT * FROM orca_workers WHERE id = ? LIMIT 1').get(id) as
+      Record<string, unknown> | undefined;
     if (existing) {
-      db.prepare('UPDATE orca_workers SET team_id = ?, session_id = ?, status = ?, label = ?, worktree_branch = ?, role = ?, focused = ?, idle_since = ?, updated_at = ? WHERE id = ?').run(
+      db.prepare(
+        'UPDATE orca_workers SET team_id = ?, session_id = ?, status = ?, label = ?, worktree_branch = ?, role = ?, focused = ?, idle_since = ?, updated_at = ? WHERE id = ?',
+      ).run(
         teamId,
         sessionId,
         payload.status != null ? payload.status : existing.status,
         payload.label === undefined ? existing.label : nullableString(payload.label),
-        payload.worktreeBranch === undefined ? existing.worktree_branch : nullableString(payload.worktreeBranch),
+        payload.worktreeBranch === undefined
+          ? existing.worktree_branch
+          : nullableString(payload.worktreeBranch),
         payload.role === undefined ? existing.role : expectString(payload.role, 'role'),
-        payload.focused === undefined ? existing.focused : (payload.focused ? 1 : 0),
-        payload.idleSince === undefined ? existing.idle_since : (payload.idleSince == null ? null : expectNumber(payload.idleSince, 'idleSince')),
+        payload.focused === undefined ? existing.focused : payload.focused ? 1 : 0,
+        payload.idleSince === undefined
+          ? existing.idle_since
+          : payload.idleSince == null
+            ? null
+            : expectNumber(payload.idleSince, 'idleSince'),
         now,
         id,
       );
       return;
     }
-    const bySession = db.prepare('SELECT * FROM orca_workers WHERE session_id = ? LIMIT 1').get(sessionId) as Record<string, unknown> | undefined;
+    const bySession = db
+      .prepare('SELECT * FROM orca_workers WHERE session_id = ? LIMIT 1')
+      .get(sessionId) as Record<string, unknown> | undefined;
     if (bySession) {
-      db.prepare('UPDATE orca_workers SET team_id = ?, status = ?, label = ?, worktree_branch = ?, role = ?, focused = ?, idle_since = ?, updated_at = ? WHERE session_id = ?').run(
+      db.prepare(
+        'UPDATE orca_workers SET team_id = ?, status = ?, label = ?, worktree_branch = ?, role = ?, focused = ?, idle_since = ?, updated_at = ? WHERE session_id = ?',
+      ).run(
         teamId,
         payload.status != null ? payload.status : bySession.status,
         payload.label === undefined ? bySession.label : nullableString(payload.label),
-        payload.worktreeBranch === undefined ? bySession.worktree_branch : nullableString(payload.worktreeBranch),
+        payload.worktreeBranch === undefined
+          ? bySession.worktree_branch
+          : nullableString(payload.worktreeBranch),
         payload.role === undefined ? bySession.role : expectString(payload.role, 'role'),
-        payload.focused === undefined ? bySession.focused : (payload.focused ? 1 : 0),
-        payload.idleSince === undefined ? bySession.idle_since : (payload.idleSince == null ? null : expectNumber(payload.idleSince, 'idleSince')),
+        payload.focused === undefined ? bySession.focused : payload.focused ? 1 : 0,
+        payload.idleSince === undefined
+          ? bySession.idle_since
+          : payload.idleSince == null
+            ? null
+            : expectNumber(payload.idleSince, 'idleSince'),
         now,
         sessionId,
       );
       return;
     }
-    db.prepare('INSERT INTO orca_workers (id, team_id, session_id, status, label, worktree_branch, role, focused, idle_since, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)').run(
+    db.prepare(
+      'INSERT INTO orca_workers (id, team_id, session_id, status, label, worktree_branch, role, focused, idle_since, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+    ).run(
       id,
       teamId,
       sessionId,
@@ -1349,41 +1844,56 @@ function orcaReserveWorkerCreation(db: Database.Database, args: unknown): unknow
   return db.transaction(() => {
     // DELETE 即使没有命中也会先取得 writer lock，后续检查与 INSERT 因而跨连接串行。
     db.prepare('DELETE FROM orca_worker_creation_reservations WHERE expires_at <= ?').run(now);
-    const duplicateWorker = db.prepare(
-      'SELECT 1 FROM orca_workers WHERE team_id = ? AND label = ? COLLATE NOCASE LIMIT 1',
-    ).get(teamId, label);
-    const duplicateReservation = db.prepare(
-      'SELECT 1 FROM orca_worker_creation_reservations WHERE team_id = ? AND label = ? COLLATE NOCASE LIMIT 1',
-    ).get(teamId, label);
+    const duplicateWorker = db
+      .prepare('SELECT 1 FROM orca_workers WHERE team_id = ? AND label = ? COLLATE NOCASE LIMIT 1')
+      .get(teamId, label);
+    const duplicateReservation = db
+      .prepare(
+        'SELECT 1 FROM orca_worker_creation_reservations WHERE team_id = ? AND label = ? COLLATE NOCASE LIMIT 1',
+      )
+      .get(teamId, label);
     if (duplicateWorker) return { ok: false, errorCode: 'DUPLICATE_LABEL' };
     if (duplicateReservation) return { ok: false, errorCode: 'WORKER_CREATION_IN_PROGRESS' };
     // Worker 进入终态仍占槽，只有关联 session 归档后才释放。
-    const occupiedWorkerCount = Number(db.prepare(`SELECT COUNT(*)
+    const occupiedWorkerCount = Number(
+      db
+        .prepare(
+          `SELECT COUNT(*)
       FROM orca_workers w INNER JOIN sessions s ON s.id = w.session_id
-      WHERE w.team_id = ? AND s.status = 'active'`).pluck().get(teamId) || 0);
-    const reservationCount = Number(db.prepare(
-      'SELECT COUNT(*) FROM orca_worker_creation_reservations WHERE team_id = ?',
-    ).pluck().get(teamId) || 0);
+      WHERE w.team_id = ? AND s.status = 'active'`,
+        )
+        .pluck()
+        .get(teamId) || 0,
+    );
+    const reservationCount = Number(
+      db
+        .prepare('SELECT COUNT(*) FROM orca_worker_creation_reservations WHERE team_id = ?')
+        .pluck()
+        .get(teamId) || 0,
+    );
     const occupiedSlotsBefore = occupiedWorkerCount + reservationCount;
     if (occupiedSlotsBefore >= hardLimit) {
       return { ok: false, errorCode: 'WORKER_LIMIT_HARD_EXCEEDED' };
     }
-    db.prepare(`INSERT INTO orca_worker_creation_reservations
-      (id, team_id, label, created_at, expires_at) VALUES (?, ?, ?, ?, ?)`)
-      .run(reservationId, teamId, label, now, expiresAt);
+    db.prepare(
+      `INSERT INTO orca_worker_creation_reservations
+      (id, team_id, label, created_at, expires_at) VALUES (?, ?, ?, ?, ?)`,
+    ).run(reservationId, teamId, label, now, expiresAt);
     return { ok: true, occupiedSlotsBefore };
   })();
 }
 
 function orcaRenewWorkerCreationReservation(db: Database.Database, args: unknown): boolean {
   const payload = asRecord(args, 'orca.renewWorkerCreationReservation args');
-  const result = db.prepare(
-    'UPDATE orca_worker_creation_reservations SET expires_at = ? WHERE id = ? AND expires_at > ?',
-  ).run(
-    expectNumber(payload.expiresAt, 'expiresAt'),
-    expectString(payload.reservationId, 'reservationId'),
-    expectNumber(payload.now, 'now'),
-  );
+  const result = db
+    .prepare(
+      'UPDATE orca_worker_creation_reservations SET expires_at = ? WHERE id = ? AND expires_at > ?',
+    )
+    .run(
+      expectNumber(payload.expiresAt, 'expiresAt'),
+      expectString(payload.reservationId, 'reservationId'),
+      expectNumber(payload.now, 'now'),
+    );
   return result.changes === 1;
 }
 
@@ -1399,11 +1909,15 @@ function readExistingImportedClientIds(
   sessionId: string,
   importClientIdPrefix: string,
 ): Set<string> {
-  const rows = db.prepare(`
+  const rows = db
+    .prepare(
+      `
     SELECT client_id AS clientId
     FROM messages
     WHERE session_id = ? AND client_id LIKE ?
-  `).all(sessionId, `${importClientIdPrefix}%`) as Array<{ clientId: string }>;
+  `,
+    )
+    .all(sessionId, `${importClientIdPrefix}%`) as Array<{ clientId: string }>;
   return new Set(rows.map((row) => row.clientId));
 }
 
@@ -1427,13 +1941,17 @@ function readExistingMessageFingerprints(
   sessionId: string,
   importClientIdPrefix: string,
 ): MessageFingerprint[] {
-  const rows = db.prepare(`
+  const rows = db
+    .prepare(
+      `
     SELECT role, content, created_at AS createdAt
     FROM messages
     WHERE session_id = ?
       AND role IN ('user', 'assistant')
       AND client_id NOT LIKE ?
-  `).all(sessionId, `${importClientIdPrefix}%`) as Array<{
+  `,
+    )
+    .all(sessionId, `${importClientIdPrefix}%`) as Array<{
     role: string;
     content: string;
     createdAt: number;
@@ -1567,7 +2085,10 @@ function extractContentText(content: unknown): string {
   for (const block of content) {
     if (!isRecord(block)) continue;
     const type = typeof block.type === 'string' ? block.type : '';
-    if ((type === 'input_text' || type === 'output_text' || type === 'text') && typeof block.text === 'string') {
+    if (
+      (type === 'input_text' || type === 'output_text' || type === 'text') &&
+      typeof block.text === 'string'
+    ) {
       parts.push(block.text);
     }
   }
@@ -1617,14 +2138,17 @@ function remapAgentMetaUuid(
 
 function normalizeStringSet(value: unknown, label: string): Set<string> {
   if (value === undefined) return new Set();
-  return new Set(expectArray(value, label).map((item, index) => expectString(item, `${label}.${index}`)));
+  return new Set(
+    expectArray(value, label).map((item, index) => expectString(item, `${label}.${index}`)),
+  );
 }
 
 function normalizeUuidMap(value: unknown): Map<string, string> {
   if (Array.isArray(value)) {
     return new Map(
       value.map((entry) => {
-        if (!Array.isArray(entry) || entry.length !== 2) throw invalidArgs('uuidMap entries must be pairs');
+        if (!Array.isArray(entry) || entry.length !== 2)
+          throw invalidArgs('uuidMap entries must be pairs');
         return [expectString(entry[0], 'uuidMap.key'), expectString(entry[1], 'uuidMap.value')];
       }),
     );
@@ -1647,7 +2171,9 @@ function normalizeNewMessageIds(value: unknown): Array<{ id: string; clientId: s
 
 function assertIdentifier(value: string): void {
   if (!/^[A-Za-z0-9_]+$/.test(value)) {
-    throw Object.assign(new Error(`invalid vec_table identifier: ${value}`), { code: 'INVALID_ARGS' });
+    throw Object.assign(new Error(`invalid vec_table identifier: ${value}`), {
+      code: 'INVALID_ARGS',
+    });
   }
 }
 

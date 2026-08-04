@@ -14,6 +14,7 @@ import path from 'node:path';
 import { ne } from 'drizzle-orm';
 
 import { getDbClient } from '../localDb/client/current';
+import type { DbClient } from '../localDb/client/DbClient';
 import { sessions } from '../localDb/schema';
 import { createLogger } from '../logger';
 
@@ -43,6 +44,8 @@ export function pathKey(p: string | null | undefined): string | null {
 export type LiveSessionPathKeys = ReadonlySet<string> | null;
 
 export interface LoadLiveSessionPathKeysOptions {
+  /** Captured owner database for startup reconciliation. */
+  dbClient?: DbClient;
   /** 日志上下文（定位是哪条 worktree 的检查失败）。 */
   contextPath?: string;
   /**
@@ -56,7 +59,7 @@ export async function loadLiveSessionPathKeys(
   opts: LoadLiveSessionPathKeysOptions = {},
 ): Promise<LiveSessionPathKeys> {
   try {
-    const db = getDbClient().drizzle;
+    const db = (opts.dbClient ?? getDbClient()).drizzle;
     const rows = await db
       .select({
         id: sessions.id,

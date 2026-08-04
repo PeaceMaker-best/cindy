@@ -199,7 +199,6 @@ async function applyGeneratedSessionDisposition(
         await sessionService.update(sessionId, { status: 'archived', pinnedAt: null });
       } else {
         await sessionService.update(sessionId, { status: 'deleted' });
-        void window.electronAPI.cleanupSessionImages(sessionId).catch(() => undefined);
       }
       makerChatStore.purgeSession(sessionId);
       discardComposerDraft(sessionId);

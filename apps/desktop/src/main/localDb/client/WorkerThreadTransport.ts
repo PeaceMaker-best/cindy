@@ -300,16 +300,26 @@ function dispatchTx(readyDb, payload) {
       return orcaRemoveWorker(readyDb, request.args);
     case 'orca.cancelStaleTeams':
       return orcaCancelStaleTeams(readyDb, request.args);
+    case 'orca.archiveWorkersByTeam':
+      return orcaArchiveWorkersByTeam(readyDb, request.args);
+    case 'orca.reconcileInactiveTeamWorkersForLead':
+      return orcaReconcileInactiveTeamWorkersForLead(readyDb, request.args);
     case 'sessions.renameTitles':
       return sessionsRenameTitles(readyDb, request.args);
     case 'sessions.setStatus':
       return sessionsSetStatus(readyDb, request.args);
+    case 'session.prepareDeletedLifecycle':
+      return sessionPrepareDeletedLifecycle(readyDb, request.args);
+    case 'session.replaceDeletedGeneration':
+      return sessionReplaceDeletedGeneration(readyDb, request.args);
     case 'session.agentSwitchFallback':
       return sessionAgentSwitchFallback(readyDb, request.args);
     case 'message.delete':
       return messageDelete(readyDb, request.args);
     case 'im.deleteBindings':
       return imDeleteBindings(readyDb, request.args);
+    case 'im.deleteBindingIfTarget':
+      return imDeleteBindingIfTarget(readyDb, request.args);
     case 'im.replaceBinding':
       return imReplaceBinding(readyDb, request.args);
     case 'session.importShare':
@@ -334,7 +344,7 @@ function imDeleteBindings(readyDb, args) {
   const deleteBinding = readyDb.prepare(
     'DELETE FROM im_bindings WHERE channel = ? AND bot_context_id = ? AND user_id = ? AND scope_key = ?',
   );
-  return readyDb.transaction(() => {
+  const transaction = readyDb.transaction(() => {
     for (const identity of identities) {
       deleteBinding.run(
         identity.channel,
@@ -343,7 +353,29 @@ function imDeleteBindings(readyDb, args) {
         identity.scopeKey,
       );
     }
-  })();
+  });
+  transaction();
+}
+
+// ⚠️ 与 worker/opHandlers/tx.ts 的 imDeleteBindingIfTarget 保持一致。
+function imDeleteBindingIfTarget(readyDb, args) {
+  const payload = asRecord(args, 'im.deleteBindingIfTarget args');
+  const channel = expectString(payload.channel, 'channel');
+  const botContextId = expectString(payload.botContextId, 'botContextId');
+  const userId = expectString(payload.userId, 'userId');
+  const scopeKey = expectString(payload.scopeKey, 'scopeKey');
+  const targetSessionId = expectString(payload.targetSessionId, 'targetSessionId');
+  const transaction = readyDb.transaction(() => {
+    const deleted = readyDb
+      .prepare(
+        'DELETE FROM im_bindings WHERE channel = ? AND bot_context_id = ? AND user_id = ? AND scope_key = ? AND target_session_id = ?',
+      )
+      .run(channel, botContextId, userId, scopeKey, targetSessionId);
+    if (deleted.changes === 0) return false;
+    readyDb.prepare('DELETE FROM im_bindings WHERE target_session_id = ?').run(targetSessionId);
+    return true;
+  });
+  return transaction();
 }
 
 // ⚠️ 与 worker/opHandlers/tx.ts 的 imReplaceBinding 保持一致。
@@ -356,7 +388,7 @@ function imReplaceBinding(readyDb, args) {
   const targetSessionId = expectString(payload.targetSessionId, 'targetSessionId');
   const attachedAt = expectNumber(payload.attachedAt, 'attachedAt');
   const attachedViaCardMessageId = nullableString(payload.attachedViaCardMessageId);
-  return readyDb.transaction(() => {
+  const transaction = readyDb.transaction(() => {
     readyDb.prepare(
       'DELETE FROM im_bindings WHERE target_session_id = ? OR (channel = ? AND bot_context_id = ? AND user_id = ? AND scope_key = ?)',
     ).run(targetSessionId, channel, botContextId, userId, scopeKey);
@@ -371,7 +403,8 @@ function imReplaceBinding(readyDb, args) {
       attachedAt,
       attachedViaCardMessageId,
     );
-  })();
+  });
+  transaction();
 }
 
 // ⚠️ 与 worker/opHandlers/tx.ts 的同名事务保持一致。
@@ -381,7 +414,7 @@ function sessionAgentSwitchFallback(readyDb, args) {
   const boundaryClientId = expectString(payload.boundaryClientId, 'boundaryClientId');
   const boundaryContent = expectString(payload.boundaryContent, 'boundaryContent');
   const updatedAt = expectNumber(payload.updatedAt, 'updatedAt');
-  return readyDb.transaction(() => {
+  const transaction = readyDb.transaction(() => {
     const sessionResult = readyDb.prepare(
       'UPDATE sessions SET sdk_session_id = NULL, updated_at = ? WHERE id = ?',
     ).run(updatedAt, sessionId);
@@ -396,7 +429,8 @@ function sessionAgentSwitchFallback(readyDb, args) {
         code: 'NOT_FOUND',
       });
     }
-  })();
+  });
+  transaction();
 }
 
 // ⚠️ 与 worker/opHandlers/tx.ts 的同名事务保持一致。
@@ -551,14 +585,15 @@ function sessionsSetStatus(readyDb, args) {
     expectString(id, 'sessionId'),
   );
   const status = expectString(payload.status, 'status');
+  const runtimeOwnerId = expectString(payload.runtimeOwnerId, 'runtimeOwnerId');
   if (status !== 'active' && status !== 'archived') {
     throw Object.assign(new Error('invalid status: ' + status), { code: 'INVALID_ARGS' });
   }
   const selectSession = readyDb.prepare(
-    'SELECT id, title, working_dir AS workingDir, workspace_kind AS workspaceKind FROM sessions WHERE id = ? LIMIT 1',
+    'SELECT id, title, working_dir AS workingDir, workspace_kind AS workspaceKind, status, runtime_owner_id AS runtimeOwnerId FROM sessions WHERE id = ? LIMIT 1',
   );
   const updateSession = readyDb.prepare(
-    'UPDATE sessions SET status = ?, updated_at = ? WHERE id = ? RETURNING id, title, working_dir AS workingDir, workspace_kind AS workspaceKind',
+    "UPDATE sessions SET status = ?, updated_at = ? WHERE id = ? AND (runtime_owner_id IS NULL OR runtime_owner_id LIKE ? || ':%') RETURNING id, title, working_dir AS workingDir, workspace_kind AS workspaceKind",
   );
   return readyDb.transaction(() => {
     const applied = [];
@@ -566,8 +601,14 @@ function sessionsSetStatus(readyDb, args) {
     for (const sessionId of sessionIds) {
       const existing = selectSession.get(sessionId);
       if (!existing) throw Object.assign(new Error('Session 不存在: ' + sessionId), { code: 'NOT_FOUND' });
-      const updated = updateSession.get(status, now, sessionId);
-      if (!updated) throw Object.assign(new Error('Session 不存在: ' + sessionId), { code: 'NOT_FOUND' });
+      if (existing.status === 'deleted') {
+        throw Object.assign(new Error('Session 已永久删除，不能恢复: ' + sessionId), { code: 'PRECONDITION_FAILED' });
+      }
+      if (existing.runtimeOwnerId && !existing.runtimeOwnerId.startsWith(runtimeOwnerId + ':')) {
+        throw Object.assign(new Error('Session 正由另一个 Cindy 实例运行: ' + sessionId), { code: 'PRECONDITION_FAILED' });
+      }
+      const updated = updateSession.get(status, now, sessionId, runtimeOwnerId);
+      if (!updated) throw Object.assign(new Error('Session 状态或 runtime owner 已变化: ' + sessionId), { code: 'PRECONDITION_FAILED' });
       applied.push({
         sessionId: updated.id,
         title: updated.title,
@@ -580,21 +621,121 @@ function sessionsSetStatus(readyDb, args) {
   })();
 }
 
+// ⚠️ 与 worker/opHandlers/tx.ts 的 deleted lifecycle helpers 保持同步。
+function prepareDeletedSessionRelations(readyDb, sessionId, now) {
+  const current = readyDb.prepare('SELECT status FROM sessions WHERE id = ? LIMIT 1').get(sessionId);
+  if (!current || current.status !== 'deleted') return false;
+  readyDb.prepare('UPDATE sessions SET runtime_owner_id = NULL, runtime_owner_pid = NULL, runtime_owner_process_start = NULL, runtime_owner_heartbeat_at = NULL WHERE id = ?').run(sessionId);
+  readyDb.prepare('UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?').run(sessionId);
+  readyDb.prepare('DELETE FROM orca_teams WHERE lead_session_id = ?').run(sessionId);
+  readyDb.prepare('DELETE FROM orca_workers WHERE session_id = ?').run(sessionId);
+  readyDb.prepare('DELETE FROM im_bindings WHERE target_session_id = ?').run(sessionId);
+  readyDb.prepare('DELETE FROM session_goals WHERE session_id = ?').run(sessionId);
+  readyDb.prepare('DELETE FROM agent_input_queue_snapshots WHERE session_id = ?').run(sessionId);
+  readyDb.prepare('DELETE FROM right_sidebar_tabs WHERE session_id = ?').run(sessionId);
+  readyDb.prepare('DELETE FROM session_pr_refs WHERE session_id = ?').run(sessionId);
+  readyDb.prepare('UPDATE schedules SET target_session_id = NULL, updated_at = ? WHERE target_session_id = ?').run(now, sessionId);
+  readyDb.prepare('UPDATE schedules SET skip_log_session_id = NULL, updated_at = ? WHERE skip_log_session_id = ?').run(now, sessionId);
+  readyDb.prepare('UPDATE schedule_runs SET session_id = NULL WHERE session_id = ?').run(sessionId);
+  readyDb.prepare("UPDATE wechat_inbox SET status = 'cancelled', lease_until = NULL, last_error_code = 'SESSION_DELETED' WHERE session_id = ? AND status IN ('pending', 'dispatching')").run(sessionId);
+  readyDb.prepare("UPDATE wechat_inbox SET status = 'interrupted', lease_until = NULL, last_error_code = 'SESSION_DELETED' WHERE session_id = ? AND status IN ('accepted_running', 'waiting_desktop')").run(sessionId);
+  readyDb.prepare("DELETE FROM media_refs WHERE ref_kind IN ('im-inbox', 'wechat-inbox') AND ref_id IN (SELECT id FROM wechat_inbox WHERE session_id = ? AND status IN ('cancelled', 'interrupted'))").run(sessionId);
+  readyDb.prepare("UPDATE wechat_file_attachments SET status = 'released' WHERE session_id = ? AND status = 'staged' AND task_id IN (SELECT id FROM wechat_inbox WHERE session_id = ? AND status IN ('cancelled', 'interrupted'))").run(sessionId, sessionId);
+  readyDb.prepare('DELETE FROM skill_usage_exposures WHERE session_id = ?').run(sessionId);
+  readyDb.prepare('DELETE FROM skill_usage_sources WHERE session_id = ?').run(sessionId);
+  readyDb.prepare('DELETE FROM ghost_cards WHERE session_id = ?').run(sessionId);
+  return true;
+}
+
+function sessionPrepareDeletedLifecycle(readyDb, args) {
+  const payload = asRecord(args, 'session.prepareDeletedLifecycle args');
+  const sessionId = expectString(payload.sessionId, 'sessionId');
+  const now = expectNumber(payload.now, 'now');
+  return readyDb.transaction(() => prepareDeletedSessionRelations(readyDb, sessionId, now))();
+}
+
+function sessionReplaceDeletedGeneration(readyDb, args) {
+  const payload = asRecord(args, 'session.replaceDeletedGeneration args');
+  const oldSessionId = expectString(payload.oldSessionId, 'oldSessionId');
+  const newSessionId = expectString(payload.newSessionId, 'newSessionId');
+  const logicalSessionId = expectString(payload.logicalSessionId, 'logicalSessionId');
+  const generation = expectNumber(payload.generation, 'generation');
+  const now = expectNumber(payload.now, 'now');
+  const nullableText = (key) => nullableString(payload[key]);
+  const transaction = readyDb.transaction(() => {
+    const latest = readyDb.prepare("SELECT id, status, im_generation AS generation FROM sessions WHERE COALESCE(im_logical_session_id, id) = ? ORDER BY im_generation DESC, created_at DESC, id DESC LIMIT 1").get(logicalSessionId);
+    if (latest && latest.status !== 'deleted') return latest.id;
+    if (!latest || latest.id !== oldSessionId || generation !== latest.generation + 1 || !prepareDeletedSessionRelations(readyDb, oldSessionId, now)) return null;
+    readyDb.prepare(
+      "INSERT OR IGNORE INTO sessions (id, title, working_dir, workspace_kind, model, effort, permission_mode, provider_id, fast_mode, agent_kind, status, source, feishu_open_id, feishu_bot_app_id, im_bot_context_id, im_user_id, im_logical_session_id, im_generation, sdk_session_id, cleared_at, user_send_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)",
+    ).run(
+      newSessionId, expectString(payload.title, 'title'), expectString(payload.workingDir, 'workingDir'),
+      expectString(payload.workspaceKind, 'workspaceKind'), expectString(payload.model, 'model'),
+      expectString(payload.effort, 'effort'), expectString(payload.permissionMode, 'permissionMode'),
+      nullableText('providerId'), payload.fastMode === true ? 1 : 0,
+      expectString(payload.agentKind, 'agentKind'), expectString(payload.source, 'source'),
+      nullableText('feishuOpenId'), nullableText('feishuBotAppId'), nullableText('imBotContextId'),
+      nullableText('imUserId'), logicalSessionId, generation, now, now, now,
+    );
+    const created = readyDb.prepare("SELECT id FROM sessions WHERE im_logical_session_id = ? AND status != 'deleted' ORDER BY im_generation DESC LIMIT 1").get(logicalSessionId);
+    return created ? created.id : null;
+  });
+  return transaction.immediate();
+}
+
 // 会话分享(.xdtshare)导入落库: 与 worker/opHandlers/tx.ts 的同名 handler 保持一致。
-// 单事务插 session 行 + 全量 messages, 任一行非法整体回滚零写入;
+// 单事务 CAS 软删覆盖目标 + 插 session 行 + 全量 messages,任一行非法整体回滚零写入;
 // session 已存在按 ALREADY_EXISTS 抛(并发双导入兜底)。
 function sessionImportShare(readyDb, args) {
   const payload = asRecord(args, 'session.importShare args');
   const session = asRecord(payload.session, 'session');
   const messages = expectArray(payload.messages, 'messages');
+  const overwriteExisting = payload.overwriteExisting === undefined
+    ? null
+    : asRecord(payload.overwriteExisting, 'overwriteExisting');
   const sessionId = expectString(session.id, 'session.id');
   const insertMessage = readyDb.prepare(
     'INSERT INTO messages (id, client_id, session_id, role, content, tool_use_id, agent_meta, agent_kind, created_at, rewind_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
   );
-  const messageCount = readyDb.transaction(() => {
+  return readyDb.transaction(() => {
     const existing = readyDb.prepare('SELECT id FROM sessions WHERE id = ? LIMIT 1').get(sessionId);
     if (existing) {
       throw Object.assign(new Error('session already exists: ' + sessionId), { code: 'ALREADY_EXISTS' });
+    }
+    const agentKind = expectString(session.agentKind, 'session.agentKind');
+    const sdkSessionId = nullableString(session.sdkSessionId);
+    let replacedSession = null;
+    if (overwriteExisting) {
+      const runtimeOwnerId = expectString(payload.runtimeOwnerId, 'runtimeOwnerId');
+      const overwriteSessionId = expectString(overwriteExisting.sessionId, 'overwriteExisting.sessionId');
+      const expectedStatus = expectString(overwriteExisting.expectedStatus, 'overwriteExisting.expectedStatus');
+      if (expectedStatus !== 'active' && expectedStatus !== 'archived') {
+        throw Object.assign(new Error('invalid overwriteExisting.expectedStatus: ' + expectedStatus), { code: 'INVALID_ARGS' });
+      }
+      if (!sdkSessionId) {
+        throw Object.assign(new Error('overwriteExisting requires session.sdkSessionId'), { code: 'INVALID_ARGS' });
+      }
+      const replacementUpdatedAt = expectNumber(session.updatedAt, 'session.updatedAt');
+      const replaced = readyDb.prepare(
+        "UPDATE sessions SET status = 'deleted', updated_at = ? WHERE id = ? AND status = ? AND agent_kind = ? AND sdk_session_id = ? AND (runtime_owner_id IS NULL OR runtime_owner_id LIKE ? || ':%') RETURNING id, title, working_dir AS workingDir, workspace_kind AS workspaceKind",
+      ).get(replacementUpdatedAt, overwriteSessionId, expectedStatus, agentKind, sdkSessionId, runtimeOwnerId);
+      if (!replaced) {
+        throw Object.assign(new Error('overwrite target changed: ' + overwriteSessionId), { code: 'PRECONDITION_FAILED' });
+      }
+      replacedSession = {
+        sessionId: replaced.id,
+        title: replaced.title,
+        workingDir: replaced.workingDir,
+        workspaceKind: replaced.workspaceKind,
+      };
+    }
+    if (sdkSessionId) {
+      const competing = readyDb.prepare(
+        "SELECT id FROM sessions WHERE agent_kind = ? AND sdk_session_id = ? AND status != 'deleted' LIMIT 1",
+      ).get(agentKind, sdkSessionId);
+      if (competing) {
+        throw Object.assign(new Error('another live session owns resume id: ' + sdkSessionId), { code: 'PRECONDITION_FAILED' });
+      }
     }
     readyDb.prepare(
       'INSERT INTO sessions (id, title, working_dir, workspace_kind, worktree_path, model, effort, permission_mode, provider_id, status, sdk_session_id, total_token_usage, total_cost_usd, context_tokens, context_window, fast_mode, plan_mode_enabled, agent_kind, source, extra_dirs, codex_history_has_product_prompt, cleared_at, user_send_at, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
@@ -616,7 +757,7 @@ function sessionImportShare(readyDb, args) {
       expectNumber(session.contextWindow, 'session.contextWindow'),
       session.fastMode ? 1 : 0,
       session.planModeEnabled ? 1 : 0,
-      expectString(session.agentKind, 'session.agentKind'),
+      agentKind,
       expectString(session.source, 'session.source'),
       expectString(session.extraDirs, 'session.extraDirs'),
       session.codexHistoryHasProductPrompt == null ? null : (session.codexHistoryHasProductPrompt ? 1 : 0),
@@ -640,9 +781,8 @@ function sessionImportShare(readyDb, args) {
         nullableNumber(m.rewindAt),
       );
     }
-    return messages.length;
-  })();
-  return { messageCount };
+    return { messageCount: messages.length, replacedSession };
+  }).immediate();
 }
 
 // ⚠️ F-COLLAB orca 事务: 与 worker/opHandlers/tx.ts 的同名 handler 必须逐字保持一致。
@@ -664,16 +804,29 @@ function orcaSetWorkerFocus(readyDb, args) {
 function orcaRemoveWorker(readyDb, args) {
   const payload = asRecord(args, 'orca.removeWorker args');
   const workerId = expectString(payload.workerId, 'workerId');
+  const expectedSessionId = payload.expectedSessionId === undefined
+    ? undefined
+    : expectString(payload.expectedSessionId, 'expectedSessionId');
   const now = expectNumber(payload.now, 'now');
-  const selectWorker = readyDb.prepare('SELECT session_id AS sessionId FROM orca_workers WHERE id = ? LIMIT 1');
+  const selectWorker = readyDb.prepare(
+    'SELECT ow.session_id AS sessionId, s.status AS sessionStatus FROM orca_workers AS ow LEFT JOIN sessions AS s ON s.id = ow.session_id WHERE ow.id = ? LIMIT 1',
+  );
   const deleteWorker = readyDb.prepare('DELETE FROM orca_workers WHERE id = ?');
-  const archiveSession = readyDb.prepare("UPDATE sessions SET status = 'archived', orca_role = NULL, updated_at = ? WHERE id = ?");
+  const archiveSession = readyDb.prepare(
+    "UPDATE sessions SET status = CASE WHEN status = 'deleted' THEN status ELSE 'archived' END, orca_role = NULL, updated_at = ? WHERE id = ?",
+  );
   return readyDb.transaction(() => {
     const row = selectWorker.get(workerId);
     if (!row) return null;
-    deleteWorker.run(workerId);
-    archiveSession.run(now, row.sessionId);
-    return row.sessionId;
+    if (expectedSessionId !== undefined && row.sessionId !== expectedSessionId) return null;
+    if (expectedSessionId !== undefined) {
+      const deleted = readyDb.prepare('DELETE FROM orca_workers WHERE id = ? AND session_id = ?').run(workerId, expectedSessionId);
+      if (deleted.changes === 0) return null;
+    } else {
+      deleteWorker.run(workerId);
+    }
+    const archived = archiveSession.run(now, row.sessionId);
+    return row.sessionStatus === 'deleted' || archived.changes === 0 ? null : row.sessionId;
   })();
 }
 
@@ -685,6 +838,61 @@ function orcaCancelStaleTeams(readyDb, args) {
   const cancel = readyDb.prepare("UPDATE orca_teams SET status = 'cancelled', completed_at = ?, updated_at = ? WHERE lead_session_id = ? AND status = 'active' AND id != ?");
   readyDb.transaction(() => {
     cancel.run(now, now, leadSessionId, keepTeamId);
+  })();
+}
+
+function orcaArchiveWorkersByTeam(readyDb, args) {
+  const payload = asRecord(args, 'orca.archiveWorkersByTeam args');
+  const teamId = expectString(payload.teamId, 'teamId');
+  const sessionIds = payload.sessionIds === undefined
+    ? undefined
+    : expectArray(payload.sessionIds, 'sessionIds').map((value, index) => expectString(value, 'sessionIds.' + index));
+  const now = expectNumber(payload.now, 'now');
+  return readyDb.transaction(() => {
+    const sessionPredicate = sessionIds === undefined
+      ? ''
+      : sessionIds.length === 0
+        ? ' AND 0'
+        : ' AND sessions.id IN (' + sessionIds.map(() => '?').join(', ') + ')';
+    readyDb.prepare("UPDATE sessions SET status = 'archived', updated_at = ? WHERE status != 'deleted'" + sessionPredicate + " AND EXISTS (SELECT 1 FROM orca_teams AS ot WHERE ot.id = ? AND ot.status != 'active') AND EXISTS (SELECT 1 FROM orca_workers AS ow WHERE ow.team_id = ? AND ow.session_id = sessions.id)").run(now, ...(sessionIds || []), teamId, teamId);
+    const resultWhere = sessionIds === undefined
+      ? ''
+      : sessionIds.length === 0
+        ? ' AND 0'
+        : ' AND s.id IN (' + sessionIds.map(() => '?').join(', ') + ')';
+    return readyDb.prepare("SELECT DISTINCT s.id AS sessionId FROM sessions AS s INNER JOIN orca_workers AS ow ON ow.session_id = s.id WHERE ow.team_id = ? AND s.status = 'archived' AND EXISTS (SELECT 1 FROM orca_teams AS ot WHERE ot.id = ? AND ot.status != 'active')" + resultWhere + ' ORDER BY s.id')
+      .all(teamId, teamId, ...(sessionIds || []))
+      .map((row) => row.sessionId);
+  })();
+}
+
+function orcaReconcileInactiveTeamWorkersForLead(readyDb, args) {
+  const payload = asRecord(args, 'orca.reconcileInactiveTeamWorkersForLead args');
+  const leadSessionId = expectString(payload.leadSessionId, 'leadSessionId');
+  const sessionIds = payload.sessionIds === undefined
+    ? undefined
+    : expectArray(payload.sessionIds, 'sessionIds').map((value, index) => expectString(value, 'sessionIds.' + index));
+  const now = expectNumber(payload.now, 'now');
+  return readyDb.transaction(() => {
+    const sessionPredicate = sessionIds === undefined
+      ? ''
+      : sessionIds.length === 0
+        ? ' AND 0'
+        : ' AND s.id IN (' + sessionIds.map(() => '?').join(', ') + ')';
+    const rows = readyDb.prepare("SELECT DISTINCT s.id AS sessionId FROM sessions AS s INNER JOIN orca_workers AS ow ON ow.session_id = s.id INNER JOIN orca_teams AS ot ON ot.id = ow.team_id WHERE ot.lead_session_id = ? AND ot.status != 'active' AND s.status = 'active'" + sessionPredicate + ' ORDER BY s.id').all(leadSessionId, ...(sessionIds || []));
+    const sessionUpdatePredicate = sessionIds === undefined
+      ? ''
+      : sessionIds.length === 0
+        ? ' AND 0'
+        : ' AND sessions.id IN (' + sessionIds.map(() => '?').join(', ') + ')';
+    readyDb.prepare("UPDATE sessions SET status = 'archived', updated_at = ? WHERE status = 'active'" + sessionUpdatePredicate + " AND EXISTS (SELECT 1 FROM orca_workers AS ow INNER JOIN orca_teams AS ot ON ot.id = ow.team_id WHERE ow.session_id = sessions.id AND ot.lead_session_id = ? AND ot.status != 'active')").run(now, ...(sessionIds || []), leadSessionId);
+    const workerPredicate = sessionIds === undefined
+      ? ''
+      : sessionIds.length === 0
+        ? ' AND 0'
+        : ' AND orca_workers.session_id IN (' + sessionIds.map(() => '?').join(', ') + ')';
+    readyDb.prepare("UPDATE orca_workers SET status = 'done', updated_at = ? WHERE 1 = 1" + workerPredicate + " AND EXISTS (SELECT 1 FROM orca_teams AS ot WHERE ot.id = orca_workers.team_id AND ot.lead_session_id = ? AND ot.status != 'active')").run(now, ...(sessionIds || []), leadSessionId);
+    return rows.map((row) => row.sessionId);
   })();
 }
 
@@ -1668,8 +1876,7 @@ const SLEEP_DETECTION_SLACK_MS = 5_000;
 
 /** RPC 超时评估结果:reject = 真超时;rearm = 定时器横跨系统睡眠,应重置预算续等。 */
 export type RpcTimeoutVerdict =
-  | { kind: 'reject'; wallElapsedMs: number }
-  | { kind: 'rearm'; wallElapsedMs: number };
+  { kind: 'reject'; wallElapsedMs: number } | { kind: 'rearm'; wallElapsedMs: number };
 
 /**
  * 判定一次 RPC 超时是真超时还是「跨睡眠假超时」。
@@ -1771,9 +1978,7 @@ export class WorkerThreadTransport implements DbTransport {
   on(event: 'vec-status', cb: (payload: VecStatusEvent) => void): void;
   on(
     event: EventName,
-    cb:
-      | ((payload: LogEvent) => void)
-      | ((payload: VecStatusEvent) => void),
+    cb: ((payload: LogEvent) => void) | ((payload: VecStatusEvent) => void),
   ): void {
     const listeners = this.eventListeners.get(event) ?? new Set<(payload: unknown) => void>();
     listeners.add(cb as (payload: unknown) => void);
@@ -1826,11 +2031,7 @@ export class WorkerThreadTransport implements DbTransport {
     const onTimeout = (): void => {
       const index = this.queued.indexOf(item);
       if (index < 0) return;
-      const verdict = evaluateRpcTimeout(
-        item.budgetStartedAtMs,
-        Date.now(),
-        this.rpcTimeoutMs,
-      );
+      const verdict = evaluateRpcTimeout(item.budgetStartedAtMs, Date.now(), this.rpcTimeoutMs);
       if (verdict.kind === 'rearm') {
         item.budgetStartedAtMs = Date.now();
         item.queueTimeout = setTimeout(onTimeout, this.rpcTimeoutMs);
@@ -1853,11 +2054,7 @@ export class WorkerThreadTransport implements DbTransport {
     const onTimeout = (): void => {
       const pending = this.pending.get(id);
       if (!pending) return;
-      const verdict = evaluateRpcTimeout(
-        pending.sentAtMs,
-        Date.now(),
-        this.rpcTimeoutMs,
-      );
+      const verdict = evaluateRpcTimeout(pending.sentAtMs, Date.now(), this.rpcTimeoutMs);
       if (verdict.kind === 'rearm') {
         // 跨睡眠假超时:重置预算续等,请求在唤醒后照常完成或在真超时时拒绝。
         this.emitClientLog('warn', {
@@ -1880,10 +2077,7 @@ export class WorkerThreadTransport implements DbTransport {
       this.drainQueue();
     };
     const budgetElapsedMs = Date.now() - item.budgetStartedAtMs;
-    const remainingBudgetMs = Math.max(
-      1,
-      this.rpcTimeoutMs - budgetElapsedMs,
-    );
+    const remainingBudgetMs = Math.max(1, this.rpcTimeoutMs - budgetElapsedMs);
     const timeout = setTimeout(onTimeout, remainingBudgetMs);
     this.pending.set(id, {
       resolve: item.resolve,

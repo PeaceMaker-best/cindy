@@ -757,6 +757,7 @@ function sendFailureLogFields(result: AgentInputSendFailure): Record<string, unk
 
 export class AgentInputCoordinator {
   private readonly states = new Map<string, SessionInputState>();
+  private readonly permanentlySealedSessions = new Set<string>();
   private readonly steerAbortControllers = new Map<string, Map<string, AbortController>>();
   /**
    * 队列快照恢复簿记(issue #761)。故意放在 SessionInputState **外面**:
@@ -807,6 +808,7 @@ export class AgentInputCoordinator {
    * 保持关闭,避免空内存态把尚未读回的快照覆盖删除。
    */
   ensureQueueRestored(sessionId: string): Promise<void> {
+    if (this.permanentlySealedSessions.has(sessionId)) return Promise.resolve();
     if (this.restoredQueueSessions.has(sessionId)) return Promise.resolve();
     if (!this.deps.loadQueueSnapshot) {
       this.restoredQueueSessions.add(sessionId);
@@ -1059,11 +1061,31 @@ export class AgentInputCoordinator {
     }
   }
 
+  /**
+   * Authoritative enqueue idempotency check for callers that must avoid doing
+   * expensive pre-enqueue work (notably remote OSS materialization). Call only
+   * after ensureQueueRestored so crash-restored rows participate in the check.
+   */
+  isDuplicateEnqueue(sessionId: string, clientId: string): boolean {
+    this.assertSessionNotSealed(sessionId);
+    return this.isDuplicateEnqueueClientId(this.getState(sessionId), clientId);
+  }
+
+  enqueueWithReceipt(
+    sessionId: string,
+    item: AgentInputQueuedMessage,
+    opts?: { wasFirst?: boolean; sendAtMs?: number; resumeRestorePausedQueue?: boolean },
+  ): { inserted: boolean; projection: AgentInputProjection } {
+    const inserted = !this.isDuplicateEnqueue(sessionId, item.clientId);
+    return { inserted, projection: this.enqueue(sessionId, item, opts) };
+  }
+
   enqueue(
     sessionId: string,
     item: AgentInputQueuedMessage,
     opts?: { wasFirst?: boolean; sendAtMs?: number; resumeRestorePausedQueue?: boolean },
   ): AgentInputProjection {
+    this.assertSessionNotSealed(sessionId);
     const state = this.getState(sessionId);
     item = captureOriginalSyntheticTrigger(item);
     // 幂等去重(弱网重发防线,PR #881):同 clientId 重复投递说明是控制端(手机
@@ -1173,6 +1195,7 @@ export class AgentInputCoordinator {
   }
 
   async compact(sessionId: string, createOpts: AgentInputCreateOpts, opts?: { userName?: string }): Promise<AgentInputProjection> {
+    this.assertSessionNotSealed(sessionId);
     const state = this.getState(sessionId);
     // 手动 /compact 是用户接管，与 composer 新消息同语义。先撤掉尚未跨过
     // vendor dispatch 的隐藏 scheduler 续跑，再让 host 终止对应 run waiter；
@@ -1307,6 +1330,7 @@ export class AgentInputCoordinator {
   }
 
   async steer(sessionId: string, item: AgentInputQueuedMessage, opts?: { removeFromQueue?: boolean; touchUserSend?: boolean }): Promise<boolean> {
+    this.assertSessionNotSealed(sessionId);
     const state = this.getState(sessionId);
     if (opts?.removeFromQueue) {
       const storedItem = state.pendingQueue.find((queued) => queued.clientId === item.clientId);
@@ -1745,6 +1769,7 @@ export class AgentInputCoordinator {
 
   /** 用户点「重试 / 继续任务」。行为见 performRetryLastError。 */
   async retryLastError(sessionId: string): Promise<AgentInputProjection> {
+    this.assertSessionNotSealed(sessionId);
     const { projection } = await this.performRetryLastError(sessionId);
     return projection;
   }
@@ -1764,6 +1789,7 @@ export class AgentInputCoordinator {
     sessionId: string,
     attemptToken: number,
   ): Promise<AutoRetryOutcome> {
+    if (this.permanentlySealedSessions.has(sessionId)) return 'superseded';
     const { outcome } = await this.performRetryLastError(sessionId, {
       auto: true,
       attemptToken,
@@ -2056,11 +2082,20 @@ export class AgentInputCoordinator {
    * origin/createOpts 锚定原条目)收敛在 updateQueuedMessageContent。空内容(无文本且无
    * 附件)拒绝——与 enqueue 的最低要求一致,防止编辑出一条发不出去的空消息。
    */
+  canUpdateQueuedItemContent(sessionId: string, clientId: string): boolean {
+    const state = this.getState(sessionId);
+    return (
+      !state.steeringQueueClientIds.includes(clientId) &&
+      state.pendingQueue.some((entry) => entry.clientId === clientId)
+    );
+  }
+
   updateContent(
     sessionId: string,
     clientId: string,
     next: AgentInputQueuedMessage,
   ): AgentInputProjection {
+    this.assertSessionNotSealed(sessionId);
     if (!next.text.trim() && !(next.files && next.files.length > 0)) {
       return this.getProjection(sessionId);
     }
@@ -2207,6 +2242,19 @@ export class AgentInputCoordinator {
     return this.getProjection(sessionId);
   }
 
+  sealSession(sessionId: string, clearedAt: string | number = Date.now()): AgentInputProjection {
+    if (this.permanentlySealedSessions.has(sessionId)) return this.getProjection(sessionId);
+    const projection = this.clearSession(sessionId, clearedAt);
+    this.permanentlySealedSessions.add(sessionId);
+    return projection;
+  }
+
+  /** Roll back a pre-commit deletion seal while the session lifecycle lock is held. */
+  unsealSession(sessionId: string): AgentInputProjection {
+    this.permanentlySealedSessions.delete(sessionId);
+    return this.getProjection(sessionId);
+  }
+
   /**
    * `signals` 只在 `type='error'` 时有意义：terminal error 的结构化信号（SDK error
    * tag / reason / HTTP 状态码），供 host 判断这次失败是否值得自动续跑。刻意不在
@@ -2219,6 +2267,7 @@ export class AgentInputCoordinator {
     message?: string,
     signals?: Omit<InterruptedTurnErrorSignals, 'message'>,
   ): void {
+    if (this.permanentlySealedSessions.has(sessionId)) return;
     const state = this.getState(sessionId);
     const active = state.activeTurn;
     this.clearAbortReconcileRetry(state);
@@ -2450,6 +2499,12 @@ export class AgentInputCoordinator {
     return state;
   }
 
+  private assertSessionNotSealed(sessionId: string): void {
+    if (this.permanentlySealedSessions.has(sessionId)) {
+      throw new Error(`[SESSION_DELETED] Session ${sessionId} is permanently deleted`);
+    }
+  }
+
   private emit(sessionId: string): void {
     this.deps.emitProjection(this.getProjection(sessionId));
     // 崩溃恢复快照的统一收口点:所有队列状态迁移最终都会 emit,在这里做
@@ -2614,6 +2669,7 @@ export class AgentInputCoordinator {
   }
 
   private scheduleDrain(sessionId: string, reason: string): void {
+    if (this.permanentlySealedSessions.has(sessionId)) return;
     const state = this.getState(sessionId);
     if (state.drainScheduled) return;
     state.drainScheduled = true;
@@ -2634,6 +2690,7 @@ export class AgentInputCoordinator {
   }
 
   private async drain(sessionId: string, reason: string): Promise<void> {
+    if (this.permanentlySealedSessions.has(sessionId)) return;
     const state = this.getState(sessionId);
     const compact = this.getDrainableCompact(sessionId, state);
     if (compact) {
@@ -3070,6 +3127,7 @@ export class AgentInputCoordinator {
 
   /** host 侧异步边界(pending 凭证切换 apply 完成等)后恢复该会话的队列派发。 */
   wakeSession(sessionId: string, reason: string): void {
+    if (this.permanentlySealedSessions.has(sessionId)) return;
     this.scheduleDrain(sessionId, reason);
   }
 

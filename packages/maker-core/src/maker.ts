@@ -68,6 +68,14 @@ export interface SessionLifecycleHooks {
   prepareStartOptions?: (sessionId: string, options: CreateSessionOptions) => void | Promise<void>;
   /** Agent 启动前的 host 准备动作。失败只记日志，不阻断 session 创建。 */
   onBeforeStart?: (context: SessionBeforeStartContext) => void | Promise<void>;
+  /**
+   * Host-level cross-process runtime ownership. Called only for a new startup
+   * after active/in-flight reuse checks. The callback releases a newly acquired
+   * claim when startup fails; successful ownership lives until onClose.
+   */
+  acquireRuntimeOwnership?: (
+    sessionId: string,
+  ) => void | (() => void | Promise<void>) | Promise<void | (() => void | Promise<void>)>;
   /** Agent 和 Session 均创建成功后、对外发布前调用。失败只记日志，不阻断创建。 */
   onStartSucceeded?: (sessionId: string, options: CreateSessionOptions) => void | Promise<void>;
   /** session 关闭时 (Maker.closeSession 主动 / 内部异常 / handle 自然结束)。 */
@@ -172,6 +180,13 @@ interface CodexThreadClaimLease {
   release(): void;
 }
 
+export class SessionPermanentlySealedError extends Error {
+  constructor(sessionId: string) {
+    super(`Session ${sessionId} is permanently sealed`);
+    this.name = 'SessionPermanentlySealedError';
+  }
+}
+
 export class Maker {
   protected readonly agents: Partial<Record<AgentKind, BaseAgent>>;
   protected readonly storage: SessionStorage;
@@ -188,6 +203,12 @@ export class Maker {
     string,
     { promise: Promise<Session> }
   >();
+  /**
+   * Physical ids permanently tombstoned by the host. A seal is process-local;
+   * the host pairs it with its cross-process persisted lifecycle lock/status
+   * guard. New IM generations receive a distinct physical id.
+   */
+  private readonly permanentlySealedSessionIds = new Set<string>();
   /**
    * Codex 0.145 会忽略已加载 thread 的 thread/resume.config。不同 Cindy task
    * 若同时复用同一 native thread，后启动者会继续使用前一 Session 的 MCP URL，
@@ -287,6 +308,9 @@ export class Maker {
     if (!opts.id) {
       return this.createSessionOnce(opts);
     }
+    if (this.permanentlySealedSessionIds.has(opts.id)) {
+      throw new SessionPermanentlySealedError(opts.id);
+    }
 
     // 进程内已经活着或正在启动的 session, 直接复用 (避免 spawn 第二个 SDK)。
     // close() 失败的 Session 不能继续收消息，但也不能立刻从 activeSessions
@@ -302,7 +326,32 @@ export class Maker {
     const inFlight = this.inFlightSessionCreations.get(opts.id);
     if (inFlight) return inFlight.promise;
 
-    const creation = { promise: this.createSessionOnce(opts) };
+    // Publish the singleflight entry before the first async ownership RPC.
+    // Otherwise two same-id callers can both cross the await and spawn two
+    // vendor handles under one process owner token.
+    const creation = {
+      promise: Promise.resolve().then(async () => {
+        let releaseRuntimeOwnershipOnFailure:
+          | (() => void | Promise<void>)
+          | undefined;
+        // Existing rows must claim ownership before starting the vendor handle so
+        // deletion cannot race a resume. A brand-new explicit id has no row yet;
+        // defer its first claim until createSessionOnce has inserted the row.
+        if (opts.id && this.lifecycleHooks.acquireRuntimeOwnership) {
+          const existing = await this.storage.get(opts.id);
+          if (existing) {
+            releaseRuntimeOwnershipOnFailure =
+              (await this.lifecycleHooks.acquireRuntimeOwnership(opts.id)) ?? (() => {});
+          }
+        }
+        try {
+          return await this.createSessionOnce(opts, releaseRuntimeOwnershipOnFailure);
+        } catch (error) {
+          await releaseRuntimeOwnershipOnFailure?.();
+          throw error;
+        }
+      }),
+    };
     this.inFlightSessionCreations.set(opts.id, creation);
     try {
       return await creation.promise;
@@ -315,7 +364,10 @@ export class Maker {
   }
 
   /** 执行一次真实 session startup；带 id 的并发去重由 createSession 统一负责。 */
-  private async createSessionOnce(opts: CreateSessionOptions): Promise<Session> {
+  private async createSessionOnce(
+    opts: CreateSessionOptions,
+    acquiredRuntimeOwnershipRelease?: (() => void | Promise<void>) | void,
+  ): Promise<Session> {
     const agent = this.requireAgent(opts.agentKind);
     const id = opts.id ?? generateSessionId();
 
@@ -409,6 +461,19 @@ export class Maker {
       codexThreadClaim?.release();
       throw error;
     }
+    if (this.permanentlySealedSessionIds.has(id)) {
+      try {
+        await handle.close();
+      } catch (error) {
+        this.logger.warn('failed to close unpublished sealed session handle', {
+          sessionId: id,
+          error: String(error),
+        });
+      } finally {
+        codexThreadClaim?.release();
+      }
+      throw new SessionPermanentlySealedError(id);
+    }
     if (opts.agentKind === 'codex' && isClaimableCodexThreadId(handle.id)) {
       try {
         if (codexThreadClaim) {
@@ -442,6 +507,7 @@ export class Maker {
 
     // 落地元数据 —— storage 已有同 id 的 row 时跳过 insert, 走 update 把 sdkSessionId 写回
     let meta: SessionMeta;
+    let createdNewRow = false;
     try {
       const existingRow = opts.id ? await this.storage.get(opts.id) : null;
       if (existingRow) {
@@ -465,6 +531,7 @@ export class Maker {
           remoteHostId: opts.remoteHostId,
           sdkSessionId: handle.id !== '<pending>' ? handle.id : undefined,
         });
+        createdNewRow = true;
       }
     } catch (error) {
       if (codexThreadClaim) {
@@ -479,6 +546,34 @@ export class Maker {
         codexThreadClaim.release();
       }
       throw error;
+    }
+
+    let runtimeOwnershipRelease = acquiredRuntimeOwnershipRelease;
+    if (!acquiredRuntimeOwnershipRelease && this.lifecycleHooks.acquireRuntimeOwnership) {
+      try {
+        runtimeOwnershipRelease = await this.lifecycleHooks.acquireRuntimeOwnership(meta.id);
+      } catch (error) {
+        try {
+          await handle.close();
+        } catch (closeError) {
+          this.logger.warn('failed to close handle after runtime ownership rejection', {
+            sessionId: meta.id,
+            error: String(closeError),
+          });
+        }
+        if (createdNewRow) {
+          try {
+            await this.storage.delete(meta.id);
+          } catch (deleteError) {
+            this.logger.warn('failed to roll back session row after runtime ownership rejection', {
+              sessionId: meta.id,
+              error: String(deleteError),
+            });
+          }
+        }
+        codexThreadClaim?.release();
+        throw error;
+      }
     }
 
     const delivery = handle.codexProductPromptDelivery;
@@ -552,6 +647,14 @@ export class Maker {
     session.onStatusChange((status) => {
       if (status === 'closed') {
         codexThreadClaim?.release();
+        void Promise.resolve()
+          .then(() => runtimeOwnershipRelease?.())
+          .catch((err) => {
+            this.logger.warn('runtime ownership release failed', {
+              sessionId: meta.id,
+              error: String(err),
+            });
+          });
         // 不再持久化运行态: 'closed' 是 SDK 子进程的瞬态, 重启即灭, 无意义存盘。
         this.activeSessions.delete(meta.id);
         this.emit({
@@ -583,6 +686,20 @@ export class Maker {
           error: String(err),
         });
       }
+    }
+
+    if (this.permanentlySealedSessionIds.has(meta.id)) {
+      try {
+        await session.close();
+      } catch (error) {
+        this.logger.warn('failed to close sealed session before publish', {
+          sessionId: meta.id,
+          error: String(error),
+        });
+      } finally {
+        codexThreadClaim?.release();
+      }
+      throw new SessionPermanentlySealedError(meta.id);
     }
 
     this.activeSessions.set(meta.id, session);
@@ -626,6 +743,13 @@ export class Maker {
   /** 串行持久化有效 vendor id，并屏蔽已判失效 query 的晚到事件。 */
   private persistSdkSessionId(sessionId: string, sdkSessionId: string): Promise<void> {
     return this.enqueueSdkSessionPersistence(sessionId, async () => {
+      if (this.permanentlySealedSessionIds.has(sessionId)) {
+        this.logger.debug('ignored sdkSessionId event for permanently sealed session', {
+          sessionId,
+          sdkSessionId,
+        });
+        return;
+      }
       if (this.invalidSdkSessionIds.get(sessionId)?.has(sdkSessionId)) {
         this.logger.debug('ignored stale sdkSessionId event after invalid-resume recovery', {
           sessionId,
@@ -686,6 +810,45 @@ export class Maker {
       // status listener 会自动清理 activeSessions 并 emit
     }
     // 已经不在内存里就 no-op —— 没有持久化的运行态需要更新。
+  }
+
+  /**
+   * Permanently reject this physical id and wait until any in-flight startup
+   * has observed the seal and closed its unpublished vendor handle.
+   */
+  async sealSession(id: string): Promise<void> {
+    this.permanentlySealedSessionIds.add(id);
+    const inFlight = this.inFlightSessionCreations.get(id)?.promise;
+    if (inFlight) {
+      await inFlight.catch((err) => {
+        if (!(err instanceof SessionPermanentlySealedError)) {
+          this.logger.warn('in-flight session startup failed while sealing', {
+            sessionId: id,
+            error: String(err),
+          });
+        }
+      });
+    }
+    await this.closeSession(id);
+    // session_id events are persisted through a per-session tail. Deletion may
+    // clear sdk_session_id only after every operation admitted before/during
+    // close has settled; otherwise a late storage.update can rewrite the
+    // deleted tombstone after cleanup commits.
+    while (true) {
+      const tail = this.sdkSessionPersistenceTails.get(id);
+      if (!tail) break;
+      await tail;
+      if (this.sdkSessionPersistenceTails.get(id) === tail) break;
+    }
+  }
+
+  /** Roll back a pre-commit deletion seal while the lifecycle lock is still held. */
+  async unsealSession(id: string): Promise<void> {
+    this.permanentlySealedSessionIds.delete(id);
+  }
+
+  isSessionPermanentlySealed(id: string): boolean {
+    return this.permanentlySealedSessionIds.has(id);
   }
 
   /**

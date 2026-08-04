@@ -26,14 +26,27 @@ const dbMock = vi.hoisted(() => ({
   txError: null as Error | null,
 }));
 const patchMock = vi.hoisted(() => ({
-  calls: [] as Array<{ sessionId: string; patch: Record<string, unknown> }>,
+  notifyCalls: [] as Array<{
+    sessionId: string;
+    title: string | null;
+    workingDir: string | null;
+    workspaceKind: string | null;
+  }>,
+  finalizeError: null as Error | null,
 }));
 const codexMock = vi.hoisted(() => ({
   importCalls: [] as unknown[],
+  finalizeCalls: [] as unknown[],
   removeCalls: [] as unknown[],
+  finalizeError: null as Error | null,
+  importStateFinalized: true,
 }));
 const cindyMediaMock = vi.hoisted(() => ({
-  ingestCalls: [] as Array<{ buffer: Buffer; mimeType: string; refs: Array<Record<string, unknown>> }>,
+  ingestCalls: [] as Array<{
+    buffer: Buffer;
+    mimeType: string;
+    refs: Array<Record<string, unknown>>;
+  }>,
   removeSessionRefsCalls: [] as string[],
   /** 置为 Error 让 ingest 全部失败(测回落老目录路径)。 */
   ingestError: null as Error | null,
@@ -52,9 +65,23 @@ vi.mock('../../localDb/client/current.js', () => ({
       return dbMock.conflictRow ?? undefined;
     },
     tx: async (name: string, args: unknown) => {
-      if (dbMock.txError) throw dbMock.txError;
       dbMock.txCalls.push({ name, args });
-      return { messageCount: (args as { messages: unknown[] }).messages.length };
+      if (dbMock.txError) throw dbMock.txError;
+      const typed = args as {
+        messages: unknown[];
+        overwriteExisting?: { sessionId: string; expectedStatus: 'active' | 'archived' };
+      };
+      return {
+        messageCount: typed.messages.length,
+        replacedSession: typed.overwriteExisting
+          ? {
+              sessionId: typed.overwriteExisting.sessionId,
+              title: '被覆盖任务',
+              workingDir: '/old/repo',
+              workspaceKind: 'project',
+            }
+          : null,
+      };
     },
   }),
 }));
@@ -69,11 +96,18 @@ vi.mock('../../maker-host/codex-local-sessions.js', () => ({
   importSharedCodexThread: async (params: unknown) => {
     codexMock.importCalls.push(params);
     return {
+      stateDbPath: path.join(tmpRoot, 'codex-home', 'state.sqlite'),
       rolloutPath: path.join(tmpRoot, 'landed-rollout.jsonl'),
       rolloutWritten: true,
       stateWritten: true,
       statePresent: true,
+      stateFinalized: codexMock.importStateFinalized,
     };
+  },
+  finalizeSharedCodexThreadImport: async (params: unknown, written: unknown) => {
+    codexMock.finalizeCalls.push({ params, written });
+    if (codexMock.finalizeError) throw codexMock.finalizeError;
+    return written;
   },
   removeSharedCodexThread: async (threadId: string, written: unknown) => {
     codexMock.removeCalls.push({ threadId, written });
@@ -113,7 +147,11 @@ vi.mock('../../logger.js', () => ({
 // 记账依赖 DbClient,这里 mock 成调用记录器,测导入编排语义(指纹前置核对、
 // mismatch 跳过、journal 回滚)而非账本本体(账本有自己的单测)。
 vi.mock('../../cindy-media/ingest.js', () => ({
-  ingestMedia: async (params: { buffer: Buffer; mimeType: string; refs: Array<Record<string, unknown>> }) => {
+  ingestMedia: async (params: {
+    buffer: Buffer;
+    mimeType: string;
+    refs: Array<Record<string, unknown>>;
+  }) => {
     if (cindyMediaMock.ingestError) throw cindyMediaMock.ingestError;
     cindyMediaMock.ingestCalls.push(params);
     // 用真实 sha256 当指纹:导入路径会经 resolveHashRef 反推仓内路径,
@@ -139,36 +177,69 @@ vi.mock('../../cindy-media/ledger.js', () => ({
   },
 }));
 const worktreeMock = vi.hoisted(() => ({
-  detect: null as
+  detect: null as null | {
+    isGitRepo: boolean;
+    isInsideWorktree: boolean;
+    gitInstalled: boolean;
+    repoRoot?: string;
+    currentBranch?: string;
+  },
+  createResult: null as
     | null
-    | { isGitRepo: boolean; isInsideWorktree: boolean; gitInstalled: boolean; repoRoot?: string; currentBranch?: string },
-  createResult: null as null | { ok: true; meta: { path: string } } | { ok: false; error: { kind: string; message?: string } },
-  createCalls: [] as Array<{ sessionId: string; baseRepo: string; name: string; sourceBranch: string }>,
+    | { ok: true; meta: { path: string } }
+    | { ok: false; error: { kind: string; message?: string } },
+  createCalls: [] as Array<{
+    sessionId: string;
+    baseRepo: string;
+    name: string;
+    sourceBranch: string;
+  }>,
   removeCalls: [] as string[],
 }));
 vi.mock('../../worktree/WorktreeManager.js', () => ({
   detectCwd: async () =>
     worktreeMock.detect ?? { isGitRepo: false, isInsideWorktree: false, gitInstalled: true },
   suggestName: async () => 'imported-wt',
-  createWorktree: async (req: { sessionId: string; baseRepo: string; name: string; sourceBranch: string }) => {
+  createWorktree: async (req: {
+    sessionId: string;
+    baseRepo: string;
+    name: string;
+    sourceBranch: string;
+  }) => {
     worktreeMock.createCalls.push(req);
-    return worktreeMock.createResult ?? { ok: false, error: { kind: 'unknown', message: 'no mock' } };
+    return (
+      worktreeMock.createResult ?? { ok: false, error: { kind: 'unknown', message: 'no mock' } }
+    );
   },
   removeWorktreeForSession: async (sessionId: string) => {
     worktreeMock.removeCalls.push(sessionId);
   },
 }));
-// 覆盖导入的软删/恢复走 patchSessionMetaInDb(真实实现依赖 Electron 主进程环境)
+// 覆盖导入提交后才通知旧任务删除并跑不可逆生命周期。
 vi.mock('../../localDb/ipc/sessions.js', () => ({
-  patchSessionMetaInDb: async (sessionId: string, patch: Record<string, unknown>) => {
-    patchMock.calls.push({ sessionId, patch });
-    return { id: sessionId, ...patch };
+  commitAndFinalizeSessionDeletion: async <T>(
+    _sessionId: string,
+    commit: () => Promise<{
+      value: T;
+      deleted: {
+        sessionId: string;
+        title: string | null;
+        workingDir: string | null;
+        workspaceKind: string | null;
+      } | null;
+    }>,
+  ): Promise<T> => {
+    const result = await commit();
+    if (result.deleted) {
+      patchMock.notifyCalls.push(result.deleted);
+      if (patchMock.finalizeError) throw patchMock.finalizeError;
+    }
+    return result.value;
   },
 }));
 
-const { inspectShareFile, unlockShareDraft, commitShareImport, cancelShareDraft } = await import(
-  '../sessionShareImport.js'
-);
+const { inspectShareFile, unlockShareDraft, commitShareImport, cancelShareDraft } =
+  await import('../sessionShareImport.js');
 const { buildLooseUrl } = await import('../mediaUrlRewrite.pure.js');
 const { buildPlainFile, sealPayload } = await import('../xdtshareCrypto.js');
 
@@ -222,7 +293,12 @@ async function buildBundle(overrides: BundleOverrides = {}): Promise<Buffer> {
       id: 'm1',
       clientId: 'c1',
       role: 'user',
-      content: JSON.stringify([{ type: 'text', text: `图 ${IMAGE_URL} 文件 ${FILE_URL}${extraImageText}${blobText}${looseAudioText}` }]),
+      content: JSON.stringify([
+        {
+          type: 'text',
+          text: `图 ${IMAGE_URL} 文件 ${FILE_URL}${extraImageText}${blobText}${looseAudioText}`,
+        },
+      ]),
       toolUseId: null,
       agentMeta: null,
       ...(overrides.omitMessageAgentKind ? {} : { agentKind: 'cc' }),
@@ -241,7 +317,17 @@ async function buildBundle(overrides: BundleOverrides = {}): Promise<Buffer> {
       rewindAt: null,
     },
   ];
-  zip.file('session.json', JSON.stringify({ model: 'claude-sonnet-4-6', effort: 'high', permissionMode: 'ask', createdAt: 1700000000000, userSendAt: 1700000000100, ...overrides.session }));
+  zip.file(
+    'session.json',
+    JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      effort: 'high',
+      permissionMode: 'ask',
+      createdAt: 1700000000000,
+      userSendAt: 1700000000100,
+      ...overrides.session,
+    }),
+  );
   zip.file('messages.jsonl', messages.map((m) => JSON.stringify(m)).join('\n'));
   const transcriptPath =
     agentKind === 'cc'
@@ -251,7 +337,10 @@ async function buildBundle(overrides: BundleOverrides = {}): Promise<Buffer> {
         : `transcripts/codex/rollout-x-${SID}.jsonl`;
   if (!overrides.omitTranscript) zip.file(transcriptPath, '{"line":1}\n');
   if (agentKind === 'codex') {
-    zip.file('codex-state/thread.json', JSON.stringify({ threads: [{ id: SID }], threadDynamicTools: [], threadSpawnEdges: [] }));
+    zip.file(
+      'codex-state/thread.json',
+      JSON.stringify({ threads: [{ id: SID }], threadDynamicTools: [], threadSpawnEdges: [] }),
+    );
   }
   zip.file('media/images/1-img-1.png', Buffer.from([1, 2, 3]));
   zip.file('media/loose/2-doc.pdf', Buffer.from([4, 5, 6]));
@@ -264,7 +353,13 @@ async function buildBundle(overrides: BundleOverrides = {}): Promise<Buffer> {
       imageHost: OLD_SESSION_ID,
       filename: overrides.imageFilenameOverride ?? 'img-1.png',
     },
-    { url: FILE_URL, scheme: 'xdt-file', kind: 'loose', zipPath: 'media/loose/2-doc.pdf', filename: 'doc.pdf' },
+    {
+      url: FILE_URL,
+      scheme: 'xdt-file',
+      kind: 'loose',
+      zipPath: 'media/loose/2-doc.pdf',
+      filename: 'doc.pdf',
+    },
   ];
   if (overrides.extraImage) {
     zip.file('media/images/3-img-2.png', Buffer.from([7, 8, 9]));
@@ -280,7 +375,13 @@ async function buildBundle(overrides: BundleOverrides = {}): Promise<Buffer> {
   if (overrides.blob && blobUrl && blobHash) {
     const zipPath = `media/blobs/4-${blobHash}.png`;
     zip.file(zipPath, overrides.blob.bytes);
-    mediaEntries.push({ url: blobUrl, scheme: 'cindy-media', kind: 'blob', zipPath, filename: `${blobHash}.png` });
+    mediaEntries.push({
+      url: blobUrl,
+      scheme: 'cindy-media',
+      kind: 'blob',
+      zipPath,
+      filename: `${blobHash}.png`,
+    });
   }
   if (overrides.looseAudio && looseAudioUrl) {
     zip.file('media/loose/5-voice.mp3', overrides.looseAudio.bytes);
@@ -312,7 +413,11 @@ async function buildBundle(overrides: BundleOverrides = {}): Promise<Buffer> {
     ...overrides.manifest,
   };
   zip.file('manifest.json', JSON.stringify(manifest));
-  return zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+  return zip.generateAsync({
+    type: 'nodebuffer',
+    compression: 'DEFLATE',
+    compressionOptions: { level: 6 },
+  });
 }
 
 async function writeBundleFile(bytes: Buffer, password?: string): Promise<string> {
@@ -328,9 +433,13 @@ describe('sessionShareImport', () => {
     dbMock.queryCalls = [];
     dbMock.txCalls = [];
     dbMock.txError = null;
-    patchMock.calls = [];
+    patchMock.notifyCalls = [];
+    patchMock.finalizeError = null;
     codexMock.importCalls = [];
+    codexMock.finalizeCalls = [];
     codexMock.removeCalls = [];
+    codexMock.finalizeError = null;
+    codexMock.importStateFinalized = true;
     cindyMediaMock.ingestCalls = [];
     cindyMediaMock.removeSessionRefsCalls = [];
     cindyMediaMock.ingestError = null;
@@ -389,9 +498,15 @@ describe('sessionShareImport', () => {
     expect(content0).toContain('2-doc.pdf');
 
     // 图片入总仓(挂 import 引用),不再写 cc-agent/images;pdf 非媒体维持老路径
-    const imgIngest = cindyMediaMock.ingestCalls.find((c) => Buffer.from(c.buffer).equals(IMG1_BYTES));
-    expect(imgIngest?.refs).toEqual([{ refKind: 'import', refId: result.sessionId, originKind: 'user' }]);
-    expect(fs.existsSync(path.join(tmpRoot, 'cc-agent', 'images', result.sessionId, 'img-1.png'))).toBe(false);
+    const imgIngest = cindyMediaMock.ingestCalls.find((c) =>
+      Buffer.from(c.buffer).equals(IMG1_BYTES),
+    );
+    expect(imgIngest?.refs).toEqual([
+      { refKind: 'import', refId: result.sessionId, originKind: 'user' },
+    ]);
+    expect(
+      fs.existsSync(path.join(tmpRoot, 'cc-agent', 'images', result.sessionId, 'img-1.png')),
+    ).toBe(false);
     expect(fs.existsSync(path.join(sharedMediaRoot, result.sessionId, '2-doc.pdf'))).toBe(true);
   });
 
@@ -425,7 +540,9 @@ describe('sessionShareImport', () => {
 
     const call = cindyMediaMock.ingestCalls.find((c) => Buffer.from(c.buffer).equals(mp3));
     expect(call?.mimeType).toBe('audio/mpeg');
-    expect(call?.refs).toEqual([{ refKind: 'import', refId: result.sessionId, originKind: 'user' }]);
+    expect(call?.refs).toEqual([
+      { refKind: 'import', refId: result.sessionId, originKind: 'user' },
+    ]);
 
     // ?path= 重写为仓内绝对路径(blobStore 真实实现按 tmpRoot userData 反推)
     const hash = createHash('sha256').update(mp3).digest('hex');
@@ -454,7 +571,9 @@ describe('sessionShareImport', () => {
     const content0 = txArgs.messages[0].content;
     expect(content0).toContain(`xdt-image://${result.sessionId}/img-1.png`);
     expect(content0).not.toContain('cindy-media://');
-    expect(fs.existsSync(path.join(tmpRoot, 'cc-agent', 'images', result.sessionId, 'img-1.png'))).toBe(true);
+    expect(
+      fs.existsSync(path.join(tmpRoot, 'cc-agent', 'images', result.sessionId, 'img-1.png')),
+    ).toBe(true);
     expect(fs.existsSync(path.join(sharedMediaRoot, result.sessionId, '2-doc.pdf'))).toBe(true);
   });
 
@@ -491,7 +610,9 @@ describe('sessionShareImport', () => {
     const call = cindyMediaMock.ingestCalls.find((c) => Buffer.from(c.buffer).equals(bytes));
     expect(call).toBeDefined();
     expect(call!.mimeType).toBe('image/png');
-    expect(call!.refs).toEqual([{ refKind: 'import', refId: result.sessionId, originKind: 'user' }]);
+    expect(call!.refs).toEqual([
+      { refKind: 'import', refId: result.sessionId, originKind: 'user' },
+    ]);
     // 内容寻址地址跨机器稳定:content 里 blob URL 原样保留,不进 urlMap 重写
     const txArgs = dbMock.txCalls[0].args as { messages: Array<{ content: string }> };
     expect(txArgs.messages[0].content).toContain(`cindy-media://blobs/${hash}.png`);
@@ -513,13 +634,17 @@ describe('sessionShareImport', () => {
     expect(result.sessionId).toBeTruthy();
     // 指纹不符的 evil 字节绝不入库(img-1 老图的 ingest 是正常行为)
     expect(
-      cindyMediaMock.ingestCalls.some((c) => Buffer.from(c.buffer).equals(Buffer.from('evil-bytes'))),
+      cindyMediaMock.ingestCalls.some((c) =>
+        Buffer.from(c.buffer).equals(Buffer.from('evil-bytes')),
+      ),
     ).toBe(false);
   });
 
   it('cindy-media blob 已入账后导入失败:journal 回滚删除新会话名下引用行', async () => {
     dbMock.txError = new Error('db down');
-    const filePath = await writeBundleFile(await buildBundle({ blob: { bytes: Buffer.from('rollback-bytes') } }));
+    const filePath = await writeBundleFile(
+      await buildBundle({ blob: { bytes: Buffer.from('rollback-bytes') } }),
+    );
     const inspect = await inspectShareFile(filePath);
     if (inspect.encrypted) return;
     await expect(
@@ -570,7 +695,50 @@ describe('sessionShareImport', () => {
     });
     expect(result.fidelity).toBe('full');
     expect(codexMock.importCalls).toHaveLength(1);
+    expect(codexMock.finalizeCalls).toHaveLength(1);
     expect((codexMock.importCalls[0] as { newCwd: string }).newCwd).toBe(newWorkdir);
+  });
+
+  it('keeps the committed import and staged files when Codex post-commit finalize fails', async () => {
+    codexMock.finalizeError = new Error('session index unavailable');
+    const filePath = await writeBundleFile(await buildBundle({ agentKind: 'codex' }));
+    const inspect = await inspectShareFile(filePath);
+    if (inspect.encrypted) return;
+
+    const result = await commitShareImport({
+      draftId: inspect.draftId,
+      workingDir: newWorkdir,
+      projectsRootOverride: projectsRoot,
+      sharedMediaRootOverride: sharedMediaRoot,
+    });
+
+    expect(result.sessionId).toBeTruthy();
+    expect(dbMock.txCalls).toHaveLength(1);
+    expect(codexMock.finalizeCalls).toHaveLength(1);
+    expect(codexMock.removeCalls).toHaveLength(0);
+    expect(cindyMediaMock.removeSessionRefsCalls).toHaveLength(0);
+    expect(fs.existsSync(path.join(sharedMediaRoot, result.sessionId, '2-doc.pdf'))).toBe(true);
+  });
+
+  it('downgrades an overwrite when the existing Codex pointer is not finalized', async () => {
+    dbMock.conflictRow = { id: 'existing-session', status: 'active' };
+    codexMock.importStateFinalized = false;
+    const filePath = await writeBundleFile(await buildBundle({ agentKind: 'codex' }));
+    const inspect = await inspectShareFile(filePath);
+    if (inspect.encrypted) return;
+
+    const result = await commitShareImport({
+      draftId: inspect.draftId,
+      workingDir: newWorkdir,
+      projectsRootOverride: projectsRoot,
+      sharedMediaRootOverride: sharedMediaRoot,
+      overwrite: true,
+    });
+
+    expect(result.fidelity).toBe('partial');
+    expect(result.notes).toContain('codexStateFinalizeFailed');
+    expect(codexMock.finalizeCalls).toHaveLength(1);
+    expect(codexMock.removeCalls).toHaveLength(0);
   });
 
   it('conflicts only on live db row with same resume id', async () => {
@@ -579,15 +747,19 @@ describe('sessionShareImport', () => {
     const i1 = await inspectShareFile(f1);
     if (i1.encrypted) return;
     await expect(
-      commitShareImport({ draftId: i1.draftId, workingDir: newWorkdir, projectsRootOverride: projectsRoot }),
+      commitShareImport({
+        draftId: i1.draftId,
+        workingDir: newWorkdir,
+        projectsRootOverride: projectsRoot,
+      }),
     ).rejects.toMatchObject({ code: 'SHARE_CONFLICT' });
     expect(dbMock.txCalls).toHaveLength(0);
-    expect(patchMock.calls).toHaveLength(0);
+    expect(patchMock.notifyCalls).toHaveLength(0);
   });
 
-  it('overwrite: soft-deletes existing live session then imports as replacement', async () => {
+  it('overwrite atomically deletes the existing session and inserts its replacement', async () => {
     dbMock.conflictRow = { id: 'existing-session', status: 'active' };
-    const filePath = await writeBundleFile(await buildBundle());
+    const filePath = await writeBundleFile(await buildBundle({ agentKind: 'codex' }));
     const inspect = await inspectShareFile(filePath);
     if (inspect.encrypted) return;
     const result = await commitShareImport({
@@ -598,17 +770,30 @@ describe('sessionShareImport', () => {
       overwrite: true,
     });
     expect(result.sessionId).toBeTruthy();
-    // 旧会话被软删(覆盖 = 替换而非叠加),新会话行正常落库
-    expect(patchMock.calls).toEqual([
-      { sessionId: 'existing-session', patch: { status: 'deleted' } },
-    ]);
     expect(dbMock.txCalls).toHaveLength(1);
+    expect(dbMock.txCalls[0]).toMatchObject({
+      name: 'session.importShare',
+      args: {
+        overwriteExisting: {
+          sessionId: 'existing-session',
+          expectedStatus: 'active',
+        },
+      },
+    });
+    expect(patchMock.notifyCalls).toEqual([
+      {
+        sessionId: 'existing-session',
+        title: '被覆盖任务',
+        workingDir: '/old/repo',
+        workspaceKind: 'project',
+      },
+    ]);
   });
 
-  it('overwrite rollback restores the soft-deleted session to its previous status', async () => {
+  it('overwrite transaction failure leaves the existing session untouched', async () => {
     dbMock.conflictRow = { id: 'existing-session', status: 'archived' };
     dbMock.txError = new Error('disk full');
-    const filePath = await writeBundleFile(await buildBundle());
+    const filePath = await writeBundleFile(await buildBundle({ agentKind: 'codex' }));
     const inspect = await inspectShareFile(filePath);
     if (inspect.encrypted) return;
     await expect(
@@ -620,12 +805,58 @@ describe('sessionShareImport', () => {
         overwrite: true,
       }),
     ).rejects.toMatchObject({ code: 'SHARE_IMPORT_FAILED' });
-    // 逆序回滚把旧会话恢复回原 status(archived 不误恢复成 active),不丢用户数据
-    expect(patchMock.calls).toEqual([
-      { sessionId: 'existing-session', patch: { status: 'deleted' } },
-      { sessionId: 'existing-session', patch: { status: 'archived' } },
-    ]);
-    expect(dbMock.txCalls).toHaveLength(0);
+    expect(patchMock.notifyCalls).toHaveLength(0);
+    expect(dbMock.txCalls).toHaveLength(1);
+    expect(dbMock.txCalls[0]).toMatchObject({
+      name: 'session.importShare',
+      args: {
+        overwriteExisting: {
+          sessionId: 'existing-session',
+          expectedStatus: 'archived',
+        },
+      },
+    });
+    expect(codexMock.importCalls).toHaveLength(1);
+    expect(codexMock.finalizeCalls).toHaveLength(0);
+    expect(codexMock.removeCalls).toHaveLength(1);
+  });
+
+  it('preserves the imported files when overwrite finalization throws after the new row lands', async () => {
+    dbMock.conflictRow = { id: 'existing-session', status: 'active' };
+    patchMock.finalizeError = new Error('cleanup unavailable');
+    const filePath = await writeBundleFile(await buildBundle());
+    const inspect = await inspectShareFile(filePath);
+    if (inspect.encrypted) return;
+
+    await expect(
+      commitShareImport({
+        draftId: inspect.draftId,
+        workingDir: newWorkdir,
+        projectsRootOverride: projectsRoot,
+        overwrite: true,
+      }),
+    ).rejects.toMatchObject({ code: 'SHARE_IMPORT_FAILED' });
+
+    expect(dbMock.txCalls[0]).toMatchObject({
+      args: {
+        overwriteExisting: {
+          sessionId: 'existing-session',
+          expectedStatus: 'active',
+        },
+      },
+    });
+    expect(patchMock.notifyCalls).toHaveLength(1);
+    expect(dbMock.txCalls).toHaveLength(1);
+    // The DB transaction has already committed when the old-session finalizer
+    // throws. The import journal must not remove files owned by the new row.
+    expect(legacyImageMock.removeSessionCalls).toHaveLength(0);
+    expect(cindyMediaMock.removeSessionRefsCalls).toHaveLength(0);
+    const transcriptPath = path.join(
+      projectsRoot,
+      newWorkdir.replace(/[^a-zA-Z0-9]/g, '-'),
+      `${SID}.jsonl`,
+    );
+    expect(fs.existsSync(transcriptPath)).toBe(true);
   });
 
   it('overwrite flag is a no-op when there is no conflict', async () => {
@@ -640,7 +871,7 @@ describe('sessionShareImport', () => {
       overwrite: true,
     });
     expect(result.sessionId).toBeTruthy();
-    expect(patchMock.calls).toHaveLength(0);
+    expect(patchMock.notifyCalls).toHaveLength(0);
     expect(dbMock.txCalls).toHaveLength(1);
   });
 
@@ -725,22 +956,42 @@ describe('sessionShareImport', () => {
     const zip = new (await import('jszip')).default();
     const evilId = '../../evil';
     zip.file('session.json', JSON.stringify({ model: 'm' }));
-    zip.file('messages.jsonl', JSON.stringify({ id: 'm1', clientId: 'c1', role: 'user', content: '"x"', createdAt: 1 }));
+    zip.file(
+      'messages.jsonl',
+      JSON.stringify({ id: 'm1', clientId: 'c1', role: 'user', content: '"x"', createdAt: 1 }),
+    );
     zip.file(`transcripts/claude/evil.jsonl`, 'x\n');
     zip.file('media-map.json', JSON.stringify({ entries: [] }));
-    zip.file('manifest.json', JSON.stringify({
-      formatVersion: 1, minReaderVersion: 1, appVersion: '9', platform: 'darwin',
-      exportedAt: '2026-07-04T00:00:00.000Z', agentKind: 'cc', title: 't', workspaceKind: 'project',
-      originalWorkingDir: '/x', sdkSessionIds: [evilId], activeSdkSessionId: null,
-      exportFidelity: 'full', counts: { messages: 1, media: 0 }, entries: [],
-      transcripts: [{ sdkSessionId: evilId, path: 'transcripts/claude/evil.jsonl' }],
-    }));
+    zip.file(
+      'manifest.json',
+      JSON.stringify({
+        formatVersion: 1,
+        minReaderVersion: 1,
+        appVersion: '9',
+        platform: 'darwin',
+        exportedAt: '2026-07-04T00:00:00.000Z',
+        agentKind: 'cc',
+        title: 't',
+        workspaceKind: 'project',
+        originalWorkingDir: '/x',
+        sdkSessionIds: [evilId],
+        activeSdkSessionId: null,
+        exportFidelity: 'full',
+        counts: { messages: 1, media: 0 },
+        entries: [],
+        transcripts: [{ sdkSessionId: evilId, path: 'transcripts/claude/evil.jsonl' }],
+      }),
+    );
     const bytes = await zip.generateAsync({ type: 'nodebuffer' });
     const filePath = await writeBundleFile(Buffer.from(bytes));
     const inspect = await inspectShareFile(filePath);
     if (inspect.encrypted) return;
     await expect(
-      commitShareImport({ draftId: inspect.draftId, workingDir: newWorkdir, projectsRootOverride: projectsRoot }),
+      commitShareImport({
+        draftId: inspect.draftId,
+        workingDir: newWorkdir,
+        projectsRootOverride: projectsRoot,
+      }),
     ).rejects.toMatchObject({ code: 'SHARE_FILE_INVALID' });
     // 零写入:转码目录不应存在任何逃逸产物
     expect(fs.existsSync(path.join(projectsRoot, '..', 'evil.jsonl'))).toBe(false);
@@ -750,20 +1001,29 @@ describe('sessionShareImport', () => {
     const filePath = await writeBundleFile(
       await buildBundle({
         agentKind: 'codex',
-        manifest: { activeSdkSessionId: '../../../../tmp/evil', sdkSessionIds: ['../../../../tmp/evil'] },
+        manifest: {
+          activeSdkSessionId: '../../../../tmp/evil',
+          sdkSessionIds: ['../../../../tmp/evil'],
+        },
       }),
     );
     const inspect = await inspectShareFile(filePath);
     if (inspect.encrypted) return;
     await expect(
-      commitShareImport({ draftId: inspect.draftId, workingDir: newWorkdir, projectsRootOverride: projectsRoot }),
+      commitShareImport({
+        draftId: inspect.draftId,
+        workingDir: newWorkdir,
+        projectsRootOverride: projectsRoot,
+      }),
     ).rejects.toMatchObject({ code: 'SHARE_FILE_INVALID' });
     expect(codexMock.importCalls).toHaveLength(0);
     expect(dbMock.txCalls).toHaveLength(0);
   });
 
   it('image filename comes from validated url, crafted entry.filename cannot escape', async () => {
-    const filePath = await writeBundleFile(await buildBundle({ imageFilenameOverride: '../../../evil.png' }));
+    const filePath = await writeBundleFile(
+      await buildBundle({ imageFilenameOverride: '../../../evil.png' }),
+    );
     const inspect = await inspectShareFile(filePath);
     if (inspect.encrypted) return;
     const result = await commitShareImport({
@@ -774,8 +1034,12 @@ describe('sessionShareImport', () => {
     });
     // 图片入总仓(不落盘 cc-agent),包内伪造的 filename 全程不参与
     // 任何路径拼接,无逃逸文件
-    expect(cindyMediaMock.ingestCalls.some((c) => Buffer.from(c.buffer).equals(IMG1_BYTES))).toBe(true);
-    expect(fs.existsSync(path.join(tmpRoot, 'cc-agent', 'images', result.sessionId, 'img-1.png'))).toBe(false);
+    expect(cindyMediaMock.ingestCalls.some((c) => Buffer.from(c.buffer).equals(IMG1_BYTES))).toBe(
+      true,
+    );
+    expect(
+      fs.existsSync(path.join(tmpRoot, 'cc-agent', 'images', result.sessionId, 'img-1.png')),
+    ).toBe(false);
     expect(fs.existsSync(path.join(tmpRoot, 'evil.png'))).toBe(false);
     expect(fs.existsSync(path.join(tmpRoot, 'cc-agent', 'evil.png'))).toBe(false);
   });
@@ -911,9 +1175,7 @@ describe('sessionShareImport', () => {
     };
     expect(txArgs.session.sdkSessionId).toBe(expectedSessionFile);
     expect(txArgs.session.agentKind).toBe('pi');
-    expect(JSON.parse(txArgs.messages[1].agentMeta ?? '{}').sdkSessionId).toBe(
-      expectedSessionFile,
-    );
+    expect(JSON.parse(txArgs.messages[1].agentMeta ?? '{}').sdkSessionId).toBe(expectedSessionFile);
     expect(codexMock.importCalls).toHaveLength(0);
     expect(dbMock.queryCalls[0].params).toEqual(['pi', expectedSessionFile]);
   });

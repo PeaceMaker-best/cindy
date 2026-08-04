@@ -3,7 +3,11 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 import type { IMAttachment } from '@cindy/im';
-import type { WechatMediaRef, WechatTransport } from '@cindy/wechat-ilink';
+import {
+  WECHAT_MEDIA_MAX_BYTES,
+  type WechatMediaRef,
+  type WechatTransport,
+} from '@cindy/wechat-ilink';
 
 import * as blobStore from '../../cindy-media/blobStore';
 import { ingestMedia } from '../../cindy-media/ingest';
@@ -11,6 +15,7 @@ import type {
   WechatPollFileAttachmentInput,
   WechatPollMediaBlobInput,
   WechatPollMediaRefInput,
+  WechatOutboxMediaInput,
 } from '../../localDb/client/tx/types';
 import { ownerScopedImUserDataPath } from '../ownerScopedStorage';
 import { decodeWechatSilkToWav } from './silkDecoder';
@@ -27,6 +32,73 @@ export interface StagedWechatTaskMedia {
   mediaBlobs: WechatPollMediaBlobInput[];
   mediaRefs: WechatPollMediaRefInput[];
   fileAttachments: WechatPollFileAttachmentInput[];
+}
+
+export async function stageWechatOutboxMedia(
+  absPaths: readonly string[],
+): Promise<WechatOutboxMediaInput[]> {
+  const staged: WechatOutboxMediaInput[] = [];
+  for (const absPath of absPaths.slice(0, MAX_ATTACHMENTS_PER_MESSAGE)) {
+    const local = await readOutboundWechatFile(absPath);
+    const mimeType = detectCindyMediaMime(local.bytes);
+    if (!mimeType) throw new Error('WECHAT_OUTBOX_MEDIA_UNSUPPORTED');
+    const written = await ingestMedia({
+      buffer: local.bytes,
+      mimeType,
+      isCache: false,
+      refs: [],
+    });
+    staged.push({
+      hash: written.hash,
+      absPath: blobStore.resolveSafe(written.url).absPath,
+      fileName: local.fileName,
+      clientId: randomUUID(),
+    });
+  }
+  return staged;
+}
+
+export async function readOutboundWechatFile(
+  absPath: string,
+  displayName?: string,
+): Promise<{
+  bytes: Uint8Array;
+  fileName: string;
+  kind: 'image' | 'video' | 'file';
+}> {
+  if (!path.isAbsolute(absPath)) {
+    throw Object.assign(new Error('WeChat outbound path must be absolute.'), {
+      code: 'ENOENT',
+    });
+  }
+  const handle = await fs.open(absPath, 'r');
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) {
+      throw Object.assign(new Error('WeChat outbound path is not a regular file.'), {
+        code: 'ENOENT',
+      });
+    }
+    if (stat.size === 0) {
+      throw Object.assign(new Error('WeChat outbound file is empty.'), {
+        code: 'WECHAT_FILE_EMPTY',
+      });
+    }
+    if (stat.size > WECHAT_MEDIA_MAX_BYTES) {
+      throw Object.assign(new Error('WeChat outbound file exceeds 5 MB.'), {
+        code: 'WECHAT_FILE_TOO_LARGE',
+      });
+    }
+    const bytes = await handle.readFile();
+    if (bytes.byteLength !== stat.size) throw new Error('WECHAT_OUTBOUND_FILE_CHANGED');
+    return {
+      bytes,
+      fileName: sanitizeAttachmentName(displayName ?? path.basename(absPath), 'cindy-file.bin'),
+      kind: detectOutboundWechatKind(bytes),
+    };
+  } finally {
+    await handle.close();
+  }
 }
 
 export async function stageWechatTaskMedia(args: {
@@ -292,6 +364,39 @@ function isMp4(bytes: Uint8Array): boolean {
   return bytes.length >= 12 && startsWithAscii(bytes.subarray(4), 'ftyp');
 }
 
+function detectCindyMediaMime(bytes: Uint8Array): string | null {
+  const image = detectImage(bytes);
+  if (image) return image.mimeType;
+  if (startsWithAscii(bytes, 'RIFF') && startsWithAscii(bytes.subarray(8), 'WAVE')) {
+    return 'audio/wav';
+  }
+  if (startsWithAscii(bytes, 'OggS')) return 'audio/ogg';
+  if (isMp3(bytes)) return 'audio/mpeg';
+  if (
+    bytes.length >= 4 &&
+    bytes[0] === 0x1a &&
+    bytes[1] === 0x45 &&
+    bytes[2] === 0xdf &&
+    bytes[3] === 0xa3
+  ) {
+    return 'video/webm';
+  }
+  if (isMp4(bytes)) {
+    const brand = String.fromCharCode(...bytes.subarray(8, 12));
+    if (brand === 'qt  ') return 'video/quicktime';
+    if (brand === 'M4A ' || brand === 'M4B ') return 'audio/mp4';
+    return 'video/mp4';
+  }
+  return null;
+}
+
+function detectOutboundWechatKind(bytes: Uint8Array): 'image' | 'video' | 'file' {
+  const mimeType = detectCindyMediaMime(bytes);
+  if (mimeType?.startsWith('image/')) return 'image';
+  if (mimeType?.startsWith('video/')) return 'video';
+  return 'file';
+}
+
 function isMp3(bytes: Uint8Array): boolean {
   return (
     startsWithAscii(bytes, 'ID3') ||
@@ -328,5 +433,6 @@ function mimeForFileName(fileName: string): string {
 
 export const __testing = {
   detectWechatMedia,
+  detectCindyMediaMime,
   sanitizeAttachmentName,
 };

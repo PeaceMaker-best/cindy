@@ -130,12 +130,12 @@ export interface OrcaInterAgentDispatcherDeps<TSessionMeta> {
   getSessionRowSnapshot: (sessionId: string) => Promise<OrcaInterAgentSessionRowSnapshot | null>;
   getLiveSession: (sessionId: string) => PersistedUserMessageSession | null | undefined;
   shouldQueueNewTurn: (sessionId: string) => boolean;
-  hasSendToSessionLock: (sessionId: string) => boolean;
+  withSessionLock: <T>(sessionId: string, task: () => Promise<T>) => Promise<T>;
   buildCreateOptsForQueuedSession: (
     sessionId: string,
     meta: TSessionMeta,
   ) => Promise<AgentInputCreateOpts>;
-  enqueueQueuedMessage: (sessionId: string, item: AgentInputQueuedMessage) => void;
+  enqueueQueuedMessage: (sessionId: string, item: AgentInputQueuedMessage) => Promise<void>;
   sendToSessionInternal: (
     params: OrcaInterAgentSendToSessionInternalParams,
   ) => Promise<OrcaInterAgentSendToSessionInternalResult>;
@@ -246,31 +246,6 @@ export function createOrcaInterAgentDispatcher<TSessionMeta>(
   const dispatchOrEnqueueOrcaInterAgentMessage = async (
     params: DispatchOrcaInterAgentMessageParams,
   ): Promise<DispatchOrcaInterAgentMessageResult> => {
-    const [meta, dbRow] = await Promise.all([
-      deps.getSessionMeta(params.targetSessionId).catch(() => null),
-      deps.getSessionRowSnapshot(params.targetSessionId),
-    ]);
-    if (!meta || !dbRow) {
-      return {
-        ok: false,
-        dispatchOutcome: {
-          ...createHostSendFailure('SEND_FAILED', `session ${params.targetSessionId} not found`),
-          source: params.meta.source,
-          context: params.meta.context,
-        },
-      };
-    }
-    if (dbRow.status === 'archived' || dbRow.status === 'deleted') {
-      return {
-        ok: false,
-        dispatchOutcome: {
-          ...createHostSendFailure('SEND_FAILED', `session ${params.targetSessionId} is ${dbRow.status}`),
-          source: params.meta.source,
-          context: params.meta.context,
-        },
-      };
-    }
-
     const clientId = deps.createId();
     const agentMessageText = formatAgentMessage(params.source, params.rawContent, params.workerId);
     const persistedContent = formatOrcaCommunicationMessage(params.source, params.rawContent);
@@ -285,12 +260,6 @@ export function createOrcaInterAgentDispatcher<TSessionMeta>(
       }
       return { ok: false, dispatchOutcome };
     };
-    const dispatchReceipt = {
-      targetTitle: dbRow.title,
-      targetLastUserSendAt: dbRow.userSendAt !== null
-        ? new Date(dbRow.userSendAt).toISOString()
-        : null,
-    };
     // senderLabel 口径 = worker 的 role。包侧路径只有 workerId 可传, host 这里反查 role 覆盖。
     const resolveSenderLabel = async (): Promise<string> => {
       if (params.source !== 'worker' || !params.workerId) return params.senderLabel;
@@ -300,46 +269,150 @@ export function createOrcaInterAgentDispatcher<TSessionMeta>(
         return params.senderLabel;
       }
     };
-    const enqueueQueuedMessage = async (logEvent: string): Promise<DispatchOrcaInterAgentMessageResult> => {
-      const createOpts = await deps.buildCreateOptsForQueuedSession(params.targetSessionId, meta);
-      const queued = buildQueuedOrcaInterAgentMessage({
-        clientId,
-        agentMessageText,
-        persistedContent,
-        rawContent: params.rawContent,
-        senderLabel: await resolveSenderLabel(),
-        createOpts,
-      });
-      if (params.onAccepted) {
-        registerQueuedOrcaInterAgentAcceptedCallback(clientId, params.onAccepted, params.onAcceptedRollback);
+    const lockedResult = await deps.withSessionLock(params.targetSessionId, async () => {
+      const [meta, dbRow] = await Promise.all([
+        deps.getSessionMeta(params.targetSessionId).catch(() => null),
+        deps.getSessionRowSnapshot(params.targetSessionId),
+      ]);
+      if (!meta || !dbRow) {
+        return {
+          kind: 'result' as const,
+          value: await failureResult({
+            ...createHostSendFailure(
+              'SEND_FAILED',
+              `session ${params.targetSessionId} not found`,
+            ),
+            source: params.meta.source,
+            context: params.meta.context,
+          }),
+        };
       }
-      deps.enqueueQueuedMessage(params.targetSessionId, queued);
-      log.info(logEvent, {
-        targetSessionId: params.targetSessionId,
-        clientId,
-        source: params.source,
-        senderLabel: params.senderLabel,
-        context: params.meta.context,
-      });
-      return {
-        ok: true,
-        mode: 'queued',
-        clientId,
-        dispatchOutcome: makeQueuedDispatchOutcome(params.meta.source),
-        ...dispatchReceipt,
+      if (dbRow.status !== 'active') {
+        return {
+          kind: 'result' as const,
+          value: await failureResult({
+            ...createHostSendFailure(
+              'SEND_FAILED',
+              `session ${params.targetSessionId} is ${dbRow.status}`,
+            ),
+            source: params.meta.source,
+            context: params.meta.context,
+          }),
+        };
+      }
+
+      const dispatchReceipt = {
+        targetTitle: dbRow.title,
+        targetLastUserSendAt:
+          dbRow.userSendAt !== null ? new Date(dbRow.userSendAt).toISOString() : null,
       };
-    };
+      const enqueueQueuedMessage = async (
+        logEvent: string,
+      ): Promise<DispatchOrcaInterAgentMessageResult> => {
+        const createOpts = await deps.buildCreateOptsForQueuedSession(
+          params.targetSessionId,
+          meta,
+        );
+        const queued = buildQueuedOrcaInterAgentMessage({
+          clientId,
+          agentMessageText,
+          persistedContent,
+          rawContent: params.rawContent,
+          senderLabel: await resolveSenderLabel(),
+          createOpts,
+        });
+        if (params.onAccepted) {
+          registerQueuedOrcaInterAgentAcceptedCallback(
+            clientId,
+            params.onAccepted,
+            params.onAcceptedRollback,
+          );
+        }
+        await deps.enqueueQueuedMessage(params.targetSessionId, queued);
+        log.info(logEvent, {
+          targetSessionId: params.targetSessionId,
+          clientId,
+          source: params.source,
+          senderLabel: params.senderLabel,
+          context: params.meta.context,
+        });
+        return {
+          ok: true,
+          mode: 'queued',
+          clientId,
+          dispatchOutcome: makeQueuedDispatchOutcome(params.meta.source),
+          ...dispatchReceipt,
+        };
+      };
 
-    const shouldQueue = deps.shouldQueueNewTurn(params.targetSessionId)
-      || deps.hasSendToSessionLock(params.targetSessionId)
-      || deps.getLiveSession(params.targetSessionId)?.isTurnRunning?.() === true;
-    if (shouldQueue) {
-      return enqueueQueuedMessage('orca inter-agent message queued');
-    }
-
-    try {
       const live = deps.getLiveSession(params.targetSessionId);
-      if (live) {
+      if (deps.shouldQueueNewTurn(params.targetSessionId) || live?.isTurnRunning?.() === true) {
+        return {
+          kind: 'result' as const,
+          value: await enqueueQueuedMessage('orca inter-agent message queued'),
+        };
+      }
+      if (!live) {
+        try {
+          const result = await deps.sendToSessionInternal({
+            targetSessionId: params.targetSessionId,
+            message: agentMessageText,
+            persistedContent,
+            clientId,
+            onAccepted: runAccepted,
+            onAcceptedRollback: params.onAcceptedRollback,
+            origin: {
+              kind: 'orca',
+              senderLabel: await resolveSenderLabel(),
+              displayText: params.rawContent,
+            },
+          });
+          if (result.ok) {
+            return {
+              kind: 'result' as const,
+              value: {
+                ok: true as const,
+                mode: result.wakeKind === 'queued' ? 'queued' as const : 'dispatched' as const,
+                clientId,
+                dispatchOutcome: result.wakeKind === 'queued'
+                  ? makeQueuedDispatchOutcome(params.meta.source)
+                  : {
+                      kind: 'session-dispatch' as const,
+                      source: params.meta.source,
+                      dispatched: true as const,
+                    },
+                targetTitle: result.targetTitle,
+                targetLastUserSendAt: result.targetLastUserSendAt,
+              },
+            };
+          }
+          return {
+            kind: 'result' as const,
+            value: await failureResult({
+              ...createHostSendFailure(
+                result.errorCode === 'BUSY' ? 'SESSION_RUNNING' : 'SEND_FAILED',
+                result.message,
+              ),
+              source: params.meta.source,
+              context: params.meta.context,
+            }),
+          };
+        } catch (err) {
+          return {
+            kind: 'result' as const,
+            value: await failureResult({
+              ...createHostSendFailure(
+                deps.isSessionRunningError(err) ? 'SESSION_RUNNING' : 'SEND_FAILED',
+                err instanceof Error ? err.message : String(err),
+              ),
+              source: params.meta.source,
+              context: params.meta.context,
+            }),
+          };
+        }
+      }
+
+      try {
         const result = await sendPersistedUserMessageToSession(deps, {
           session: live,
           dbContent: persistedContent,
@@ -350,55 +423,45 @@ export function createOrcaInterAgentDispatcher<TSessionMeta>(
           onAccepted: runAccepted,
         });
         if (result.dispatched) {
-          return { ok: true, mode: 'dispatched', clientId, dispatchOutcome: result.dispatchOutcome, ...dispatchReceipt };
+          return {
+            kind: 'result' as const,
+            value: {
+              ok: true as const,
+              mode: 'dispatched' as const,
+              clientId,
+              dispatchOutcome: result.dispatchOutcome,
+              ...dispatchReceipt,
+            },
+          };
         }
-        if (result.dispatchOutcome.kind === 'host-send' && result.dispatchOutcome.code === 'SESSION_RUNNING') {
-          return enqueueQueuedMessage('orca inter-agent message queued after SESSION_RUNNING race');
+        if (
+          result.dispatchOutcome.kind === 'host-send' &&
+          result.dispatchOutcome.code === 'SESSION_RUNNING'
+        ) {
+          return {
+            kind: 'result' as const,
+            value: await enqueueQueuedMessage(
+              'orca inter-agent message queued after SESSION_RUNNING race',
+            ),
+          };
         }
-        return failureResult(result.dispatchOutcome);
-      }
-
-      const result = await deps.sendToSessionInternal({
-        targetSessionId: params.targetSessionId,
-        message: agentMessageText,
-        persistedContent,
-        clientId,
-        onAccepted: runAccepted,
-        onAcceptedRollback: params.onAcceptedRollback,
-        origin: {
-          kind: 'orca',
-          senderLabel: await resolveSenderLabel(),
-          displayText: params.rawContent,
-        },
-      });
-      if (result.ok) {
+        return { kind: 'result' as const, value: await failureResult(result.dispatchOutcome) };
+      } catch (err) {
         return {
-          ok: true,
-          mode: result.wakeKind === 'queued' ? 'queued' : 'dispatched',
-          clientId,
-          dispatchOutcome: result.wakeKind === 'queued'
-            ? makeQueuedDispatchOutcome(params.meta.source)
-            : {
-                kind: 'session-dispatch',
-                source: params.meta.source,
-                dispatched: true,
-              },
-          targetTitle: result.targetTitle,
-          targetLastUserSendAt: result.targetLastUserSendAt,
+          kind: 'result' as const,
+          value: await failureResult({
+            ...createHostSendFailure(
+              deps.isSessionRunningError(err) ? 'SESSION_RUNNING' : 'SEND_FAILED',
+              err instanceof Error ? err.message : String(err),
+            ),
+            source: params.meta.source,
+            context: params.meta.context,
+          }),
         };
       }
-      return failureResult({
-        ...createHostSendFailure(result.errorCode === 'BUSY' ? 'SESSION_RUNNING' : 'SEND_FAILED', result.message),
-        source: params.meta.source,
-        context: params.meta.context,
-      });
-    } catch (err) {
-      return failureResult({
-        ...createHostSendFailure(deps.isSessionRunningError(err) ? 'SESSION_RUNNING' : 'SEND_FAILED', err instanceof Error ? err.message : String(err)),
-        source: params.meta.source,
-        context: params.meta.context,
-      });
-    }
+    });
+
+    return lockedResult.value;
   };
 
   return {

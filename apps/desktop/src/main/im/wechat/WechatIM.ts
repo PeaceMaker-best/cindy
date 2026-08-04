@@ -1,5 +1,4 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import fs from 'node:fs/promises';
 import path from 'node:path';
 
 import {
@@ -16,7 +15,6 @@ import {
   asWechatIlinkError,
   chunkWechatText,
   filterWechatMarkdown,
-  WECHAT_MEDIA_MAX_BYTES,
   WechatIlinkError,
   type WechatAuthorizationEvent,
   type WechatCredentials,
@@ -40,11 +38,19 @@ import {
   resolvePermissionMode,
 } from '../shared/permissionModeControl';
 import { ui } from './uiText';
-import { WechatTaskStore, type WechatActiveBinding, type WechatTask } from './taskStore';
+import {
+  WechatTaskStore,
+  type WechatActiveBinding,
+  type WechatInboundTaskInput,
+  type WechatTask,
+} from './taskStore';
 import type { DbClient } from '../../localDb/client/DbClient';
+import { withSessionLifecycleLocks } from '../../sessionLifecycleLock';
 import {
   removeUncommittedWechatFiles,
   removeReleasedWechatFiles,
+  readOutboundWechatFile,
+  stageWechatOutboxMedia,
   stageWechatTaskMedia,
   type WechatTaskAttachment,
 } from './mediaStaging';
@@ -88,6 +94,14 @@ interface WechatTaskPayload {
   text: string;
   attachments: WechatTaskAttachment[];
   unsupportedMedia: string[];
+}
+
+interface WechatTaskInputRoute {
+  index: number;
+  bindingEpoch: string;
+  source: WechatInboundMessage;
+  sessionId: string;
+  message: Omit<WechatInboundTaskInput, 'payloadJson'>;
 }
 
 interface ActiveTask {
@@ -598,6 +612,7 @@ export class WechatIM extends BaseIM implements RichChannelIM {
     const active = this.#activeTasks.get(output.userId);
     if (!active) throw new Error('WECHAT_NO_ACTIVE_TASK');
     const chunks = chunkWechatText(normalizeFinalOutputText(output.text));
+    const media = await stageWechatOutboxMedia(output.mediaAbsPaths ?? []);
     const kind =
       output.terminal === 'done'
         ? ('final' as const)
@@ -614,16 +629,7 @@ export class WechatIM extends BaseIM implements RichChannelIM {
         kind,
         chunkIndex: index,
         text: chunk,
-        ...(index === 0 && output.mediaAbsPaths?.length
-          ? {
-              mediaJson: JSON.stringify(
-                output.mediaAbsPaths.slice(0, 4).map((absPath) => ({
-                  absPath,
-                  clientId: randomUUID(),
-                })),
-              ),
-            }
-          : {}),
+        ...(index === 0 && media.length ? { media } : {}),
       })),
     });
     if (!result.committed) throw new Error('WECHAT_TERMINAL_COMMIT_REJECTED');
@@ -805,11 +811,6 @@ export class WechatIM extends BaseIM implements RichChannelIM {
       try {
         const result = await transport.poll(cursor, signal);
         const now = this.#now();
-        const preparedInputs = await Promise.all(
-          result.messages.map((message, index) =>
-            this.#toTaskInput(binding.bindingEpoch, message, transport, signal, now, index),
-          ),
-        );
         const interactionIndexes = new Set(
           result.messages
             .map((message, index) =>
@@ -821,34 +822,54 @@ export class WechatIM extends BaseIM implements RichChannelIM {
             )
             .filter((index) => index >= 0),
         );
-        const normalPreparedInputs = preparedInputs.filter(
-          (_input, index) => !interactionIndexes.has(index),
+        const routedInputs = await Promise.all(
+          result.messages
+            .map((message, index) => ({ message, index }))
+            .filter(({ index }) => !interactionIndexes.has(index))
+            .map(({ message, index }) =>
+              this.#resolveTaskInputRoute(binding.bindingEpoch, message, now, index),
+            ),
         );
-        const inputs = normalPreparedInputs.map((input) => input.message);
-        const mediaBlobs = normalPreparedInputs.flatMap((input) => input.mediaBlobs);
-        const mediaRefs = normalPreparedInputs.flatMap((input) => input.mediaRefs);
-        const fileAttachments = normalPreparedInputs.flatMap((input) => input.fileAttachments);
-        const allFileAttachments = preparedInputs.flatMap((input) => input.fileAttachments);
         let releasePollBarrier!: () => void;
         this.#pollBarrier = new Promise<void>((resolve) => {
           releasePollBarrier = resolve;
         });
         let committed;
         try {
-          committed = await this.#requireStore().commitPollBatch({
-            bindingEpoch: binding.bindingEpoch,
-            expectedCursor: cursor,
-            nextCursor: result.cursor,
-            now,
-            messages: inputs,
-            mediaBlobs,
-            mediaRefs,
-            fileAttachments,
-          });
-          await removeUncommittedWechatFiles(
-            allFileAttachments,
-            acceptedPollTaskIds(committed),
+          const locked = await withSessionLifecycleLocks(
+            routedInputs.map((input) => input.sessionId),
+            async () => {
+              for (const input of routedInputs) {
+                const row = await this.#deps.getDbClient().queryOne<{ status: string }>(
+                  'SELECT status FROM sessions WHERE id = ? LIMIT 1',
+                  [input.sessionId],
+                );
+                if (row?.status !== 'active') throw new Error('WECHAT_SESSION_ROUTE_STALE');
+              }
+              const preparedInputs = await Promise.all(
+                routedInputs.map((input) =>
+                  this.#stageTaskInput(input, transport, signal, now),
+                ),
+              );
+              const committedBatch = await this.#requireStore().commitPollBatch({
+                bindingEpoch: binding.bindingEpoch,
+                expectedCursor: cursor,
+                nextCursor: result.cursor,
+                now,
+                messages: preparedInputs.map((input) => input.message),
+                mediaBlobs: preparedInputs.flatMap((input) => input.mediaBlobs),
+                mediaRefs: preparedInputs.flatMap((input) => input.mediaRefs),
+                fileAttachments: preparedInputs.flatMap((input) => input.fileAttachments),
+              });
+              await removeUncommittedWechatFiles(
+                preparedInputs.flatMap((input) => input.fileAttachments),
+                acceptedPollTaskIds(committedBatch),
+              );
+              return committedBatch;
+            },
           );
+          if (!locked.acquired) throw new Error('WECHAT_SESSION_LIFECYCLE_BUSY');
+          committed = locked.value;
           if (committed.committed) {
             for (const message of result.messages) {
               await this.#requireStore().refreshPendingOutboxContext({
@@ -862,7 +883,7 @@ export class WechatIM extends BaseIM implements RichChannelIM {
           if (committed.committed) {
             for (let index = 0; index < result.messages.length; index += 1) {
               const message = result.messages[index];
-              const task = preparedInputs[index]?.message;
+              const task = routedInputs.find((input) => input.index === index)?.message;
               const command = message?.text.trim();
               if (!message || !task || (command !== '/stop' && command !== '/stop all')) {
                 continue;
@@ -1470,7 +1491,7 @@ export class WechatIM extends BaseIM implements RichChannelIM {
     }
     for (const media of parseOutboxMedia(item.mediaJson)) {
       this.#assertSendEpochCurrent(bindingEpoch, signal);
-      const local = await readOutboundWechatFile(media.absPath);
+      const local = await readOutboxMedia(media);
       this.#assertSendEpochCurrent(bindingEpoch, signal);
       const uploaded = await transport.uploadMedia(
         {
@@ -1505,11 +1526,9 @@ export class WechatIM extends BaseIM implements RichChannelIM {
     return row.peerId;
   }
 
-  async #toTaskInput(
+  async #resolveTaskInputRoute(
     bindingEpoch: string,
     message: WechatInboundMessage,
-    transport: WechatTransport,
-    signal: AbortSignal,
     receivedAt: number,
     index: number,
   ) {
@@ -1522,17 +1541,11 @@ export class WechatIM extends BaseIM implements RichChannelIM {
       existing ?? (await runtime.repo.createSession(botId, message.senderId, undefined, prepared));
     const epoch = await this.#requireStore().getConversationEpoch(bindingEpoch, message.senderId);
     const taskId = randomUUID();
-    const staged = await stageWechatTaskMedia({
-      bindingEpoch,
-      taskId,
-      sessionId: session.id,
-      media: [...(message.quote?.media ?? []), ...message.media],
-      transport,
-      signal,
-      now: receivedAt,
-    });
-    const quote = formatWechatQuote(message);
     return {
+      index,
+      bindingEpoch,
+      source: message,
+      sessionId: session.id,
       message: {
         id: taskId,
         platformMessageId: message.messageId,
@@ -1542,17 +1555,41 @@ export class WechatIM extends BaseIM implements RichChannelIM {
         platformCreatedAt: message.createdAt ?? receivedAt,
         sessionId: session.id,
         conversationEpoch: epoch,
-        payloadJson: JSON.stringify({
-          text: quote ? `${quote}\n${message.text}`.trim() : message.text,
-          attachments: staged.attachments,
-          unsupportedMedia: staged.unsupportedMedia,
-        } satisfies WechatTaskPayload),
         contextToken: message.contextToken,
         overloadReply: {
           outboxId: randomUUID(),
           clientId: randomUUID(),
           text: '当前微信任务较多，请稍后再试。',
         },
+      },
+    };
+  }
+
+  async #stageTaskInput(
+    route: WechatTaskInputRoute,
+    transport: WechatTransport,
+    signal: AbortSignal,
+    receivedAt: number,
+  ) {
+    const message = route.source;
+    const staged = await stageWechatTaskMedia({
+      bindingEpoch: route.bindingEpoch,
+      taskId: route.message.id,
+      sessionId: route.sessionId,
+      media: [...(message.quote?.media ?? []), ...message.media],
+      transport,
+      signal,
+      now: receivedAt,
+    });
+    const quote = formatWechatQuote(message);
+    return {
+      message: {
+        ...route.message,
+        payloadJson: JSON.stringify({
+          text: quote ? `${quote}\n${message.text}`.trim() : message.text,
+          attachments: staged.attachments,
+          unsupportedMedia: staged.unsupportedMedia,
+        } satisfies WechatTaskPayload),
       },
       mediaBlobs: staged.mediaBlobs,
       mediaRefs: staged.mediaRefs,
@@ -1765,7 +1802,17 @@ function retryDelay(attempt: number): number {
 
 interface OutboxMedia {
   absPath: string;
+  /**
+   * Added after the first reliable-outbox release. Old pending rows only have
+   * absPath/clientId, so keep this optional and fall back to the stored path's
+   * basename when an upgraded client resumes delivery.
+   */
+  fileName?: string;
   clientId: string;
+}
+
+async function readOutboxMedia(media: OutboxMedia) {
+  return readOutboundWechatFile(media.absPath, media.fileName);
 }
 
 function parseOutboxMedia(raw: string): OutboxMedia[] {
@@ -1785,6 +1832,9 @@ function parseOutboxMedia(raw: string): OutboxMedia[] {
         !Array.isArray(item) &&
         typeof (item as Partial<OutboxMedia>).absPath === 'string' &&
         path.isAbsolute((item as Partial<OutboxMedia>).absPath!) &&
+        ((item as Partial<OutboxMedia>).fileName === undefined ||
+          (typeof (item as Partial<OutboxMedia>).fileName === 'string' &&
+            (item as Partial<OutboxMedia>).fileName!.length > 0)) &&
         typeof (item as Partial<OutboxMedia>).clientId === 'string' &&
         (item as Partial<OutboxMedia>).clientId!.length > 0,
     )
@@ -1792,78 +1842,6 @@ function parseOutboxMedia(raw: string): OutboxMedia[] {
     throw new Error('WECHAT_OUTBOX_MEDIA_INVALID');
   }
   return value as OutboxMedia[];
-}
-
-async function readOutboundWechatFile(
-  absPath: string,
-  displayName?: string,
-): Promise<{
-  bytes: Uint8Array;
-  fileName: string;
-  kind: 'image' | 'video' | 'file';
-}> {
-  if (!path.isAbsolute(absPath)) {
-    throw Object.assign(new Error('WeChat outbound path must be absolute.'), {
-      code: 'ENOENT',
-    });
-  }
-  const handle = await fs.open(absPath, 'r');
-  try {
-    const stat = await handle.stat();
-    if (!stat.isFile()) {
-      throw Object.assign(new Error('WeChat outbound path is not a regular file.'), {
-        code: 'ENOENT',
-      });
-    }
-    if (stat.size === 0) {
-      throw Object.assign(new Error('WeChat outbound file is empty.'), {
-        code: 'WECHAT_FILE_EMPTY',
-      });
-    }
-    if (stat.size > WECHAT_MEDIA_MAX_BYTES) {
-      throw Object.assign(new Error('WeChat outbound file exceeds 5 MB.'), {
-        code: 'WECHAT_FILE_TOO_LARGE',
-      });
-    }
-    const bytes = await handle.readFile();
-    if (bytes.byteLength !== stat.size) {
-      throw new Error('WECHAT_OUTBOUND_FILE_CHANGED');
-    }
-    return {
-      bytes,
-      fileName: sanitizeOutboundFileName(displayName ?? path.basename(absPath)),
-      kind: detectOutboundWechatKind(bytes),
-    };
-  } finally {
-    await handle.close();
-  }
-}
-
-function sanitizeOutboundFileName(input: string): string {
-  const value = path
-    .basename(input.normalize('NFKC'))
-    .replace(/\p{Cc}/gu, '_')
-    .replace(/[<>:"/\\|?*]/g, '_')
-    .replace(/[. ]+$/g, '')
-    .trim()
-    .slice(0, 180);
-  return value || 'cindy-file.bin';
-}
-
-function detectOutboundWechatKind(bytes: Uint8Array): 'image' | 'video' | 'file' {
-  const ascii = (offset: number, value: string): boolean =>
-    bytes.length >= offset + value.length &&
-    Array.from(value).every((char, index) => bytes[offset + index] === char.charCodeAt(0));
-  if (
-    (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) ||
-    (bytes.length >= 8 && bytes[0] === 0x89 && ascii(1, 'PNG\r\n\u001a\n')) ||
-    ascii(0, 'GIF87a') ||
-    ascii(0, 'GIF89a') ||
-    (ascii(0, 'RIFF') && ascii(8, 'WEBP'))
-  ) {
-    return 'image';
-  }
-  return ascii(4, 'ftyp') ? 'video' : 'file';
 }
 
 function withJitter(value: number): number {
@@ -1978,6 +1956,8 @@ export const __testing = {
   classifyOutboxSendError,
   hasWechatTaskContent,
   normalizeFinalOutputText,
+  parseOutboxMedia,
+  readOutboxMedia,
   formatWechatInteractionPrompt,
   parseWechatInteractionReply,
   stopActiveWechatTurns,

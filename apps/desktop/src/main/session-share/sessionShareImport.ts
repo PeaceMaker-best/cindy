@@ -19,11 +19,15 @@ import { app } from 'electron';
 
 import { getDbClient } from '../localDb/client/current.js';
 import { ensureDialogueWorkspaceDir } from '../localDb/dialogueWorkspace.js';
-import { patchSessionMetaInDb } from '../localDb/ipc/sessions.js';
+import { commitAndFinalizeSessionDeletion } from '../localDb/ipc/sessions.js';
+import { getSessionRuntimeOwnerPrefix } from '../sessionRuntimeOwnership.js';
+import { withCrossProcessLock } from '../device-link/crossProcessLock.js';
 import { createLogger } from '../logger.js';
 import {
+  finalizeSharedCodexThreadImport,
   importSharedCodexThread,
   removeSharedCodexThread,
+  type ImportSharedCodexThreadParams,
   type ImportSharedCodexThreadResult,
 } from '../maker-host/codex-local-sessions.js';
 import { defaultClaudeConfigDirCandidates } from '../maker-orchestration/claudeTranscriptAnchors.js';
@@ -41,7 +45,11 @@ import {
 } from '../imageCacheStore.js';
 import { resolveSafe as resolveVideoUrl } from '../videoCacheStore.js';
 import { resolveSafe as resolveModelUrl } from '../modelCacheStore.js';
-import { parseBlobUrl, mimeForExt, resolveHashRef as resolveBlobHashRef } from '../cindy-media/blobStore.js';
+import {
+  parseBlobUrl,
+  mimeForExt,
+  resolveHashRef as resolveBlobHashRef,
+} from '../cindy-media/blobStore.js';
 import { ingestMedia } from '../cindy-media/ingest.js';
 import { removeSessionRefs as removeSessionMediaRefs } from '../cindy-media/ledger.js';
 
@@ -114,7 +122,9 @@ function toPreview(manifest: XdtshareManifest): SharePreview {
   };
 }
 
-async function loadZipAndManifest(zipBytes: Buffer): Promise<{ zip: JSZip; manifest: XdtshareManifest }> {
+async function loadZipAndManifest(
+  zipBytes: Buffer,
+): Promise<{ zip: JSZip; manifest: XdtshareManifest }> {
   const zip = await JSZip.loadAsync(zipBytes).catch(() => {
     throw new XdtshareError('SHARE_FILE_INVALID', 'payload is not a readable zip');
   });
@@ -289,7 +299,10 @@ export async function commitShareImport(
   // CC 侧 resume 也按 `<id>.jsonl` 定位转录——非单路径段一律拒整包(审查 P0)。
   const portableActiveSdkSessionId = manifest.activeSdkSessionId;
   if (portableActiveSdkSessionId && !isSafePathSegment(portableActiveSdkSessionId)) {
-    throw new XdtshareError('SHARE_FILE_INVALID', `unsafe activeSdkSessionId: ${portableActiveSdkSessionId}`);
+    throw new XdtshareError(
+      'SHARE_FILE_INVALID',
+      `unsafe activeSdkSessionId: ${portableActiveSdkSessionId}`,
+    );
   }
   const bundledTranscripts = manifest.transcripts.filter(
     (t): t is { sdkSessionId: string; path: string } => t.path !== null,
@@ -299,7 +312,10 @@ export async function commitShareImport(
   // 先整体校验为单路径段,非法直接拒绝整包。
   for (const t of bundledTranscripts) {
     if (!isSafePathSegment(t.sdkSessionId)) {
-      throw new XdtshareError('SHARE_FILE_INVALID', `unsafe sdkSessionId in transcripts: ${t.sdkSessionId}`);
+      throw new XdtshareError(
+        'SHARE_FILE_INVALID',
+        `unsafe sdkSessionId in transcripts: ${t.sdkSessionId}`,
+      );
     }
   }
   const piSessionsRoot = path.resolve(
@@ -320,25 +336,32 @@ export async function commitShareImport(
   }
   const activeSdkSessionId =
     manifest.agentKind === 'pi'
-      ? (portableActiveSdkSessionId
-          ? (piTranscriptTargets.get(portableActiveSdkSessionId) ?? null)
-          : null)
+      ? portableActiveSdkSessionId
+        ? (piTranscriptTargets.get(portableActiveSdkSessionId) ?? null)
+        : null
       : portableActiveSdkSessionId;
+  const runImport = async (): Promise<CommitShareImportResult> => {
   // 互斥判定的唯一权威:DB 里是否已有同 agent + 同 resume id 的**存活**会话行。
   // 刻意排除 status='deleted'——删除会话不清理盘上的转录/rollout/state,重导同一
   // 分享包时下方文件层一律「存在即复用、绝不覆盖」,不把盘上残留当成冲突。
-  // overwrite = 用户在冲突弹窗确认"覆盖导入":记下旧会话,写入阶段先软删它,
-  // 再走既有的"已删除会话重导"路径(盘上转录复用)——净效果是替换而非叠加。
-  let conflictExisting: { id: string; status: string } | null = null;
+  // overwrite = 用户在冲突弹窗确认"覆盖导入":记下旧会话及预期状态,最后由
+  // session.importShare 事务 CAS 软删旧行并插入新行,避免文件准备失败时先删后恢复。
+  let conflictExisting: { id: string; status: 'active' | 'archived' } | null = null;
   if (activeSdkSessionId) {
-    const existing = await getDbClient().queryOne<{ id: string; status: string }>(
+    const existing = await getDbClient().queryOne<{
+      id: string;
+      status: 'active' | 'archived';
+    }>(
       `SELECT id, status FROM sessions
-       WHERE agent_kind = ? AND sdk_session_id = ? AND status != 'deleted' LIMIT 1`,
+       WHERE agent_kind = ? AND sdk_session_id = ? AND status IN ('active', 'archived') LIMIT 1`,
       [manifest.agentKind, activeSdkSessionId],
     );
     if (existing) {
       if (!opts.overwrite) {
-        throw codedError('SHARE_CONFLICT', `session with same resume id already imported: ${existing.id}`);
+        throw codedError(
+          'SHARE_CONFLICT',
+          `session with same resume id already imported: ${existing.id}`,
+        );
       }
       conflictExisting = existing;
     }
@@ -354,6 +377,7 @@ export async function commitShareImport(
   let worktreePath: string | null = null;
   const journal: Array<() => Promise<void>> = [];
   const notes: string[] = [];
+  let dbCommitted = false;
   const rollback = async (): Promise<void> => {
     for (const undo of journal.reverse()) {
       await undo().catch((err) => {
@@ -365,24 +389,7 @@ export async function commitShareImport(
   };
 
   try {
-    // 0. 覆盖导入:软删旧会话(复用手动删除的完整语义——DB 更新 + 图片缓存清理 +
-    //    sessions:patched 广播,sidebar 即时移除),并登记 journal 恢复原 status:
-    //    后续任一步失败逆序回滚时旧会话回到列表,不丢用户数据。
-    if (conflictExisting) {
-      const { id: existingId, status: prevStatus } = conflictExisting;
-      await patchSessionMetaInDb(existingId, { status: 'deleted' });
-      journal.push(async () => {
-        await patchSessionMetaInDb(existingId, {
-          status: prevStatus === 'archived' ? 'archived' : 'active',
-        });
-      });
-      log.info('share import overwrite: soft-deleted existing session', {
-        existingId,
-        prevStatus,
-      });
-    }
-
-    // 0b. worktree(仅 project 会话 + 用户勾选):以所选目录的 git 仓库根为
+    // 0. worktree(仅 project 会话 + 用户勾选):以所选目录的 git 仓库根为
     //     baseRepo 建会话级 worktree,后续所有 workingDir 相关落位(CC 转录转码
     //     目录 / codex cwd / session 行)一律指向 worktree 路径——与 New Maker
     //     草稿开 worktree 创建同语义。失败即中止导入;成功登记 journal,后续
@@ -517,18 +524,24 @@ export async function commitShareImport(
 
     // 2b. Codex rollout + state 落位
     let codexWritten: ImportSharedCodexThreadResult | null = null;
+    let codexStateExpected = false;
+    let codexFinalize: {
+      params: ImportSharedCodexThreadParams;
+      written: ImportSharedCodexThreadResult;
+    } | null = null;
     if (manifest.agentKind === 'codex' && activeSdkSessionId) {
       const stateEntry = zip.file('codex-state/thread.json');
       const stateRows = stateEntry
-        ? ((JSON.parse(await stateEntry.async('string'))) as {
+        ? (JSON.parse(await stateEntry.async('string')) as {
             threads: Array<Record<string, unknown>>;
             threadDynamicTools: Array<Record<string, unknown>>;
             threadSpawnEdges: Array<Record<string, unknown>>;
           })
         : { threads: [], threadDynamicTools: [], threadSpawnEdges: [] };
+      codexStateExpected = stateRows.threads.length > 0;
       const rolloutRef = bundledTranscripts[0] ?? null;
       const rolloutFile = rolloutRef ? zip.file(rolloutRef.path) : null;
-      codexWritten = await importSharedCodexThread({
+      const codexImportParams = {
         threadId: activeSdkSessionId,
         stateRows,
         rolloutBuffer: rolloutFile ? Buffer.from(await rolloutFile.async('nodebuffer')) : null,
@@ -536,16 +549,13 @@ export async function commitShareImport(
         newCwd: workingDir,
         title: manifest.title,
         updatedAt: now,
-      });
+      };
+      codexWritten = await importSharedCodexThread(codexImportParams);
       const written = codexWritten;
       journal.push(async () => {
         await removeSharedCodexThread(activeSdkSessionId, written);
       });
-      // 降档提示看 statePresent(state 行最终在不在),不能看 stateWritten——
-      // 删除后重导时行已存在、本次零插入,state 依然完好,不该提示。
-      if (!written.statePresent && stateRows.threads.length > 0) {
-        notes.push('codexStateSkipped');
-      }
+      codexFinalize = { params: codexImportParams, written };
     }
 
     // 3. DB 最后一步(tx 原子):message id 重新生成防撞库,content 过媒体重写
@@ -564,19 +574,65 @@ export async function commitShareImport(
       createdAt: m.createdAt,
       rewindAt: m.rewindAt,
     }));
-    await getDbClient().tx('session.importShare', {
-      session: buildSessionRow({
-        newId,
-        manifest,
-        snapshot: sessionSnapshot,
-        draftPrefs: opts.draftPrefs ?? null,
-        workingDir,
-        worktreePath,
-        activeSdkSessionId,
-        now,
-      }),
-      messages: dbMessages,
-    });
+    const commitImport = () =>
+      getDbClient().tx('session.importShare', {
+        session: buildSessionRow({
+          newId,
+          manifest,
+          snapshot: sessionSnapshot,
+          draftPrefs: opts.draftPrefs ?? null,
+          workingDir,
+          worktreePath,
+          activeSdkSessionId,
+          now,
+        }),
+        messages: dbMessages,
+        ...(conflictExisting
+          ? {
+              runtimeOwnerId: getSessionRuntimeOwnerPrefix(),
+              overwriteExisting: {
+                sessionId: conflictExisting.id,
+                expectedStatus: conflictExisting.status,
+              },
+            }
+          : {}),
+      });
+    const importResult = conflictExisting
+      ? await commitAndFinalizeSessionDeletion(conflictExisting.id, async () => {
+          const result = await commitImport();
+          // commitAndFinalizeSessionDeletion runs the old-session finalizer after
+          // this callback returns. Mark the new import durable at that boundary;
+          // a later finalizer failure must not roll back files owned by it.
+          dbCommitted = true;
+          return { value: result, deleted: result.replacedSession };
+        })
+      : await commitImport();
+    if (!conflictExisting) dbCommitted = true;
+
+    if (codexFinalize) {
+      try {
+        codexWritten = await finalizeSharedCodexThreadImport(
+          codexFinalize.params,
+          codexFinalize.written,
+        );
+      } catch (err) {
+        // Cindy DB is already committed. Final pointer/index publication is
+        // best-effort and must never route into the pre-commit rollback journal:
+        // that would delete rollout/media/worktree state still owned by the new
+        // durable session, while the DB transaction cannot be undone here.
+        log.warn('share import Codex post-commit finalize failed; preserving staged state', {
+          newId,
+          threadId: codexFinalize.params.threadId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    // stateWritten 只表示本次是否 INSERT,不能代表可续聊指针是否落位:
+    // 删除后重导时既有 row 不会重插,而覆盖导入的 finalize 仍可能更新失败。
+    if (codexWritten && codexStateExpected) {
+      if (!codexWritten.statePresent) notes.push('codexStateSkipped');
+      else if (!codexWritten.stateFinalized) notes.push('codexStateFinalizeFailed');
+    }
 
     // ── 最终保真度 ──
     const fidelity = resolveFinalFidelity({
@@ -597,14 +653,42 @@ export async function commitShareImport(
     drafts.delete(opts.draftId);
     return { sessionId: newId, fidelity, notes };
   } catch (err) {
-    await rollback();
+    if (!dbCommitted) {
+      await rollback();
+    } else {
+      log.warn('share import failed after DB commit; preserving committed external state', {
+        newId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
     const code = (err as { code?: unknown }).code;
     if (typeof code === 'string' && code !== 'ALREADY_EXISTS') throw err;
-    throw codedError(
-      'SHARE_IMPORT_FAILED',
-      err instanceof Error ? err.message : String(err),
+    throw codedError('SHARE_IMPORT_FAILED', err instanceof Error ? err.message : String(err));
+  }
+  };
+
+  if (manifest.agentKind === 'codex' && activeSdkSessionId) {
+    const lockDir = path.join(app.getPath('userData'), 'session-share-import-locks');
+    await fsp.mkdir(lockDir, { recursive: true });
+    const lockPath = path.join(
+      lockDir,
+      `${createHash('sha256').update(activeSdkSessionId).digest('hex')}.lock`,
+    );
+    return withCrossProcessLock(
+      lockPath,
+      { label: 'session-share-codex-thread', waitMs: 60_000 },
+      async (status) => {
+        if (!status.held) {
+          throw codedError(
+            'PRECONDITION_FAILED',
+            `Codex thread import is busy: ${activeSdkSessionId}`,
+          );
+        }
+        return runImport();
+      },
     );
   }
+  return runImport();
 }
 
 // ---------------------------------------------------------------------------
@@ -616,7 +700,8 @@ async function readJsonEntry(zip: JSZip, entryPath: string): Promise<Record<stri
   if (!file) throw codedError('SHARE_FILE_INVALID', `${entryPath} missing`);
   try {
     const parsed = JSON.parse(await file.async('string')) as unknown;
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not object');
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
+      throw new Error('not object');
     return parsed as Record<string, unknown>;
   } catch {
     throw codedError('SHARE_FILE_INVALID', `${entryPath} is not valid JSON`);
@@ -739,7 +824,9 @@ async function restoreMediaEntry(params: {
   // 的扩展名反查;白名单外/账本不可用返回 null 由调用方走各自回落路径。
   // 白名单即 blobStore 全集(含 .glb 模型)——比"图/音/视频"口径略宽是有意的:
   // xdt-file 直读协议本就放行 .glb,入仓只是换了字节的住处。
-  const ingestLegacyMedia = async (ext: string): Promise<{ url: string; absPath: string } | null> => {
+  const ingestLegacyMedia = async (
+    ext: string,
+  ): Promise<{ url: string; absPath: string } | null> => {
     const mimeType = mimeForExt(ext.toLowerCase());
     if (!mimeType) return null;
     try {
@@ -861,7 +948,14 @@ async function writeIfMissing(
 }
 
 const EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
-const PERMISSION_MODES = new Set(['ask', 'default', 'acceptEdits', 'plan', 'auto', 'bypassPermissions']);
+const PERMISSION_MODES = new Set([
+  'ask',
+  'default',
+  'acceptEdits',
+  'plan',
+  'auto',
+  'bypassPermissions',
+]);
 
 /** draftPrefs 缺省(旧调用方 / 测试)时按 agentKind 兜底的模型。 */
 const FALLBACK_MODEL_BY_AGENT: Record<'cc' | 'codex' | 'pi', string> = {
@@ -917,10 +1011,17 @@ function buildSessionRow(params: {
   createdAt: number;
   updatedAt: number;
 } {
-  const { newId, manifest, snapshot, draftPrefs, workingDir, worktreePath, activeSdkSessionId, now } =
-    params;
-  const str = (v: unknown, fallback: string): string =>
-    typeof v === 'string' && v ? v : fallback;
+  const {
+    newId,
+    manifest,
+    snapshot,
+    draftPrefs,
+    workingDir,
+    worktreePath,
+    activeSdkSessionId,
+    now,
+  } = params;
+  const str = (v: unknown, fallback: string): string => (typeof v === 'string' && v ? v : fallback);
   const num = (v: unknown, fallback: number): number =>
     typeof v === 'number' && Number.isFinite(v) ? v : fallback;
   const effort = str(draftPrefs?.effort, 'high');
@@ -973,6 +1074,7 @@ function resolveFinalFidelity(params: {
   const { manifest, transcriptsWritten, bundledCount, codexWritten } = params;
   if (manifest.agentKind === 'codex') {
     if (!codexWritten?.rolloutPath) return 'db-only';
+    if (!codexWritten.stateFinalized) return 'partial';
     return manifest.exportFidelity === 'full' ? 'full' : manifest.exportFidelity;
   }
   if (bundledCount === 0 || transcriptsWritten === 0) return 'db-only';

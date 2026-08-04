@@ -144,10 +144,9 @@ describe('rewind draft attachment wiring', () => {
     expect(clearBlock).not.toMatch(/cleanupCachedImages/);
   });
 
-  it('deleting a session cleans that session image cache, while archive keeps history images', () => {
+  it('leaves permanent session resource cleanup to the Main lifecycle', () => {
     expect(lifecycleSrc).toMatch(/if \(action === 'delete'\) \{/);
-    expect(lifecycleSrc).toMatch(/cleanupSessionImages\(sessionId\)/);
-    expect(lifecycleSrc).not.toMatch(/action === 'archive'[\s\S]{0,120}cleanupSessionImages/);
+    expect(lifecycleSrc).not.toMatch(/cleanupSessionImages/);
   });
 });
 

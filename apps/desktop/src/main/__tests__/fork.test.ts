@@ -27,10 +27,17 @@ const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9
 // (确认 fork 把对的 sourceSdkSessionId / upToMessageId / title / workingDir 传下去)
 // 和返回值 (uuidMap 决定 messages.agentMeta remap 结果)。
 const forkSdkSessionMock = vi.fn();
+const commitMessageMediaRefsMock = vi.fn();
 vi.mock('../maker-host/index.js', () => ({
   getMaker: () => ({
     forkSdkSession: forkSdkSessionMock,
   }),
+}));
+vi.mock('../cindy-media/chatAttachments.js', () => ({
+  commitMessageMediaRefs: commitMessageMediaRefsMock,
+}));
+vi.mock('../logger.js', () => ({
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
 }));
 
 // fake drizzle: select 链返回 thenable。写入侧 MR2.2 后走 DbClient.tx。
@@ -93,6 +100,8 @@ beforeEach(async () => {
   queryMock.mockReset();
   queryMock.mockResolvedValue([]);
   forkSdkSessionMock.mockReset();
+  commitMessageMediaRefsMock.mockReset();
+  commitMessageMediaRefsMock.mockResolvedValue({ committed: 1, skipped: 0, failed: 0 });
   // 默认空 uuidMap 让 agentMeta 字段被去掉 (无映射)。具体测试按需 override。
   forkSdkSessionMock.mockResolvedValue({
     newSdkSessionId: 'sdk-new-session-uuid',
@@ -199,7 +208,12 @@ describe('forkSessionAtMessage', () => {
     const priorUser = makeMessageRow({
       id: 'user-1',
       role: 'user',
-      content: '"hi"',
+      content: JSON.stringify({
+        text: 'hi',
+        images: [
+          'cindy-media://blobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png',
+        ],
+      }),
       createdAt: 2000,
     });
 
@@ -265,6 +279,11 @@ describe('forkSessionAtMessage', () => {
     expect(txArgs.newMessageIds).toHaveLength(2);
     expect(txArgs.newMessageIds[0].id).not.toBe('user-1');
     expect(txArgs.newMessageIds[0].clientId).not.toBe('client-id');
+    expect(commitMessageMediaRefsMock).toHaveBeenCalledWith({
+      sessionId: sv.id,
+      role: 'user',
+      content: priorUser.content,
+    });
 
     expect(result.title).toBe('[Fork] Project A');
     expect(result.parentSessionId).toBe('src-session');
@@ -382,7 +401,16 @@ describe('forkSessionAtMessage', () => {
       model: 'gpt-5.5',
       sdkSessionId: 'codex-thread-source',
     });
-    const first = makeMessageRow({ id: 'user-1', role: 'user', createdAt: 1000 });
+    const first = makeMessageRow({
+      id: 'user-1',
+      role: 'user',
+      content: JSON.stringify({
+        images: [
+          'cindy-media://blobs/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.webp',
+        ],
+      }),
+      createdAt: 1000,
+    });
     const second = makeMessageRow({ id: 'asst-1', role: 'assistant', createdAt: 2000 });
 
     selectQueue.push([source]); // source session
@@ -424,6 +452,11 @@ describe('forkSessionAtMessage', () => {
     expect(txArgs.newSession.forkedAtMessageId).toBeNull();
     expect(txArgs.newSession.providerId).toBe('xd');
     expect(txArgs.newMessageIds).toHaveLength(2);
+    expect(commitMessageMediaRefsMock).toHaveBeenCalledWith({
+      sessionId: txArgs.newSession.id,
+      role: 'user',
+      content: first.content,
+    });
     expect(result.parentSessionId).toBe('src-session');
   });
 

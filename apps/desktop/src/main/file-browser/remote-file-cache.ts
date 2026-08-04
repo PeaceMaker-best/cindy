@@ -74,63 +74,7 @@ export function getChatAttachmentCacheRoot(): string {
   return chatAttachmentCacheDir();
 }
 
-function isInsideChatAttachmentCache(p: string): boolean {
-  return path.resolve(p).startsWith(`${chatAttachmentCacheDir()}${path.sep}`);
-}
-
-/**
- * Extract persisted file paths from a user-message content JSON document.
- * This is deliberately format-tolerant: malformed/legacy content contributes
- * no paths, and the actual deletion function still applies its cache-root and
- * `.bin` guards before touching anything on disk.
- */
-export function extractChatAttachmentPathsFromPersistedContent(content: string): string[] {
-  try {
-    const parsed = JSON.parse(content) as { files?: unknown };
-    if (!Array.isArray(parsed.files)) return [];
-    return parsed.files.flatMap((entry) => {
-      if (!entry || typeof entry !== 'object') return [];
-      const candidate = (entry as { path?: unknown }).path;
-      return typeof candidate === 'string' ? [candidate] : [];
-    });
-  } catch {
-    return [];
-  }
-}
-
-/** Remove one staged attachment if it is a safe, controlled cache file. */
-export async function removeStagedChatAttachment(filePath: string): Promise<boolean> {
-  if (
-    typeof filePath !== 'string' ||
-    !path.isAbsolute(filePath) ||
-    !isInsideChatAttachmentCache(filePath) ||
-    path.extname(filePath).toLowerCase() !== '.bin'
-  ) {
-    return false;
-  }
-  try {
-    const stat = await fs.lstat(filePath);
-    if (!stat.isFile() && !stat.isSymbolicLink()) return false;
-    await fs.unlink(filePath);
-    return true;
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException | null)?.code;
-    if (code !== 'ENOENT') {
-      log.warn('staged chat attachment cleanup failed', {
-        filePath,
-        error: String(err),
-      });
-    }
-    return false;
-  }
-}
-
-/** Best-effort batch cleanup used by draft/message/session lifecycle hooks. */
-export async function cleanupStagedChatAttachments(
-  filePaths: readonly string[],
-): Promise<void> {
-  await Promise.all(filePaths.map((filePath) => removeStagedChatAttachment(filePath)));
-}
+type ChatAttachmentRemovalGuard = () => boolean | Promise<boolean>;
 
 function normalizePathForComparison(filePath: string): string {
   const resolved = path.resolve(filePath);
@@ -149,24 +93,39 @@ export async function cleanupOwnedUnpersistedStagedChatAttachments(params: {
   protectedPaths: readonly string[];
   canRemove?: () => boolean;
 }): Promise<void> {
-  const ownerDir = normalizePathForComparison(chatAttachmentOwnerCacheDir(params.ownerId));
   const protectedPaths = new Set(params.protectedPaths.map(normalizePathForComparison));
-  await Promise.all(
+  await removeOwnedStagedChatAttachments({
+    ownerId: params.ownerId,
+    filePaths: params.filePaths.filter(
+      (filePath) => !protectedPaths.has(normalizePathForComparison(filePath)),
+    ),
+    canRemove: params.canRemove,
+  });
+}
+
+/** Remove validated direct-child staged files for one data owner. */
+export async function removeOwnedStagedChatAttachments(params: {
+  ownerId: string;
+  filePaths: readonly string[];
+  canRemove?: ChatAttachmentRemovalGuard;
+}): Promise<number> {
+  const ownerDir = normalizePathForComparison(chatAttachmentOwnerCacheDir(params.ownerId));
+  const results = await Promise.all(
     params.filePaths.map(async (filePath) => {
       if (
         typeof filePath !== 'string' ||
         !path.isAbsolute(filePath) ||
         path.extname(filePath).toLowerCase() !== '.bin' ||
-        normalizePathForComparison(path.dirname(filePath)) !== ownerDir ||
-        protectedPaths.has(normalizePathForComparison(filePath))
+        normalizePathForComparison(path.dirname(filePath)) !== ownerDir
       ) {
-        return;
+        return false;
       }
       try {
         const stat = await fs.lstat(filePath);
-        if (!stat.isFile() && !stat.isSymbolicLink()) return;
-        if (params.canRemove && !params.canRemove()) return;
+        if (!stat.isFile() && !stat.isSymbolicLink()) return false;
+        if (params.canRemove && !(await params.canRemove())) return false;
         await fs.unlink(filePath);
+        return true;
       } catch (err) {
         const code = (err as NodeJS.ErrnoException | null)?.code;
         if (code !== 'ENOENT') {
@@ -175,9 +134,11 @@ export async function cleanupOwnedUnpersistedStagedChatAttachments(params: {
             error: String(err),
           });
         }
+        return false;
       }
     }),
   );
+  return results.filter(Boolean).length;
 }
 
 export interface StartupStagedChatAttachmentSweepResult {

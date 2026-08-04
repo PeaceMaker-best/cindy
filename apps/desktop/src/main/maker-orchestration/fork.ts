@@ -18,6 +18,8 @@ import { sessions, messages } from '../localDb/schema';
 import { sessionToCamel } from '../localDb/mapper';
 import { getMaker } from '../maker-host/index.js';
 import { createBusinessSessionId } from '../sessionIds.js';
+import { commitMessageMediaRefs } from '../cindy-media/chatAttachments.js';
+import { createLogger } from '../logger.js';
 import { dbToMakerAgentKind, normalizeDbAgentKind } from '../../shared/agentKindConversion.js';
 import type { Session } from '../../renderer/lib/ccAgent.types';
 import {
@@ -26,6 +28,8 @@ import {
   parseClaudeAgentMeta,
   resolveClaudeForkAssistantAnchor,
 } from './claudeTranscriptAnchors';
+
+const log = createLogger('maker-orchestration/fork');
 
 /** fork 内部错误码——由 IPC 层 catch 后映射到对应 IPC 错误码。 */
 export type ForkErrorCode =
@@ -86,6 +90,42 @@ interface ForkTimelineMessage {
   agentKind: string | null;
   createdAt: number;
   rowid: number;
+}
+
+/**
+ * Fork copies message bodies in SQLite, but cindy-media ownership lives in a
+ * separate ledger. Recreate those refs for the child so deleting the parent
+ * cannot leave the copied blob URLs dangling. The fork transaction has already
+ * committed at this point, so ledger failures are logged and never turn a
+ * successfully created child session into a user-visible fork failure.
+ */
+async function commitForkedMessageMediaRefs(
+  newSessionId: string,
+  sourceMessages: readonly { id: string; role: string; content: string }[],
+): Promise<void> {
+  for (const message of sourceMessages) {
+    if (!message.content.includes('cindy-media://blobs/')) continue;
+    try {
+      const result = await commitMessageMediaRefs({
+        sessionId: newSessionId,
+        role: message.role,
+        content: message.content,
+      });
+      if (result && result.failed > 0) {
+        log.warn('forked message media refs partially failed', {
+          newSessionId,
+          sourceMessageId: message.id,
+          failed: result.failed,
+        });
+      }
+    } catch (err) {
+      log.warn('forked message media ref commit failed', {
+        newSessionId,
+        sourceMessageId: message.id,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 }
 
 interface ParsedAgentSwitchBoundary {
@@ -645,6 +685,8 @@ export async function forkSessionAtMessage(
     newMessageIds,
   });
 
+  await commitForkedMessageMediaRefs(newSessionId, sourceMessages);
+
   // 6. 返回 mapper 转过的新 session（含 messageCount）
   const [row] = await db.select().from(sessions).where(eq(sessions.id, newSessionId));
   if (!row) {
@@ -754,6 +796,8 @@ export async function forkSessionStripEncrypted(sourceSessionId: string): Promis
     uuidMap: Array.from(uuidMap.entries()),
     newMessageIds,
   });
+
+  await commitForkedMessageMediaRefs(newSessionId, sourceMessages);
 
   const [row] = await db.select().from(sessions).where(eq(sessions.id, newSessionId));
   if (!row) {

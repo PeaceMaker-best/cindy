@@ -63,6 +63,9 @@ import {
 } from './session-storage.js';
 import { desktopMakerLogger } from './logger-adapter.js';
 import { resolveSessionCcDebugFile } from '../logger.js';
+import {
+  acquireSessionRuntimeOwnership,
+} from '../sessionRuntimeOwnership.js';
 import { resetProviderModelAutoRefreshCooldowns } from './provider-model-auto-refresh.js';
 import { createSshDaemonTransport } from './codex-remote-transport.js';
 import { getRemoteSshPool } from '../remote-ssh/index.js';
@@ -1398,6 +1401,7 @@ export function getMaker(): Maker {
             await codexAgent.listAgentSkills({ workingDir, forceReload: true });
           }
         },
+        acquireRuntimeOwnership: (sessionId) => acquireSessionRuntimeOwnership(sessionId),
         onStartSucceeded: (sessionId, opts) => {
           const createOpts = opts as MakerSessionCreateOpts;
           markOrcaMcpHydratedIfNeeded(sessionId, createOpts);

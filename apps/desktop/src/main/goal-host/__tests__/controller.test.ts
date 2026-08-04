@@ -1871,6 +1871,81 @@ describe('GoalController', () => {
     expect(h.session.sends.at(-1)?.content).toContain('keep going');
   });
 
+  it('resumeOnOpen does not hydrate, attach, emit, or send when deletion wins admission', async () => {
+    const ensureSession = vi.fn(async () => new FakeSession('s1'));
+    const acquirePendingAgentSwitch = vi.fn(async () => () => {});
+    const emitStatus = vi.fn();
+    const local = makeController({
+      ensureSession,
+      acquirePendingAgentSwitch,
+      emitStatus,
+      withActiveSessionLifecycle: vi.fn(async () => ({ admitted: false as const })),
+    });
+    await local.storage.set(seededGoal({ status: 'active', objective: 'must stay deleted' }));
+
+    await local.controller.resumeOnOpen('s1');
+
+    expect(acquirePendingAgentSwitch).not.toHaveBeenCalled();
+    expect(ensureSession).not.toHaveBeenCalled();
+    expect(emitStatus).not.toHaveBeenCalled();
+    expect(local.session.sends).toHaveLength(0);
+  });
+
+  it('fireTurn keeps lifecycle admission through ensure, baseline handoff, and send settlement', async () => {
+    const order: string[] = [];
+    let resolveSend!: (result: SessionSendResult) => void;
+    const sendGate = new Promise<SessionSendResult>((resolve) => {
+      resolveSend = resolve;
+    });
+    const local = makeController({
+      withActiveSessionLifecycle: vi.fn(async (_sessionId, run) => {
+        order.push('lifecycle-acquired');
+        const value = await run();
+        order.push('lifecycle-released');
+        return { admitted: true as const, value };
+      }),
+      ensureSession: async () => {
+        order.push('ensure-session');
+        return local.session;
+      },
+      acquirePendingAgentSwitch: async () => {
+        order.push('route-acquired');
+        return () => order.push('route-released');
+      },
+      beforeDispatchUserTurn: async () => {
+        order.push('baseline-started');
+      },
+    });
+    await startGoal(local);
+    order.length = 0;
+    vi.spyOn(local.session, 'send').mockImplementationOnce(async () => {
+      order.push('send-start');
+      const result = await sendGate;
+      order.push('send-settled');
+      return result;
+    });
+
+    const firePromise = (
+      local.controller as unknown as { fireTurn(sessionId: string): Promise<void> }
+    ).fireTurn('s1');
+    await vi.waitFor(() => expect(order).toContain('send-start'));
+    expect(order).not.toContain('lifecycle-released');
+
+    resolveSend({ accepted: true });
+    await firePromise;
+
+    expect(order).toEqual([
+      'lifecycle-acquired',
+      'route-acquired',
+      'ensure-session',
+      'baseline-started',
+      'send-start',
+      'send-settled',
+      'route-released',
+      'lifecycle-released',
+    ]);
+  });
+
   it('does not let a stale startup active snapshot overwrite a concurrent Stop', async () => {
     const active = seededGoal({ status: 'active', objective: 'stay stopped' });
     await h.storage.set(active);

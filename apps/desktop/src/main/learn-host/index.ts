@@ -34,6 +34,7 @@ import { visibleMessageTextForConversationSearch } from '../localDb/conversation
 import { searchChatHistoryHybrid } from '../localDb/chatHistorySearch';
 import { backfillSessionMeta } from '../scheduler-host/runners/_shared';
 import { defaultModelFor } from '../scheduler-host/model-defaults';
+import { acquireSessionLifecycleLease } from '../sessionLifecycleLock.js';
 import { computeTwoDirDiff } from '../skillhub/snapshot';
 import type { LearnEventPayload } from '../../shared/learnTypes';
 import { LearnController, type LearnSessionLike } from './controller';
@@ -299,6 +300,12 @@ export function startLearnHost(deps: StartLearnHostDeps): LearnController {
           // best-effort UI refresh,失败不影响业务
         }
       }
+    },
+    acquireSessionLifecycleLease: async (sessionId) => {
+      const lease = await acquireSessionLifecycleLease(sessionId);
+      return lease.acquired
+        ? { acquired: true, release: lease.release }
+        : { acquired: false };
     },
     ...(deps.fetchHubSkill ? { fetchHubSkill: deps.fetchHubSkill } : {}),
     logger,

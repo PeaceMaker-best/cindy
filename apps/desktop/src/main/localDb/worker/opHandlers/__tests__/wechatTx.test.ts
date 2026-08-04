@@ -618,6 +618,112 @@ describe('WeChat reliable worker transactions', () => {
     expect(count(db, 'media_refs')).toBe(0);
   });
 
+  it('owns outbound media until its outbox row reaches a terminal state', () => {
+    const db = createDb();
+    activate(db, 'epoch-1', null);
+    insertBlob(db);
+    commitBatch(db, {
+      messages: [message('task-1', 'platform-1', 'session-1')],
+    });
+    lease(db, 'epoch-1', 200);
+    runTx(db, 'wechatMarkAccepted', {
+      bindingEpoch: 'epoch-1',
+      taskId: 'task-1',
+    });
+    runTx(db, 'wechatCommitTerminal', {
+      bindingEpoch: 'epoch-1',
+      taskId: 'task-1',
+      now: 300,
+      outbox: [
+        outbox('outbox-1', 'client-1', 0, '', [outboxMedia('media-client-1', '报告.png')]),
+        outbox('outbox-2', 'client-2', 1, '', [outboxMedia('media-client-2', '附件.png')]),
+      ],
+    });
+
+    expect(
+      db.prepare(
+        `SELECT ref_kind AS refKind, ref_id AS refId, origin_session_id AS originSessionId
+         FROM media_refs ORDER BY ref_id`,
+      ).all(),
+    ).toEqual([
+      { refKind: 'wechat-outbox', refId: 'outbox-1', originSessionId: null },
+      { refKind: 'wechat-outbox', refId: 'outbox-2', originSessionId: null },
+    ]);
+
+    expect(runTx(db, 'wechatMarkOutboxDelivered', {
+      bindingEpoch: 'epoch-1',
+      outboxId: 'outbox-1',
+      deliveredAt: 301,
+    })).toMatchObject({ changed: true, taskCompleted: false });
+    expect(
+      db.prepare("SELECT ref_id FROM media_refs WHERE ref_kind = 'wechat-outbox'").pluck().all(),
+    ).toEqual(['outbox-2']);
+    // Replayed delivery acknowledgements cannot release another row's media.
+    expect(runTx(db, 'wechatMarkOutboxDelivered', {
+      bindingEpoch: 'epoch-1',
+      outboxId: 'outbox-1',
+      deliveredAt: 302,
+    })).toMatchObject({ changed: false, taskCompleted: false });
+    expect(count(db, 'media_refs')).toBe(1);
+
+    db.prepare("UPDATE wechat_outbox SET status = 'sending' WHERE id = 'outbox-2'").run();
+    expect(runTx(db, 'wechatRecordOutboxFailure', {
+      bindingEpoch: 'epoch-1',
+      outboxId: 'outbox-2',
+      nextRetryAt: 400,
+      terminal: false,
+      errorCode: 'NETWORK_TIMEOUT',
+    })).toMatchObject({ changed: true, taskFailed: false });
+    expect(count(db, 'media_refs')).toBe(1);
+
+    db.prepare("UPDATE wechat_outbox SET status = 'sending' WHERE id = 'outbox-2'").run();
+    expect(runTx(db, 'wechatRecordOutboxFailure', {
+      bindingEpoch: 'epoch-1',
+      outboxId: 'outbox-2',
+      nextRetryAt: 500,
+      terminal: true,
+      errorCode: 'ENOENT',
+    })).toMatchObject({ changed: true, taskFailed: true });
+    expect(count(db, 'media_refs')).toBe(0);
+  });
+
+  it('keeps pending outbox media across stop recovery and releases it on binding close', () => {
+    const db = createDb();
+    activate(db, 'epoch-1', null);
+    insertBlob(db);
+    commitBatch(db, {
+      messages: [message('task-1', 'platform-1', 'session-1')],
+    });
+    lease(db, 'epoch-1', 200);
+    runTx(db, 'wechatMarkAccepted', {
+      bindingEpoch: 'epoch-1',
+      taskId: 'task-1',
+    });
+    runTx(db, 'wechatCommitTerminal', {
+      bindingEpoch: 'epoch-1',
+      taskId: 'task-1',
+      now: 300,
+      outbox: [outbox('outbox-1', 'client-1', 0, '', [outboxMedia('media-client-1', 'a.png')])],
+    });
+    db.prepare("UPDATE wechat_outbox SET status = 'sending' WHERE id = 'outbox-1'").run();
+
+    runTx(db, 'wechatStopAll', {
+      bindingEpoch: 'epoch-1',
+      now: 350,
+      errorCode: 'PROCESS_RESTARTED',
+    });
+    expect(db.prepare("SELECT status FROM wechat_outbox WHERE id = 'outbox-1'").pluck().get()).toBe(
+      'pending',
+    );
+    expect(count(db, 'media_refs')).toBe(1);
+
+    expect(runTx(db, 'wechatCloseBindingEpoch', {
+      bindingEpoch: 'epoch-1',
+      now: 400,
+    })).toEqual({ closed: true });
+    expect(count(db, 'media_refs')).toBe(0);
+  });
+
   it('rolls back terminal outbox on a chunk conflict and repairs impossible delivery state', () => {
     const db = createDb();
     activate(db, 'epoch-1', null);
@@ -827,8 +933,31 @@ function lease(db: Database.Database, bindingEpoch: string, now: number) {
   });
 }
 
-function outbox(id: string, clientId: string, chunkIndex: number, text: string) {
-  return { id, clientId, kind: 'final', chunkIndex, text };
+function outbox(
+  id: string,
+  clientId: string,
+  chunkIndex: number,
+  text: string,
+  media?: Array<ReturnType<typeof outboxMedia>>,
+) {
+  return { id, clientId, kind: 'final', chunkIndex, text, ...(media ? { media } : {}) };
+}
+
+function outboxMedia(clientId: string, fileName: string) {
+  return {
+    hash: HASH,
+    absPath: `/cindy-media/${HASH}.png`,
+    fileName,
+    clientId,
+  };
+}
+
+function insertBlob(db: Database.Database): void {
+  db.prepare(
+    `INSERT INTO media_blobs
+      (hash, ext, mime_type, bytes, is_cache, created_at, last_access_at)
+     VALUES (?, '.png', 'image/png', 4, 0, 100, 100)`,
+  ).run(HASH);
 }
 
 function runTx(db: Database.Database, name: string, args: Record<string, unknown>): unknown {

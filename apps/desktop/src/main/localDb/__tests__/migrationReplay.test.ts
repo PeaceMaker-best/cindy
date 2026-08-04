@@ -111,6 +111,7 @@ describeMigrationReplay('migration replay', () => {
              AND name IN (
                'uniq_active_team_per_lead',
                'uniq_orca_workers_focused_per_team',
+               'uniq_sessions_live_im_logical',
                'uniq_wechat_inbox_running_session',
                'uniq_wechat_sync_active'
              )
@@ -127,6 +128,7 @@ describeMigrationReplay('migration replay', () => {
       expect(partialIndexes).toEqual([
         'uniq_active_team_per_lead',
         'uniq_orca_workers_focused_per_team',
+        'uniq_sessions_live_im_logical',
         'uniq_wechat_inbox_running_session',
         'uniq_wechat_sync_active',
       ]);
@@ -134,7 +136,57 @@ describeMigrationReplay('migration replay', () => {
       expect(tableExists(db, 'wechat_inbox')).toBe(true);
       expect(tableExists(db, 'wechat_outbox')).toBe(true);
       expect(tableExists(db, 'wechat_file_attachments')).toBe(true);
+      expect(columnNames(db, 'sessions')).toEqual(
+        expect.arrayContaining(['im_logical_session_id', 'im_generation']),
+      );
     } finally {
+      cleanup();
+    }
+  });
+
+  it('backfills X sessions into the shared IM logical lifecycle', () => {
+    const { db, cleanup } = createTempDb();
+    const stagedDir = mkdtempSync(path.join(tmpdir(), 'xdmaker-drizzle-pre0086-'));
+    try {
+      for (const migration of listMigrations(drizzleDir())) {
+        if (migration.seq >= 86) continue;
+        copyFileSync(migration.sqlPath, path.join(stagedDir, migration.fileName));
+        if (migration.tsScriptPath) {
+          mkdirSync(path.join(stagedDir, 'scripts'), { recursive: true });
+          copyFileSync(
+            migration.tsScriptPath,
+            path.join(stagedDir, 'scripts', path.basename(migration.tsScriptPath)),
+          );
+        }
+      }
+      runMigrationReplay(db, { drizzleDir: stagedDir });
+      const now = Date.now();
+      const insert = db.prepare(
+        `INSERT INTO sessions (id, source, created_at, updated_at)
+         VALUES (?, ?, ?, ?)`,
+      );
+      insert.run('legacy-x', 'x', now, now);
+      insert.run('legacy-feishu', 'feishu', now, now);
+      insert.run('desktop-session', 'desktop', now, now);
+
+      runMigrationReplay(db, { drizzleDir: drizzleDir() });
+
+      expect(
+        db
+          .prepare(
+            `SELECT id, im_logical_session_id
+             FROM sessions
+             WHERE id IN ('legacy-x', 'legacy-feishu', 'desktop-session')
+             ORDER BY id`,
+          )
+          .all(),
+      ).toEqual([
+        { id: 'desktop-session', im_logical_session_id: null },
+        { id: 'legacy-feishu', im_logical_session_id: 'legacy-feishu' },
+        { id: 'legacy-x', im_logical_session_id: 'legacy-x' },
+      ]);
+    } finally {
+      rmSync(stagedDir, { recursive: true, force: true });
       cleanup();
     }
   });
@@ -208,9 +260,7 @@ describeMigrationReplay('migration replay', () => {
       expect(result.applied.map((migration) => migration.seq)).toContain(60);
       expect(columnNames(db, 'sessions')).toContain('plan_mode_enabled');
       const rows = db
-        .prepare(
-          `SELECT id, permission_mode, plan_mode_enabled FROM sessions ORDER BY id`,
-        )
+        .prepare(`SELECT id, permission_mode, plan_mode_enabled FROM sessions ORDER BY id`)
         .all();
       expect(rows).toEqual([
         { id: 'legacy-plan-session', permission_mode: 'ask', plan_mode_enabled: 1 },
@@ -227,9 +277,7 @@ describeMigrationReplay('migration replay', () => {
         .map((migration) => migration.seq);
       expect(replayResult.applied.map((migration) => migration.seq)).toEqual(expectedReplaySeqs);
       const replayRows = db
-        .prepare(
-          `SELECT id, permission_mode, plan_mode_enabled FROM sessions ORDER BY id`,
-        )
+        .prepare(`SELECT id, permission_mode, plan_mode_enabled FROM sessions ORDER BY id`)
         .all();
       expect(replayRows).toEqual(rows);
     } finally {
@@ -274,7 +322,9 @@ describeMigrationReplay('migration replay', () => {
       });
 
       expect(result.applied.map((migration) => migration.seq)).toEqual(
-        listMigrations(drizzleDir()).filter((migration) => migration.seq > 73).map((migration) => migration.seq),
+        listMigrations(drizzleDir())
+          .filter((migration) => migration.seq > 73)
+          .map((migration) => migration.seq),
       );
       expect(
         db
@@ -342,11 +392,16 @@ describeMigrationReplay('migration replay', () => {
       runMigrationReplay(db, { drizzleDir: stagedDir });
       const now = Date.now();
       for (const id of ['lead', 'worker-1', 'worker-2', 'worker-3', 'worker-4']) {
-        db.prepare('INSERT INTO sessions (id, created_at, updated_at) VALUES (?, ?, ?)').run(id, now, now);
+        db.prepare('INSERT INTO sessions (id, created_at, updated_at) VALUES (?, ?, ?)').run(
+          id,
+          now,
+          now,
+        );
       }
-      db.prepare(`INSERT INTO orca_teams
-        (id, lead_session_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`)
-        .run('team-1', 'lead', 'active', now, now);
+      db.prepare(
+        `INSERT INTO orca_teams
+        (id, lead_session_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
+      ).run('team-1', 'lead', 'active', now, now);
       const insertWorker = db.prepare(`INSERT INTO orca_workers
         (id, team_id, session_id, status, label, role, focused, created_at, updated_at)
         VALUES (?, 'team-1', ?, 'idle', ?, 'tester', 0, ?, ?)`);
@@ -356,11 +411,9 @@ describeMigrationReplay('migration replay', () => {
 
       runMigrationReplay(db, { drizzleDir: drizzleDir() });
 
-      expect(db.prepare('SELECT label FROM orca_workers ORDER BY created_at').pluck().all()).toEqual([
-        'tester',
-        'tester-3',
-        'tester-2',
-      ]);
+      expect(
+        db.prepare('SELECT label FROM orca_workers ORDER BY created_at').pluck().all(),
+      ).toEqual(['tester', 'tester-3', 'tester-2']);
       expect(tableExists(db, 'orca_worker_creation_reservations')).toBe(true);
       expect(indexExists(db, 'uniq_orca_workers_team_label')).toBe(true);
       expect(() => insertWorker.run('worker-row-4', 'worker-4', 'TESTER', 4, 4)).toThrow();

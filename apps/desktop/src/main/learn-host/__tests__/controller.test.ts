@@ -217,6 +217,92 @@ const goodScan = (dirName = 'my-skill'): ScanStagingResult => ({
 });
 
 describe('LearnController 状态机', () => {
+  it('does not create, backfill, persist, or send when lifecycle admission rejects the new distill session', async () => {
+    const createSession = vi.fn(async () => new FakeSession());
+    const backfillSessionMeta = vi.fn(async () => {});
+    const persistUserMessage = vi.fn(async () => {});
+    const acquireSessionLifecycleLease = vi.fn(async () => ({ acquired: false as const }));
+    const h = makeHarness({
+      createSession,
+      backfillSessionMeta,
+      persistUserMessage,
+      acquireSessionLifecycleLease,
+    });
+
+    const { runId } = await h.controller.startLearn({ input: 'too late', sourceKind: 'freetext' });
+    const run = await h.waitForStatus(runId, 'failed');
+
+    expect(run.error).toContain('lifecycle admission failed');
+    expect(acquireSessionLifecycleLease).toHaveBeenCalledTimes(1);
+    expect(createSession).not.toHaveBeenCalled();
+    expect(backfillSessionMeta).not.toHaveBeenCalled();
+    expect(persistUserMessage).not.toHaveBeenCalled();
+    expect(h.session.sent).toHaveLength(0);
+  });
+
+  it('holds lifecycle admission through create, backfill, distilling persistence, and send acceptance', async () => {
+    const order: string[] = [];
+    let settleSend!: (result: LearnSessionSendResult) => void;
+    const sendGate = new Promise<LearnSessionSendResult>((resolve) => {
+      settleSend = resolve;
+    });
+    const session = new FakeSession();
+    vi.spyOn(session, 'send').mockImplementationOnce(async (_message, opts) => {
+      order.push('send-start');
+      await opts?.onAccepted?.();
+      order.push('accepted-effects-done');
+      const result = await sendGate;
+      order.push('send-settled');
+      return result;
+    });
+    const releaseLifecycle = vi.fn(() => {
+      order.push('lifecycle-released');
+    });
+    const h = makeHarness({
+      createSession: async () => {
+        order.push('session-created');
+        return session;
+      },
+      backfillSessionMeta: async () => {
+        order.push('session-backfilled');
+      },
+      persistUserMessage: async () => {
+        order.push('message-persisted');
+      },
+      beforeDispatchUserTurn: async () => {
+        order.push('baseline-started');
+      },
+      acquireSessionLifecycleLease: async () => {
+        order.push('lifecycle-acquired');
+        return { acquired: true as const, release: releaseLifecycle };
+      },
+    });
+    h.setScan(goodScan());
+
+    const { runId } = await h.controller.startLearn({ input: 'learn safely', sourceKind: 'freetext' });
+    await vi.waitFor(() => expect(order).toContain('accepted-effects-done'));
+    expect(h.store.get(runId)?.status).toBe('distilling');
+    expect(releaseLifecycle).not.toHaveBeenCalled();
+
+    settleSend({ accepted: true });
+    await vi.waitFor(() => expect(releaseLifecycle).toHaveBeenCalledTimes(1));
+    expect(order).toEqual([
+      'lifecycle-acquired',
+      'session-created',
+      'session-backfilled',
+      'send-start',
+      'message-persisted',
+      'baseline-started',
+      'accepted-effects-done',
+      'send-settled',
+      'lifecycle-released',
+    ]);
+
+    session.emit({ type: 'done' });
+    await h.waitForStatus(runId, 'awaiting-review');
+    expect(releaseLifecycle).toHaveBeenCalledTimes(1);
+  });
+
   it('freetext 全流程:collecting → distilling → awaiting-review', async () => {
     const h = makeHarness();
     h.setScan(goodScan());

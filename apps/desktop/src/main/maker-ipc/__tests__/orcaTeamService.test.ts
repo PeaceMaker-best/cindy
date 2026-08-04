@@ -308,7 +308,7 @@ describe('OrcaTeamService', () => {
 
     expect(deps.getWorkerLinkBySessionId).toHaveBeenCalledWith('worker-session-1');
     expect(deps.getWorkerLinkBySessionId).not.toHaveBeenCalledWith('worker-1');
-    expect(deps.resumeWorkerSession).toHaveBeenCalledOnce();
+    expect(deps.resumeWorkerSession).not.toHaveBeenCalled();
     expect(getWorker().idleSince).toBeNull();
     expect(deps.dispatchWorkerMessage).toHaveBeenCalledWith(expect.objectContaining({
       targetSessionId: 'worker-session-1',
@@ -415,7 +415,7 @@ describe('OrcaTeamService', () => {
     expect(deps.dispatchWorkerMessage).not.toHaveBeenCalled();
   });
 
-  it('normalizes resume failures to AGENT_NOT_READY for sendToWorker', async () => {
+  it('lets the dispatch boundary own idle-session wake instead of pre-resuming it', async () => {
     const { deps, service } = createDeps({
       resumeWorkerSession: vi.fn(async () => {
         throw new Error('rehydrate failed');
@@ -425,14 +425,12 @@ describe('OrcaTeamService', () => {
     await expect(
       service.sendToWorker({ callerLeadSessionId: 'lead-1', targetSessionId: 'worker-session-1', message: '继续' }),
     ).resolves.toMatchObject({
-      ok: false,
-      errorCode: 'AGENT_NOT_READY',
-      message: 'rehydrate failed',
+      ok: true,
+      wakeKind: 'resumed',
     });
 
-    expect(deps.dispatchWorkerMessage).not.toHaveBeenCalled();
-    expect(deps.updateWorkerStatus).not.toHaveBeenCalled();
-    expect(deps.broadcastOrcaWorkerChanged).not.toHaveBeenCalled();
+    expect(deps.resumeWorkerSession).not.toHaveBeenCalled();
+    expect(deps.dispatchWorkerMessage).toHaveBeenCalledOnce();
   });
 
   it.each([

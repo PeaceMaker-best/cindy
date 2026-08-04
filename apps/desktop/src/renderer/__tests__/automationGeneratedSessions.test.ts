@@ -1032,7 +1032,7 @@ describe('automation-generated sessions', () => {
       "sessionService.update(sessionId, { status: 'archived', pinnedAt: null })",
     );
     expect(deleteHookSource).toContain("sessionService.update(sessionId, { status: 'deleted' })");
-    expect(deleteHookSource).toContain('window.electronAPI.cleanupSessionImages(sessionId)');
+    expect(deleteHookSource).not.toContain('cleanupSessionImages');
     expect(deleteHookSource).toContain('makerChatStore.closeSessionQuery(sessionId)');
     expect(deleteHookSource).toContain('discardComposerDraft(sessionId)');
     expect(deleteHookSource).toContain('scheduler.deleteDialog.option.keep.title');

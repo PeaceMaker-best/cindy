@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import path from 'node:path';
 
-import { Maker, type CreateSessionOptions } from './maker.js';
+import {
+  Maker,
+  SessionPermanentlySealedError,
+  type CreateSessionOptions,
+} from './maker.js';
 import { Session } from './session.js';
 import { createAsyncQueue } from './agents/shared/async-queue.js';
 import type { AgentSessionHandle, BaseAgent } from './agents/base-agent.js';
@@ -135,6 +139,136 @@ function createDeferred<T = void>(): {
 }
 
 describe('Maker session creation singleflight', () => {
+  it('claims runtime ownership after creating a new explicit-id row', async () => {
+    const storage = createStorage();
+    const releaseOwnership = vi.fn(async () => undefined);
+    const acquireRuntimeOwnership = vi.fn(async (sessionId: string) => {
+      expect(await storage.get(sessionId)).not.toBeNull();
+      return releaseOwnership;
+    });
+    const maker = new Maker({
+      agents: { codex: createAgent(async () => createHandle({ id: 'thread-new' })) },
+      storage,
+      logger: createLogger(),
+      lifecycleHooks: { acquireRuntimeOwnership },
+    });
+
+    const session = await maker.createSession({
+      id: 'session-new-explicit',
+      agentKind: 'codex',
+      workingDir: '/repo',
+      model: 'gpt-5.4',
+    });
+
+    expect(acquireRuntimeOwnership).toHaveBeenCalledOnce();
+    expect(acquireRuntimeOwnership).toHaveBeenCalledWith('session-new-explicit');
+    await session.close();
+  });
+
+  it('rolls back a newly created row when runtime ownership claim fails', async () => {
+    const storage = createStorage();
+    const failedHandle = createHandle({ id: 'thread-claim-failed' });
+    failedHandle.close = vi.fn(async () => undefined);
+    const maker = new Maker({
+      agents: { codex: createAgent(async () => failedHandle) },
+      storage,
+      logger: createLogger(),
+      lifecycleHooks: {
+        acquireRuntimeOwnership: vi.fn(async (sessionId: string) => {
+          expect(await storage.get(sessionId)).not.toBeNull();
+          throw new Error('runtime ownership unavailable');
+        }),
+      },
+    });
+
+    await expect(
+      maker.createSession({
+        id: 'session-claim-failed',
+        agentKind: 'codex',
+        workingDir: '/repo',
+        model: 'gpt-5.4',
+      }),
+    ).rejects.toThrow('runtime ownership unavailable');
+
+    expect(failedHandle.close).toHaveBeenCalledOnce();
+    await expect(storage.get('session-claim-failed')).resolves.toBeNull();
+  });
+
+  it('seals an in-flight startup before it can publish and permanently rejects the physical id', async () => {
+    const startGate = createDeferred<AgentSessionHandle>();
+    const handle = createHandle({ id: 'thread-sealed' });
+    handle.close = vi.fn(async () => undefined);
+    const startSession = vi.fn(() => startGate.promise);
+    const maker = new Maker({
+      agents: { codex: createAgent(startSession) },
+      storage: createStorage(),
+      logger: createLogger(),
+    });
+    const options: CreateSessionOptions = {
+      id: 'session-sealed',
+      agentKind: 'codex',
+      workingDir: '/repo',
+      model: 'gpt-5.4',
+    };
+
+    const creating = maker.createSession(options);
+    await vi.waitFor(() => expect(startSession).toHaveBeenCalledTimes(1));
+    const sealing = maker.sealSession(options.id!);
+    startGate.resolve(handle);
+
+    await expect(creating).rejects.toBeInstanceOf(SessionPermanentlySealedError);
+    await sealing;
+    expect(handle.close).toHaveBeenCalledTimes(1);
+    expect(maker.listActiveSessions()).toEqual([]);
+    await expect(maker.createSession(options)).rejects.toBeInstanceOf(
+      SessionPermanentlySealedError,
+    );
+    expect(startSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('drains admitted sdkSessionId persistence before a sealed session can be cleaned', async () => {
+    const events = createAsyncQueue<AgentEvent>();
+    const handle = createHandle({ id: 'thread-initial' });
+    handle.events = () => events;
+    const storage = createStorage();
+    const originalUpdate = storage.update.bind(storage);
+    const updateEntered = createDeferred();
+    const updateRelease = createDeferred();
+    storage.update = vi.fn(async (id, patch) => {
+      if (patch.sdkSessionId === 'thread-late') {
+        updateEntered.resolve();
+        await updateRelease.promise;
+      }
+      return originalUpdate(id, patch);
+    });
+    const maker = new Maker({
+      agents: { codex: createAgent(async () => handle) },
+      storage,
+      logger: createLogger(),
+    });
+    const session = await maker.createSession({
+      id: 'session-sdk-tail',
+      agentKind: 'codex',
+      workingDir: '/repo',
+      model: 'gpt-5.4',
+    });
+
+    events.push({ type: 'session_id', data: 'thread-late', source: 'codex' });
+    await updateEntered.promise;
+    let sealFinished = false;
+    const sealing = maker.sealSession(session.id).then(() => {
+      sealFinished = true;
+    });
+    await Promise.resolve();
+    expect(sealFinished).toBe(false);
+
+    updateRelease.resolve();
+    await sealing;
+    await storage.update(session.id, { sdkSessionId: undefined });
+    await Promise.resolve();
+    expect((await storage.get(session.id))?.sdkSessionId).toBeUndefined();
+  });
+
   it('binds each rebuilt business session to a fresh runtime instance id', async () => {
     const seenInstanceIds: string[] = [];
     const startSession = vi.fn(async (opts: CreateSessionOptions) => {
@@ -191,7 +325,7 @@ describe('Maker session creation singleflight', () => {
     const first = maker.createSession(options);
     const second = maker.createSession({ ...options });
 
-    expect(startSession).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(startSession).toHaveBeenCalledTimes(1));
     resolveStart(createHandle({ id: 'thread-1' }));
     const [firstSession, secondSession] = await Promise.all([first, second]);
 

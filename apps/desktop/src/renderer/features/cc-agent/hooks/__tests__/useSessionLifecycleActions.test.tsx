@@ -14,7 +14,6 @@ const mocks = vi.hoisted(() => ({
   clearComposerDraft: vi.fn(),
   cleanupSessionLayoutPrefs: vi.fn(),
   refreshWorktrees: vi.fn(),
-  cleanupSessionImages: vi.fn(),
   toastError: vi.fn(),
 }));
 
@@ -74,11 +73,6 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.setStatus.mockResolvedValue({});
   mocks.refreshSessions.mockResolvedValue([]);
-  mocks.cleanupSessionImages.mockResolvedValue(undefined);
-  Object.defineProperty(window, 'electronAPI', {
-    configurable: true,
-    value: { cleanupSessionImages: mocks.cleanupSessionImages },
-  });
 });
 
 describe('useSessionLifecycleActions archive optimistic ordering', () => {

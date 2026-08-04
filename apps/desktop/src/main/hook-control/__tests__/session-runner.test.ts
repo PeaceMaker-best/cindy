@@ -410,6 +410,102 @@ describe('hook session 精确接管边界', () => {
   });
 });
 
+describe('hook session lifecycle admission', () => {
+  it('does not create runtime, stage attachments, persist, or send when deletion wins', async () => {
+    const withActiveSessionLifecycle = vi.fn(async () => ({
+      admitted: false as const,
+      reason: 'deleted',
+    }));
+    const runner = createMakerHookSessionRunner({ log, withActiveSessionLifecycle });
+
+    const outcome = await runner.run(baseReq({
+      sessionId: 'sess-deleted',
+      isNew: false,
+      attachments: [
+        {
+          name: 'late.png',
+          mimeType: 'image/png',
+          dataBase64: Buffer.from('late').toString('base64'),
+        },
+      ],
+    }));
+
+    expect(outcome).toMatchObject({
+      status: 'error',
+      errorMessage: expect.stringContaining('lifecycle admission failed: deleted'),
+    });
+    expect(fakeMaker.createSession).not.toHaveBeenCalled();
+    expect(cindyMock.ingestMedia).not.toHaveBeenCalled();
+    expect(h.createMessage).not.toHaveBeenCalled();
+    expect(h.touchUserSendInDb).not.toHaveBeenCalled();
+  });
+
+  it('keeps lifecycle admission through runtime creation, attachment staging, persistence, and send acceptance', async () => {
+    const order: string[] = [];
+    cindyMock.ingestMedia.mockImplementationOnce(async ({ mimeType }: { mimeType: string }) => {
+      order.push('attachment-staged');
+      return {
+        hash: 'a'.repeat(64),
+        ext: '.png',
+        mimeType,
+        bytes: 8,
+        url: `cindy-media://blobs/${'a'.repeat(64)}.png`,
+        deduplicated: false,
+        refIds: ['ref-1'],
+      };
+    });
+    h.createMessage.mockImplementationOnce(async () => {
+      order.push('message-persisted');
+    });
+    fakeMaker.createSession.mockImplementationOnce(async (opts: { id?: string }) => {
+      order.push('runtime-created');
+      const session = makeFakeSession(opts.id ?? 'sess-old');
+      session.send.mockImplementationOnce(async (_message, sendOpts) => {
+        order.push('send-start');
+        await sendOpts.afterTurnReserved?.();
+        await sendOpts.beforeProviderStart?.();
+        await sendOpts.onAccepted?.();
+        order.push('send-accepted');
+        queueMicrotask(() => h.eventCbs.get(session.id)?.({ type: 'done', data: null }));
+        return { accepted: true };
+      });
+      return session;
+    });
+    const withActiveSessionLifecycle = vi.fn(async (_sessionId, run) => {
+      order.push('lifecycle-acquired');
+      const value = await run();
+      order.push('lifecycle-released');
+      return { admitted: true as const, value };
+    });
+    const runner = createMakerHookSessionRunner({ log, withActiveSessionLifecycle });
+
+    const outcome = await runner.run(baseReq({
+      sessionId: 'sess-old',
+      isNew: false,
+      attachments: [
+        {
+          name: 'photo.png',
+          mimeType: 'image/png',
+          dataBase64: Buffer.from('photo').toString('base64'),
+        },
+      ],
+    }));
+
+    expect(outcome.status).toBe('ok');
+    expect(order.at(0)).toBe('lifecycle-acquired');
+    expect(order.at(-1)).toBe('lifecycle-released');
+    for (const step of [
+      'runtime-created',
+      'attachment-staged',
+      'message-persisted',
+      'send-accepted',
+    ]) {
+      expect(order.indexOf(step)).toBeGreaterThan(0);
+      expect(order.indexOf(step)).toBeLessThan(order.indexOf('lifecycle-released'));
+    }
+  });
+});
+
 describe('真正要跑的那个 live session 的目录也要过映射', () => {
   it('活实例仍在已撤权的目录 -> 拒绝执行, 消息不进 agent', async () => {
     // maker.createSession 对已在 activeSessions 里的 id 直接返回既有实例, 忽略

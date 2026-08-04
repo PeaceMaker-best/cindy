@@ -163,7 +163,15 @@ import { RendererBootGuard } from './renderer-boot-guard';
 import yaml from 'js-yaml';
 import matter from 'gray-matter';
 import type { Maker } from '@cindy/maker-core';
-import { im, feishuIm, telegramIm, registerTelegramBotConfigIpc, startImOrchestrators, startImConnection, stopImConnection } from './im';
+import {
+  im,
+  feishuIm,
+  telegramIm,
+  registerTelegramBotConfigIpc,
+  startImOrchestrators,
+  startImConnection,
+  stopImConnection,
+} from './im';
 import { setTelegramRemoteSource } from './device-link/telegramRemoteControl';
 import * as authManager from './authManager';
 import { hasPersistedSessionHint } from './authSessionHint';
@@ -224,7 +232,6 @@ import {
 } from './cindy-media/cindyMediaProtocol';
 import * as cindyMediaBlobStore from './cindy-media/blobStore';
 import * as cindyChatAttachments from './cindy-media/chatAttachments';
-import { removeSessionRefs as removeSessionMediaRefs } from './cindy-media/ledger';
 import { createStorageIpcHandlers } from './cindy-media/storageIpc';
 import {
   getAllRegisteredDraftUrls,
@@ -252,6 +259,13 @@ import { resolveWorkspacePathCached, resolveWorkspacePathBatchCached } from './p
 import { registerLocalDbIpc } from './localDb/ipc/registerAll';
 import { listPersistedChatAttachmentPaths } from './localDb/ipc/messages';
 import {
+  finalizeDeletedSessionLifecycle,
+  reconcileDeletedSessionLifecycles,
+} from './localDb/ipc/sessions';
+import { configureSessionLifecycleRuntime } from './localDb/ipc/sessionLifecycleRuntime.js';
+import { drainPersistQueue } from './messagePersistBroadcaster.js';
+import { isSessionStillRemovable } from './worktree/sessionRemovalRecycle.js';
+import {
   registerLegacyMigrationIpc,
   runLegacyUserDataMigrationForUser,
 } from './legacyUserDataMigration';
@@ -262,9 +276,16 @@ import {
   closeDb as localDbCloseDb,
   getCurrentDbPath as localDbGetCurrentDbPath,
 } from './localDb/index';
+import { reconcileStrandedOrcaSessions } from './localDb/orcaStrandedLeadReconcile.js';
 import { createDbClient, createInprocDbClient } from './localDb/client/DbClient';
 import { createLifecycleDbClientManager } from './localDb/client/lifecycleDbClient';
-import { clearCurrentDbClient, getDbClient, setCurrentDbClient } from './localDb/client/current';
+import {
+  clearCurrentDbClient,
+  getCurrentDbClientUserId,
+  getDbClient,
+  setCurrentDbClient,
+  tryGetDbClient,
+} from './localDb/client/current';
 import {
   resolveBetterSqliteModuleEntry,
   resolveBetterSqliteNativeBinding,
@@ -329,6 +350,7 @@ import {
   registerWorktreeIpc,
   WorktreePool,
   reconcileWorktreesForDeletedSessions,
+  recycleWorktreeForRemovedSession,
 } from './worktree';
 // shadow savepoint 链的启动期对账(孤儿 refs/cindy/savepoints/* 清理)
 import { reconcileSavepointRefsForDeletedSessions } from './git-snapshot/savepointCleanup';
@@ -437,6 +459,7 @@ import {
   setGoalIdleObserver,
   setGoalStopObserver,
   setGoalAskAnswerObserver,
+  prepareSessionRuntimeForPermanentDeletion,
 } from './maker-ipc/register.js';
 import { MAKER_INVOKE as MAKER_IPC_INVOKE, MAKER_PUSH } from './maker-ipc/channels.js';
 import {
@@ -654,6 +677,7 @@ import {
   getGhostManager,
   getGhostSessionActivityTracker,
   isGhostAvailableForActiveSession,
+  notifyGhostSessionEvent,
   refreshGhostLocalization,
   registerGhostIpc,
   setGhostsChangedObserver,
@@ -665,10 +689,7 @@ import { listActiveClaudeBackgroundActivitySessions } from './maker-host/claude-
 import { registerRelaunchBusyActivityIpc } from './relaunchBusyActivityIpc.js';
 import { getGhostSetupChangeBus } from './cindy-brain/ghostSetupChangeBus.js';
 import { getGhostSetupInteractionBridge } from './cindy-brain/ghostSetupInteractionBridge.js';
-import {
-  registerPluginMarketIpc,
-  syncDefaultMarketPlugins,
-} from './plugin-market/registerIpc.js';
+import { registerPluginMarketIpc, syncDefaultMarketPlugins } from './plugin-market/registerIpc.js';
 import { findCindyFileInArgv } from './cindy-brain/argv.js';
 import { handleIncomingCindyFile } from './cindy-brain/openFileInstall.js';
 import { registerCindyFileAssociation } from './cindy-brain/fileAssociation.js';
@@ -2826,13 +2847,16 @@ const registerIpcHandlers = () => {
       !isAppSessionBoundaryPending() && activeOwnerScopeKey() === ownerScopeKey;
     return applyCodexSpawnConfigChangeWithRestart(async () => {
       if (!stillValid()) {
-        throwIpcError('PRECONDITION_FAILED', 'app session changed during codex restart; write dropped');
+        throwIpcError(
+          'PRECONDITION_FAILED',
+          'app session changed during codex restart; write dropped',
+        );
       }
       writeSubagentModelSettingsPatch(parsed);
       return subagentModelSettingsWire();
-    // stillValid 同时传给执行体:busy 路径 persist 与登记之间还有一个 await 边界,
-    // 该窗口内 owner boundary 清掉旧登记后,本请求不得再 schedule(codex review
-    // P1 第 3 轮)。
+      // stillValid 同时传给执行体:busy 路径 persist 与登记之间还有一个 await 边界,
+      // 该窗口内 owner boundary 清掉旧登记后,本请求不得再 schedule(codex review
+      // P1 第 3 轮)。
     }, stillValid);
   });
   ipcMain.handle(MAKER_IPC_INVOKE.SUBAGENT_MODEL_SETTINGS_RESET, async (event) => {
@@ -2853,7 +2877,10 @@ const registerIpcHandlers = () => {
       !isAppSessionBoundaryPending() && activeOwnerScopeKey() === ownerScopeKey;
     return applyCodexSpawnConfigChangeWithRestart(async () => {
       if (!stillValid()) {
-        throwIpcError('PRECONDITION_FAILED', 'app session changed during codex restart; reset dropped');
+        throwIpcError(
+          'PRECONDITION_FAILED',
+          'app session changed during codex restart; reset dropped',
+        );
       }
       resetSubagentModelSettings();
       return subagentModelSettingsWire();
@@ -3530,7 +3557,11 @@ const registerIpcHandlers = () => {
     // 向所有窗口广播 PROVIDER_CHANGED:useProviders 依赖此消息刷新连接态快照(多窗口同步)。
     for (const win of BrowserWindow.getAllWindows()) {
       if (!win.isDestroyed()) {
-        try { win.webContents.send(MAKER_PUSH.PROVIDER_CHANGED, {}); } catch { /* no-op */ }
+        try {
+          win.webContents.send(MAKER_PUSH.PROVIDER_CHANGED, {});
+        } catch {
+          /* no-op */
+        }
       }
     }
   };
@@ -3696,7 +3727,11 @@ const registerIpcHandlers = () => {
 
   ipcMain.handle(
     'builtin-api-key-store',
-    async (event: Electron.IpcMainInvokeEvent, providerId: unknown, value: unknown): Promise<void> => {
+    async (
+      event: Electron.IpcMainInvokeEvent,
+      providerId: unknown,
+      value: unknown,
+    ): Promise<void> => {
       assertTrustedAppRendererEvent(event);
       builtinApiKeyStore(builtinApiKeyDeps, providerId, value);
     },
@@ -4094,17 +4129,6 @@ const registerIpcHandlers = () => {
     await WorktreePool.recoverPool().catch((err) => {
       console.error('[bootstrap-electron] recoverPool failed (non-fatal):', err);
     });
-    // P0 重构对账:会话已删除(status='deleted' 或行已缺失)但 worktree 回收没跑完
-    // (崩溃窗口/回收失败)的孤儿,启动期补一次回收。fire-and-forget,不阻塞启动。
-    void reconcileWorktreesForDeletedSessions().catch((err) => {
-      console.error('[bootstrap-electron] worktree reconcile failed (non-fatal):', err);
-    });
-    // 同窗口的 shadow savepoint 对账:owning session 已删除的孤儿保存点链
-    // (refs/cindy/savepoints/<sid>)启动期补删。fire-and-forget,不阻塞启动。
-    void reconcileSavepointRefsForDeletedSessions().catch((err) => {
-      console.error('[bootstrap-electron] savepoint reconcile failed (non-fatal):', err);
-    });
-
     // Scheduler / Goal / Learn 统一由 localDb onReady 在 provider readiness settle 后启动。
     // DB 与 splash 无论谁先完成，上方 configured 信号都会解开同一条后台链；
     // 这里不再直启，避免 scheduler 在账号模型发现完成前抢先选路由。
@@ -4237,9 +4261,10 @@ const registerIpcHandlers = () => {
           broadcastFailure: false,
           signal: piInstallSignal,
         });
-        piInfo = piRes.ready && piRes.path
-          ? { status: 'passed' as const, path: piRes.path }
-          : { status: 'failed' as const, error: piRes.error ?? 'pi binary not available' };
+        piInfo =
+          piRes.ready && piRes.path
+            ? { status: 'passed' as const, path: piRes.path }
+            : { status: 'failed' as const, error: piRes.error ?? 'pi binary not available' };
       } catch (err: unknown) {
         piInfo = {
           status: 'failed' as const,
@@ -4298,9 +4323,8 @@ const registerIpcHandlers = () => {
   // ChatGPT Desktop 当前注册 `codex:` 协议（macOS bundle id com.openai.codex；
   // Windows 安装包也由系统协议注册表接管）。独立无参 IPC 保持最小权限，不能借此
   // 打开 renderer 提供的任意自定义 scheme / deep link。
-  ipcMain.handle(
-    'shell:open-chatgpt-app',
-    async (event): Promise<{ success: boolean }> => handleOpenChatGPTApp(event, {
+  ipcMain.handle('shell:open-chatgpt-app', async (event): Promise<{ success: boolean }> =>
+    handleOpenChatGPTApp(event, {
       assertTrustedSender: assertTrustedAppRendererEvent,
       openExternal: (url) => shell.openExternal(url),
     }),
@@ -4681,23 +4705,24 @@ const registerIpcHandlers = () => {
       const params = requireObject(payload);
       const defaultPathValue = params.defaultPath;
       if (
-        defaultPathValue !== undefined
-        && (
-          typeof defaultPathValue !== 'string'
-          || defaultPathValue.length > 4096
-          || !path.isAbsolute(defaultPathValue)
-        )
+        defaultPathValue !== undefined &&
+        (typeof defaultPathValue !== 'string' ||
+          defaultPathValue.length > 4096 ||
+          !path.isAbsolute(defaultPathValue))
       ) {
         throwIpcError('INVALID_PARAMS', 'defaultPath must be an absolute path');
       }
       const owner = BrowserWindow.fromWebContents(event.sender);
       if (!owner) return { success: true, path: null, kind: null };
       try {
-        const picked = await pickNativeAtResource({
-          platform: process.platform,
-          showOpenDialog: (options) => dialog.showOpenDialog(owner, options),
-          isDirectory: (selectedPath) => fs.statSync(selectedPath).isDirectory(),
-        }, defaultPathValue);
+        const picked = await pickNativeAtResource(
+          {
+            platform: process.platform,
+            showOpenDialog: (options) => dialog.showOpenDialog(owner, options),
+            isDirectory: (selectedPath) => fs.statSync(selectedPath).isDirectory(),
+          },
+          defaultPathValue,
+        );
         return { success: true, ...picked };
       } catch {
         throwIpcError('INTERNAL', 'unable to open resource picker');
@@ -5078,7 +5103,7 @@ const registerIpcHandlers = () => {
             filePath,
             hasUrlState,
             fallback: hasUrlState
-                ? openFileUrlWithWindowsHandler
+              ? openFileUrlWithWindowsHandler
                 ? 'windows-url-handler'
                 : 'disabled'
               : 'openPath',
@@ -5191,26 +5216,23 @@ const registerIpcHandlers = () => {
       return stageChatAttachment(params);
     },
   );
-  ipcMain.handle(
-    'chat-attachment:cleanup',
-    async (event, filePaths: readonly string[]) => {
-      assertTrustedAppRendererEvent(event);
-      if (!Array.isArray(filePaths)) return;
-      const ownerScopeKey = activeOwnerScopeKey();
-      const ownerId = getActiveAppSession().dataOwnerId;
-      if (!ownerId || isAppSessionBoundaryPending()) return;
-      const protectedPaths = await listPersistedChatAttachmentPaths();
-      const isCurrentOwner = () =>
-        activeOwnerScopeKey() === ownerScopeKey && !isAppSessionBoundaryPending();
-      if (!isCurrentOwner()) return;
-      await cleanupOwnedUnpersistedStagedChatAttachments({
-        ownerId,
-        filePaths,
-        protectedPaths,
-        canRemove: isCurrentOwner,
-      });
-    },
-  );
+  ipcMain.handle('chat-attachment:cleanup', async (event, filePaths: readonly string[]) => {
+    assertTrustedAppRendererEvent(event);
+    if (!Array.isArray(filePaths)) return;
+    const ownerScopeKey = activeOwnerScopeKey();
+    const ownerId = getActiveAppSession().dataOwnerId;
+    if (!ownerId || isAppSessionBoundaryPending()) return;
+    const protectedPaths = await listPersistedChatAttachmentPaths();
+    const isCurrentOwner = () =>
+      activeOwnerScopeKey() === ownerScopeKey && !isAppSessionBoundaryPending();
+    if (!isCurrentOwner()) return;
+    await cleanupOwnedUnpersistedStagedChatAttachments({
+      ownerId,
+      filePaths,
+      protectedPaths,
+      canRemove: isCurrentOwner,
+    });
+  });
   ipcMain.handle(
     'chat-attachment:save-as',
     (event, params: { sourcePath?: unknown; suggestedName?: unknown }) => {
@@ -5647,22 +5669,13 @@ const registerIpcHandlers = () => {
     },
   );
 
-  // F7: cleanup an entire session's cache directory (delete session)
+  // F7 compatibility channel: cleanup is owned by the Main session lifecycle.
+  // Re-checking status here prevents stale renderer calls from destroying an
+  // active/restored session.
   ipcMain.handle(
     'image-cache:cleanup-session',
     async (_event: Electron.IpcMainInvokeEvent, sessionId: string): Promise<void> => {
-      await imageCacheStore.removeSession(sessionId);
-      // 媒体总仓对应清理:删本会话名下的媒体引用行(附件/导入/
-      // 消息出生引用;画廊等持久引用不动)。失败只警告——引用行残留是
-      // 无害的保守方向(blob 多活一阵),由对账工具兜底,不阻塞会话删除。
-      try {
-        await removeSessionMediaRefs(sessionId);
-      } catch (err) {
-        createLogger('image-cache').warn('session media ref cleanup failed', {
-          sessionId,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
+      await finalizeDeletedSessionLifecycle(sessionId);
     },
   );
 
@@ -5969,6 +5982,15 @@ app.on('ready', async () => {
   // 首登轻量数据迁移(mToc)的确认弹窗 IPC —— 必须先于 registerLocalDbIpc 注册,
   // 保证 beforeEnsureReady 推送 confirm 态时 renderer 已能 invoke 确认通道。
   registerLegacyMigrationIpc();
+  configureSessionLifecycleRuntime({
+    prepareSessionRuntimeForPermanentDeletion,
+    getMakerIfReady,
+    getGoalController,
+    isSessionStillRemovable,
+    recycleWorktreeForRemovedSession,
+    drainPersistQueue,
+    notifyGhostSessionEvent,
+  });
   registerLocalDbIpc({
     isOwnerCurrent: (userId) =>
       isLocalDbOwnerCurrent(authManager.getAuthState(), userId, isAppSessionBoundaryPending()),
@@ -5978,9 +6000,8 @@ app.on('ready', async () => {
       // Provider discovery is detached from DB read readiness for the same owner, but a
       // different owner must not replace the DB while the previous account task can still
       // update owner-scoped catalogs or agent environments.
-      const previousProviderTaskSettled = await accountProviderReadinessBarrier.waitForPreviousScope(
-        activeOwnerScopeKey(),
-      );
+      const previousProviderTaskSettled =
+        await accountProviderReadinessBarrier.waitForPreviousScope(activeOwnerScopeKey());
       // The old task may have completed its owner-scoped DB read after teardown cleared the
       // process-global catalog. Clear once more after joining it so a failed next-owner reload
       // cannot inherit the old endpoint/model snapshot. Same-scope ensure retries skip this.
@@ -6024,6 +6045,85 @@ app.on('ready', async () => {
         });
         return;
       }
+      const startupDbClient = tryGetDbClient();
+      const isStartupOwnerCurrent = (): boolean =>
+        startupDbClient !== null &&
+        tryGetDbClient() === startupDbClient &&
+        getCurrentDbClientUserId() === userId &&
+        isLocalDbOwnerCurrent(authManager.getAuthState(), userId, isAppSessionBoundaryPending());
+      if (!isStartupOwnerCurrent()) {
+        dbClientLog.warn(
+          '[DbClient] owner changed before startup reconciliation; stopping stale hooks',
+          {
+            userId,
+          },
+        );
+        return;
+      }
+      try {
+        const result = await reconcileDeletedSessionLifecycles({
+          dbClient: startupDbClient!,
+          canContinue: isStartupOwnerCurrent,
+        });
+        if (result.scanned > 0) {
+          dbClientLog.info('[SessionDeletion] startup lifecycle reconciliation completed', {
+            ownerId: userId,
+            ...result,
+          });
+        }
+      } catch (err) {
+        dbClientLog.warn('[SessionDeletion] startup lifecycle reconciliation failed (non-fatal)', {
+          ownerId: userId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      logStartupPhase('deleted-session-reconcile');
+      if (!isStartupOwnerCurrent()) return;
+      try {
+        const result = await reconcileStrandedOrcaSessions({
+          dbClient: startupDbClient!,
+          canContinue: isStartupOwnerCurrent,
+        });
+        if (result.archivedWorkerSessions > 0) {
+          dbClientLog.info('[Orca] startup stranded session reconciliation completed', {
+            ownerId: userId,
+            ...result,
+          });
+        }
+      } catch (err) {
+        dbClientLog.warn('[Orca] startup stranded session reconciliation failed (non-fatal)', {
+          ownerId: userId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      logStartupPhase('orca-stranded-session-reconcile');
+      if (!isStartupOwnerCurrent()) return;
+      try {
+        await reconcileWorktreesForDeletedSessions({
+          dbClient: startupDbClient!,
+          canContinue: isStartupOwnerCurrent,
+        });
+      } catch (err) {
+        dbClientLog.warn('[Worktree] startup deleted-session reconciliation failed (non-fatal)', {
+          ownerId: userId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      logStartupPhase('worktree-reconcile');
+      if (!isStartupOwnerCurrent()) return;
+      try {
+        await reconcileSavepointRefsForDeletedSessions({
+          dbClient: startupDbClient!,
+          canContinue: isStartupOwnerCurrent,
+        });
+      } catch (err) {
+        dbClientLog.warn('[Savepoint] startup deleted-session reconciliation failed (non-fatal)', {
+          ownerId: userId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      logStartupPhase('savepoint-reconcile');
+      if (!isStartupOwnerCurrent()) return;
       // Phase 1.1: file worker 接管 DB 连接后,释放 main 端的 _db + optimize 定时器。
       // 如果 worker takeover 失败并进入 inproc fallback,main _db 必须继续保留,
       // 否则 fallback 会拿到已关闭的连接。
@@ -6135,9 +6235,7 @@ app.on('ready', async () => {
                 });
               }
               await refreshCustomProvidersIntoCatalog(
-                () =>
-                  activeOwnerScopeKey() === providerScopeKey &&
-                  !isAppSessionBoundaryPending(),
+                () => activeOwnerScopeKey() === providerScopeKey && !isAppSessionBoundaryPending(),
               );
               await refreshProviderModelsAfterAccountReady({
                 restartCodex: restartCodexAfterAuthModeChange,

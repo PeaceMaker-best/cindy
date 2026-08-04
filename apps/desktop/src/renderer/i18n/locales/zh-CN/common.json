@@ -8601,6 +8601,7 @@
     },
     "note": {
       "codexStateSkipped": "本机尚未初始化 Codex 环境，任务状态未完全恢复；先运行一次 Codex 任务后即可正常续聊。",
+      "codexStateFinalizeFailed": "Codex 任务状态已导入，但续聊指针更新失败；重新导入这个分享包可重试修复。",
       "workdirKeyInexact": "所选目录路径过长，无法放置历史转录，已降级为仅对话记录。"
     }
   },

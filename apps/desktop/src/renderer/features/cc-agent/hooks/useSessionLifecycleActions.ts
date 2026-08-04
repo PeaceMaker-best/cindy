@@ -154,9 +154,6 @@ export function useSessionLifecycleActions(options?: { includeArchived?: ListSta
       // hold an orphan entry forever.
       discardComposerDraft(sessionId);
       if (action === 'delete') {
-        void window.electronAPI.cleanupSessionImages(sessionId).catch((err: unknown) => {
-          log.warn('[session delete] cleanup images failed', err);
-        });
         // RSB 布局偏好(fraction / treeWidth / collapsed)按 sessionId 持久化在
         // localStorage,删 session 时一起清掉,避免僵尸数据堆积。
         cleanupSessionLayoutPrefs(sessionId);

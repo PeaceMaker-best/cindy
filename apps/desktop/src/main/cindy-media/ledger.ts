@@ -58,6 +58,9 @@ function defaultDb(): LedgerDb {
  * 'profile-avatar':用户自定义头像(设置 → 用户卡片编辑),refId = 登录用户
  * id。跨会话持久(removeSessionRefs 不碰),同 refId 只保留最新指纹——换头像时
  * 由 profileEdit 用 removeRefsExceptHash 清旧引用,恢复默认头像时 removeRefs 清空。
+ * 'wechat-outbox':已提交待投递的 WeChat 媒体,refId = wechat_outbox.id。
+ * 它属于投递队列而不是产生它的 session，删除 session 不得清理；送达、永久
+ * 失败或 binding 关闭时由 WeChat outbox 事务精确释放。
  */
 export type MediaRefKind =
   | 'message'
@@ -69,7 +72,8 @@ export type MediaRefKind =
   | 'ghost-deposit'
   | 'import'
   | 'integration-cache'
-  | 'profile-avatar';
+  | 'profile-avatar'
+  | 'wechat-outbox';
 /** 出生来源类型。 */
 export type MediaOriginKind = 'ghost' | 'tool' | 'user' | 'integration';
 

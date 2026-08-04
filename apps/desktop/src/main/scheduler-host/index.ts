@@ -14,6 +14,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import { app } from 'electron';
+import { acquireSessionLifecycleLease } from '../sessionLifecycleLock.js';
 import type { BrowserWindow } from 'electron';
 
 import { Scheduler } from '@cindy/maker-scheduler';
@@ -86,6 +87,7 @@ export async function startScheduler(deps: StartSchedulerDeps): Promise<Schedule
     beforeDispatchUserTurn: deps.beforeDispatchUserTurn,
     onUndispatchedUserTurn: deps.onUndispatchedUserTurn,
     acquirePendingAgentSwitch: acquirePendingAgentSwitchForDirectSend,
+    acquireSessionLifecycleLease,
     onSessionCreated: broadcastSessionCreated,
     // 停用轴裁决:每次 fire 前判保存路由是否已被用户停用(见 runner deps 注释)。
     checkModelRoute: verdictForModelRoute,
