@@ -65,25 +65,42 @@ export function buildTrackUrl(target: LogUploadTarget): string {
 }
 
 /**
+ * 单条记录在 `__logs__` 数组里的额外开销：分隔用的逗号。envelope 本身
+ * （`__topic__` / `__source__` / `__tags__` / 括号）由 `ENVELOPE_RESERVE_BYTES` 兜。
+ */
+const PER_RECORD_OVERHEAD_BYTES = 1;
+
+/**
+ * 留给 envelope 的字节。`__tags__` 里有 version / platform / arch / userId / crashToken
+ * 这些短串，几百字节量级，这里给 4KB 富余。
+ */
+const ENVELOPE_RESERVE_BYTES = 4 * 1024;
+
+/**
  * 按条数与字节双上限切批。
  *
- * 字节估算用 `JSON.stringify(log).length`（UTF-16 长度，对 CJK 是保守高估——高估只会让批
- * 变小，不会超限）。单条就超过 `MAX_BATCH_BYTES` 时仍然单独成批：正文已在第四层截断过，
- * 这里再丢一次不如让服务端按自己的规则拒，我们据此收到明确的失败。
+ * 字节必须按 **UTF-8** 数（`Buffer.byteLength`）：`JSON.stringify(log).length` 是 UTF-16
+ * 码元数，中文一个字符算 1 而实际占 3 字节，emoji 更是 2 : 4——那是**低估**，会让一批在估算
+ * 里没超限、编码后实际接近或超过服务端上限，被整批拒收，而崩溃标记因此留着反复重试
+ * （2026-08-04 review P2；本函数原先的注释把它写成「保守高估」，方向恰好写反了）。
+ *
+ * 单条就超过预算时仍然单独成批：正文已在第四层截断过，这里再丢一次不如让服务端按自己的
+ * 规则拒，我们据此收到明确的失败。
  */
 export function splitBatches(
   records: readonly UploadRecord[],
   uploadCode: string,
 ): Array<Array<Record<string, string>>> {
+  const budget = MAX_BATCH_BYTES - ENVELOPE_RESERVE_BYTES;
   const batches: Array<Array<Record<string, string>>> = [];
   let current: Array<Record<string, string>> = [];
   let currentBytes = 0;
   for (const record of records) {
     const log = toWireLog(record, uploadCode);
-    const bytes = JSON.stringify(log).length;
+    const bytes = Buffer.byteLength(JSON.stringify(log), 'utf8') + PER_RECORD_OVERHEAD_BYTES;
     const wouldExceed =
       current.length >= MAX_LOGS_PER_BATCH ||
-      (current.length > 0 && currentBytes + bytes > MAX_BATCH_BYTES);
+      (current.length > 0 && currentBytes + bytes > budget);
     if (wouldExceed) {
       batches.push(current);
       current = [];
@@ -156,4 +173,4 @@ export async function sendLogs(
   return { ok: true, batches: batches.length, records: sentRecords };
 }
 
-export const __testing = { toWireLog };
+export const __testing = { toWireLog, ENVELOPE_RESERVE_BYTES, PER_RECORD_OVERHEAD_BYTES };

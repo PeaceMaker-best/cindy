@@ -9,7 +9,7 @@
  */
 import { describe, expect, it, vi } from 'vitest';
 
-import { MAX_LOGS_PER_BATCH } from '../limits';
+import { MAX_BATCH_BYTES, MAX_LOGS_PER_BATCH } from '../limits';
 import { buildTrackUrl, sendLogs, splitBatches, toWireTags } from '../logSink';
 import type { LogUploadMeta, LogUploadTarget, UploadRecord } from '../types';
 
@@ -120,6 +120,34 @@ describe('splitBatches', () => {
 
   it('空输入 ⇒ 空批次列表', () => {
     expect(splitBatches([], META.uploadCode)).toEqual([]);
+  });
+
+  /**
+   * 2026-08-04 review P2 的回归锁：原先按 `JSON.stringify(log).length`（UTF-16 码元数）算
+   * 预算，中文一个字符算 1 而实际 3 字节——**低估**，会让批在编码后超过服务端上限被整批拒收。
+   */
+  it('⚠️ 中文正文按 UTF-8 字节算预算：编码后的真实 body 不超过上限', () => {
+    // 30 万个中文字符 ≈ 90 万 UTF-8 字节,但只有 30 万 UTF-16 码元 —— 按码元算会判成一批。
+    const cjk = '中'.repeat(300 * 1024);
+    const batches = splitBatches([record(1, cjk), record(2, cjk)], META.uploadCode);
+    for (const batch of batches) {
+      const body = JSON.stringify({
+        __topic__: 'cindy-client-log',
+        __source__: 'darwin-arm64',
+        __tags__: toWireTags(META),
+        __logs__: batch,
+      });
+      expect(Buffer.byteLength(body, 'utf8')).toBeLessThanOrEqual(MAX_BATCH_BYTES);
+    }
+  });
+
+  it('emoji（代理对）同样按字节算', () => {
+    const emoji = '🙂'.repeat(200 * 1024); // 2 码元 / 4 字节
+    const batches = splitBatches([record(1, emoji)], META.uploadCode);
+    expect(batches).toHaveLength(1);
+    expect(
+      Buffer.byteLength(JSON.stringify(batches[0]), 'utf8'),
+    ).toBeGreaterThan(JSON.stringify(batches[0]).length);
   });
 });
 

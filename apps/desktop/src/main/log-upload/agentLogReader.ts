@@ -3,15 +3,30 @@
  *
  * 只在崩溃路径附带，且**只取 `source === 'proxy'` 的记录**：同一个文件里还有 `maker`
  * 源的启动期 / 全局基础设施日志，那些可能带 agent 提示词与用户内容。需求 §4.2 的措辞是
- * 「只取 proxy 的状态/耗时/错误，作崩溃上下文」，这里按字面执行。
+ * 「只取 proxy 的状态/耗时/错误，作崩溃上下文」。
+ *
+ * ⚠️ **「按字面执行」不能靠原样搬 `msg`**（2026-08-04 review P1）。proxy 自己会把请求体与
+ * 上游错误体写进日志上下文：
+ *
+ *   - `logger.debug('▶ inbound request from client', { …, body: dumpBody(rawBody) })`
+ *     —— `XDT_PROXY_DUMP_REQUEST_BODY=1` 时带**完整请求体**，对 anthropic-compat proxy
+ *     就是整个 prompt（对话正文 + 被读进上下文的文件内容）；
+ *   - `logger.warn('◀ upstream response (non-2xx)', { …, body: dumpBody(errBody) })`
+ *     —— 只要 debug 等级开着就带上游错误体，而它发在 **warn** 级，光按等级过滤挡不住。
+ *
+ * 而 `logger.emit()` 是 `util.format(...args)`，上下文对象会被**渲染进 `msg`**。所以拿整条
+ * `msg` 上报等于把这些 dump 一起带走。
+ *
+ * 因此 proxy 记录不走「整条正文 + 正则兜底」，而是**逐字段重建**：
+ *   1. 等级闸：只放行 info 及以上，debug / trace 整条丢（请求体 dump 就在 debug）；
+ *   2. 标记：取 `msg` 里渲染对象之前的那截字面量，截断到 `MAX_MARKER_CHARS`；
+ *   3. 字段白名单：只按 `PROXY_FIELDS` 的窄正则取回状态码 / 字节数 / 耗时这类标量，
+ *      `body` 这种不在名单里的键**根本没有出口**，与等级无关。
  *
  * 记录边界不需要哨兵：NDJSON 一行一条，边界由 JSON 行本身保证，不存在伪造记录头的问题。
- * 但字段白名单照样要做——NDJSON 里有 `sessionId` 等字段，不在白名单内一律不带出。
  */
 
 import { redact } from './redact';
-import { truncateMsg } from './mainLogReader';
-import { isAllowedScope } from './sourceAllowlist';
 import type { ParsedRecord } from './types';
 
 export interface ParseAgentLogOptions {
@@ -38,6 +53,52 @@ function isProxyScope(scope: string): boolean {
   return PROXY_SCOPE_ROOTS.some(
     (root) => scope === root || scope.startsWith(`${root}/`) || scope.startsWith(`${root}:`),
   );
+}
+
+/**
+ * 放行的等级。debug / trace 整条丢：proxy 的请求体 dump 就发在 debug，而调试级别本来也不是
+ * 「状态/耗时/错误」这层需要的东西。
+ */
+const ALLOWED_LEVELS: readonly string[] = ['info', 'warn', 'error', 'fatal'];
+
+/** 标记（渲染对象之前那截字面量）的长度上限。 */
+const MAX_MARKER_CHARS = 80;
+
+/**
+ * 可以带出的标量字段。**这是第四层字段白名单在 proxy 记录内部的延伸**：值必须匹配这里给的
+ * 窄形状才带出，不匹配就当没有；名单外的键（`body` / `prompt` / 任何将来新增的）没有出口。
+ *
+ * 形状写窄不是为了好看——用 `.*` 之类宽松模式取值，等于把「这个键的值安全」的判断让给了
+ * 写日志的人。这里每条都限定字符集与长度。
+ */
+const PROXY_FIELDS: ReadonlyArray<{ key: string; pattern: RegExp }> = [
+  { key: 'reqId', pattern: /\breqId:\s*'([A-Za-z0-9_-]{1,64})'/ },
+  { key: 'method', pattern: /\bmethod:\s*'(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)'/ },
+  { key: 'status', pattern: /\bstatus:\s*(\d{3})\b/ },
+  { key: 'bytes', pattern: /\bbytes:\s*(\d{1,12})\b/ },
+  { key: 'elapsedMs', pattern: /\belapsedMs:\s*(\d{1,12})\b/ },
+  { key: 'errorType', pattern: /\berrorType:\s*'([A-Za-z0-9_.-]{1,64})'/ },
+  { key: 'upstreamBase', pattern: /\bupstreamBase:\s*'([A-Za-z0-9_.:/-]{1,120})'/ },
+  { key: 'attempt', pattern: /\battempt:\s*(\d{1,4})\b/ },
+];
+
+/**
+ * 把一条 proxy 记录的 `msg` 重建成「标记 + 白名单标量」。
+ *
+ * 标记取渲染对象之前那一截（`util.format` 把上下文对象渲染成 `{ … }` 接在字面量后面），
+ * 因此对象里的任何值都不可能进标记。没有对象的纯字符串消息整条当标记，同样受长度上限与
+ * `redact()` 约束。
+ */
+function rebuildProxyMsg(msg: string, homeDir?: string): string {
+  const braceAt = msg.indexOf('{');
+  const markerRaw = (braceAt >= 0 ? msg.slice(0, braceAt) : msg).trim();
+  const marker = redact(markerRaw, homeDir).slice(0, MAX_MARKER_CHARS);
+  const fields: string[] = [];
+  for (const { key, pattern } of PROXY_FIELDS) {
+    const m = pattern.exec(msg);
+    if (m) fields.push(`${key}=${m[1]}`);
+  }
+  return fields.length > 0 ? `${marker} ${fields.join(' ')}`.trim() : marker;
 }
 
 /**
@@ -78,9 +139,15 @@ export function parseAgentLogText(
       droppedBySource += 1;
       continue;
     }
+    // 等级闸:debug / trace 整条丢(请求体 dump 就在 debug)。等级读不出来按 debug 处理 ——
+    // 未知等级不该比明确的 debug 更宽松。
+    const level = typeof rec.level === 'string' ? rec.level : 'debug';
+    if (!ALLOWED_LEVELS.includes(level)) {
+      droppedBySource += 1;
+      continue;
+    }
     const tsMs = typeof rec.ts === 'number' && Number.isFinite(rec.ts) ? rec.ts : Number.NaN;
     if (!Number.isFinite(tsMs)) continue;
-    const level = typeof rec.level === 'string' ? rec.level : 'info';
     const msg = typeof rec.msg === 'string' ? rec.msg : '';
 
     records.push({
@@ -90,7 +157,9 @@ export function parseAgentLogText(
       level,
       src: 'proxy',
       scope,
-      msg: truncateMsg(redact(msg, options.homeDir)),
+      // 逐字段重建,不搬原文 —— 理由见文件头。重建结果长度已被标记上限 + 白名单标量
+      // 共同封顶,不需要再走 truncateMsg。
+      msg: rebuildProxyMsg(msg, options.homeDir),
     });
   }
 
@@ -117,4 +186,12 @@ function localIsoWithOffset(tsMs: number): string {
   );
 }
 
-export const __testing = { PROXY_SCOPE_ROOTS, isProxyScope, localIsoWithOffset };
+export const __testing = {
+  PROXY_SCOPE_ROOTS,
+  ALLOWED_LEVELS,
+  PROXY_FIELDS,
+  MAX_MARKER_CHARS,
+  isProxyScope,
+  rebuildProxyMsg,
+  localIsoWithOffset,
+};

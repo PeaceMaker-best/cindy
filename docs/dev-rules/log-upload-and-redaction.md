@@ -113,6 +113,25 @@ override 语义见 [`configuration-and-overrides.md`](configuration-and-override
 `agent-<date>.ndjson` 只在崩溃路径附带，且**只取 `source === 'proxy'` 且 scope 落在 proxy 根下
 的记录**（双闸）。同一文件里还有 `maker` 源的日志，那些可能带 agent 提示词与用户内容。
 
+⚠️ **proxy 记录不能原样搬 `msg`，必须逐字段重建**（2026-08-04 review P1）。proxy 自己会把
+请求体与上游错误体写进日志上下文：
+
+- `logger.debug('▶ inbound request from client', { …, body: dumpBody(rawBody) })` ——
+  `XDT_PROXY_DUMP_REQUEST_BODY=1` 时带**完整请求体**，对 anthropic-compat proxy 就是整个
+  prompt（对话正文 + 被读进上下文的文件内容）；
+- `logger.warn('◀ upstream response (non-2xx)', { …, body: dumpBody(errBody) })` ——
+  只要 debug 等级开着就带上游错误体，而它发在 **warn** 级，**光按等级过滤挡不住**。
+
+而 `logger.emit()` 是 `util.format(...args)`，上下文对象会被渲染进 `msg`。所以三道一起上，
+缺一不可（`agentLogReader.ts`）：
+
+1. **等级闸**：只放行 info 及以上；等级缺失或不认识按 debug 处理（未知不该比明确的 debug 宽松）；
+2. **标记截断**：只取 `msg` 里渲染对象之前那截字面量（对象里的值因此不可能进标记），截断；
+3. **标量字段白名单**：`PROXY_FIELDS` 逐个键配窄正则取值，`body` 这类名单外的键**没有出口**，
+   与等级无关。形状写窄是要点——用 `.*` 取值等于把「这个值安全」的判断让给写日志的人。
+
+新增可带出的 proxy 字段等同于放宽隐私边界：要论证该键在 debug 打开时也不可能承载用户内容。
+
 脱敏规则**只增不减**：放宽任何一条（缩小匹配范围、提高最小长度、去掉某个形态）都视为隐私
 变更，需要重新评审。按**形态**写规则而不是按厂商——厂商清单永远滞后于新出现的 key 形态。
 
@@ -215,7 +234,8 @@ main/log-upload/logUploadTarget.ts         ← 解析 + 区域交叉校验;不�
 2. 给来源白名单加了条目吗？理由写清楚了吗？该来源在 debug 级别会不会打用户输入？
 3. 脱敏规则有没有被放宽（范围缩小 / 长度门槛提高 / 形态删除）？放宽属隐私变更，需重新评审。
 4. 新增了从本地日志读取的路径吗？会不会碰到 `sessions/**` 或 `*cc-debug.raw.log`？
-5. 第四层字段白名单是否仍然只带出那五个字段？新增字段有没有论证过安全性？
+5. 第四层字段白名单是否仍然只带出那五个字段？新增字段有没有论证过安全性？proxy 记录是否仍然
+   **逐字段重建**（等级闸 + 标记截断 + `PROXY_FIELDS` 白名单），没有退回「搬整条 msg」？
 6. 标记的清除是否仍然「只在成功且非空时」且「只清自己那一代」？授权关闭是否清空全部（含
    claim 文件）？
 7. 崩溃时刻新增的动作是否仍然同步且极短、没有进 `onQuit`？

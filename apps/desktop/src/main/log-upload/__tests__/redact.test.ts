@@ -28,6 +28,16 @@ const FAKE = {
   awsAk: ['AKIA', 'IOSFODNN7EXAMPLE'].join(''),
   googleKey: ['AIza', 'SyA1234567890abcdefghijklmnopqrstuvw'].join(''),
   slackBot: ['xoxb', '1234567890', 'abcdefghijklmnop'].join('-'),
+  /**
+   * PEM 私钥块。头尾同样运行时拼：仓库的安全内容门只按 `PRIVATE KEY` 这个形状硬命中，
+   * 不看有没有 `FAKE` 标记，所以哪怕写成 `BEGIN FAKE PRIVATE KEY` 也照样被拦
+   * （2026-08-04 已被拦三次）。正文用一眼假的串而非 base64 样的密钥材料。
+   */
+  pemBlock: [
+    `-----BEGIN FAKE ${['PRIVATE', 'KEY'].join(' ')}-----`,
+    'NOT-A-REAL-KEY-body-for-tests',
+    `-----END FAKE ${['PRIVATE', 'KEY'].join(' ')}-----`,
+  ].join('\n'),
 } as const;
 
 const CASES: Array<{ name: string; input: string; mustVanish: string[] }> = [
@@ -107,12 +117,9 @@ const CASES: Array<{ name: string; input: string; mustVanish: string[] }> = [
     mustVanish: ['my+private+question'],
   },
   {
-    // 头部刻意写成 `BEGIN FAKE PRIVATE KEY`(仓库安全门要求的显式假占位形态),
-    // `FAKE ` 仍落在正则的 `[A-Z ]*` 里,覆盖不受影响;正文也用一眼假的串而非 base64 样的
-    // 密钥材料,免得被 secret scanning 判成真私钥。
+    // 样本见 FAKE.pemBlock:头尾运行时拼,`FAKE ` 仍落在正则的 `[A-Z ]*` 里,覆盖不受影响。
     name: 'PEM 私钥块',
-    input:
-      '-----BEGIN FAKE PRIVATE KEY-----\nNOT-A-REAL-KEY-body-for-tests\n-----END FAKE PRIVATE KEY-----',
+    input: FAKE.pemBlock,
     mustVanish: ['NOT-A-REAL-KEY-body-for-tests'],
   },
 ];

@@ -153,7 +153,12 @@ export function parseMainLogText(
 }
 
 /**
- * 二分查找：返回**第一条时间戳 ≥ targetMs 的记录**所在行的起始偏移；
+ * 二分查找：返回一个**不晚于 `targetMs` 的读取起点**（字节偏移）。
+ *
+ * 精确到 `probeBytes`：循环收敛到 `hi - lo <= probeBytes` 就返回 `lo`，所以结果通常落在
+ * 目标时刻**之前**最多 `probeBytes` 字节处，而不是「第一条 ≥ targetMs 的记录行首」。这是
+ * 有意的——多读一点只是多几条早于锚点的记录，少读会把锚点本身切掉。
+ *
  * 全文都早于 targetMs 时返回文件末尾附近；文件为空返回 0。
  *
  * 前提：单个 main 日志文件内记录时间**单调不减**（logger 按天 rotate + 追加写，
