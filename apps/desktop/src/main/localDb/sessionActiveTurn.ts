@@ -489,7 +489,7 @@ export async function getRecoveryContextSnapshot(
       .select({ role: messages.role, content: messages.content })
       .from(messages)
       .where(visibleProgress)
-      .orderBy(desc(messages.createdAt))
+      .orderBy(desc(messages.createdAt), desc(sql.raw('"messages"."rowid"')))
       .limit(6),
   ]);
 
@@ -533,6 +533,7 @@ function summarizeRecoveryContent(raw: string): string {
         if (!part || typeof part !== 'object') return '';
         const record = part as Record<string, unknown>;
         if (typeof record.text === 'string') return record.text;
+        if (typeof record.toolName === 'string') return `tool ${record.toolName}`;
         if (typeof record.name === 'string') return `tool ${record.name}`;
         return '';
       })
@@ -540,7 +541,8 @@ function summarizeRecoveryContent(raw: string): string {
       .join(' ');
   } else if (value && typeof value === 'object') {
     const record = value as Record<string, unknown>;
-    if (typeof record.name === 'string') summary = `tool ${record.name}`;
+    if (typeof record.toolName === 'string') summary = `tool ${record.toolName}`;
+    else if (typeof record.name === 'string') summary = `tool ${record.name}`;
     else if (typeof record.text === 'string') summary = record.text;
     else if (typeof record.summary === 'string') summary = record.summary;
     else if (typeof record.command === 'string') summary = `command ${record.command}`;

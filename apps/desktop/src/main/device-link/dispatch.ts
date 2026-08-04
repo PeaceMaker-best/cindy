@@ -1820,9 +1820,11 @@ function markRemoteRowsTrimmed(messages: unknown[], originalCount: number): unkn
 }
 
 function mergeRemoteAgentMeta(agentMeta: unknown, patch: Record<string, unknown>): Record<string, unknown> {
-  return agentMeta && typeof agentMeta === 'object' && !Array.isArray(agentMeta)
-    ? { ...(agentMeta as Record<string, unknown>), ...patch }
-    : { ...patch };
+  if (!agentMeta || typeof agentMeta !== 'object' || Array.isArray(agentMeta)) {
+    return { ...patch };
+  }
+  const { recoveryCheckpoint: _, ...safe } = agentMeta as Record<string, unknown>;
+  return { ...safe, ...patch };
 }
 
 function compactRemoteMessageContent(content: unknown, limit: number): unknown {

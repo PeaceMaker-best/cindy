@@ -1857,6 +1857,19 @@ export class AgentInputCoordinator {
               sessionId,
               recovery.item.clientId,
             );
+            // Revalidate after the second await: the snapshot read may race
+            // enqueue/clearError/session close that cancel the recovery intent.
+            const stateAfterSnapshot = this.getState(sessionId);
+            if (stateAfterSnapshot.recovery !== recovery) {
+              return { projection: this.getProjection(sessionId), outcome: 'superseded' };
+            }
+            if (
+              opts?.auto &&
+              (!stateAfterSnapshot.autoResumePending ||
+                stateAfterSnapshot.autoResumeAttemptToken !== attemptToken)
+            ) {
+              return { projection: this.getProjection(sessionId), outcome: 'superseded' };
+            }
             recoveryCheckpoint = buildRecoveryCheckpoint(
               opts?.auto ? 'automatic' : 'manual',
               recovery.item.clientId,
