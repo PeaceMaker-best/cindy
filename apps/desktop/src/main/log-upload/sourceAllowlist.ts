@@ -166,6 +166,23 @@ function isUnderRoot(scope: string, root: string): boolean {
 }
 
 /**
+ * 排除表匹配 —— 分隔符无关（2026-08-04 review copilot）。
+ *
+ * 仓库里 `/` 与 `:` 两种子 scope 分隔符都在用（`localDb/messages` 用 `/`、`device-link:ipc`
+ * 用 `:`）。排除表按写出来的那一种存,但匹配时必须两种都认:否则一条以 `localDb/messages`
+ * 形式列入的排除项挡不住 `localDb:messages`——万一将来有人把 `localDb` 重新加回根放行,这条
+ * 「纵深防御」就形同虚设。把两侧的 `:` 归一成 `/` 再比,`localDb:messages` 与 `localDb/messages`
+ * 就是同一个东西。
+ */
+function matchesDeniedSubScope(scope: string): boolean {
+  const norm = scope.replace(/:/g, '/');
+  for (const denied of DENIED_SUB_SCOPES) {
+    if (isUnderRoot(norm, denied.replace(/:/g, '/'))) return true;
+  }
+  return false;
+}
+
+/**
  * 判定一条记录的 scope 是否放行。
  *
  * 顺序有意义：先看排除表（放行根下的危险子来源），再看放行表。反过来会让
@@ -173,9 +190,7 @@ function isUnderRoot(scope: string, root: string): boolean {
  */
 export function isAllowedScope(scope: string): boolean {
   if (!scope) return false;
-  for (const denied of DENIED_SUB_SCOPES) {
-    if (isUnderRoot(scope, denied)) return false;
-  }
+  if (matchesDeniedSubScope(scope)) return false;
   // 精确匹配优先于根匹配:这些 scope 的子 scope 不跟着放行(见 ALLOWED_EXACT_SCOPES)。
   if (ALLOWED_EXACT_SCOPES.includes(scope)) return true;
   for (const root of ALLOWED_ROOT_SCOPES) {
@@ -189,4 +204,5 @@ export const __testing = {
   ALLOWED_EXACT_SCOPES,
   DENIED_SUB_SCOPES,
   NOTABLE_DENIED_ROOTS,
+  matchesDeniedSubScope,
 };

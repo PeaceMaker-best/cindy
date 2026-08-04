@@ -115,6 +115,31 @@ describe('排除表优先于放行表', () => {
   it('被排除的子 scope 其更深层也被拦', () => {
     expect(isAllowedScope('device-link:mediaFetch/inner')).toBe(false);
   });
+
+  /**
+   * 2026-08-04 review copilot：排除表匹配必须**分隔符无关**。仓库里 `/` 与 `:` 两种子 scope
+   * 分隔符都在用,排除项按写出来的那一种存,但两种形式都得挡住 —— 否则这张「纵深防御」表在
+   * 「有人把某个根重新加回根放行」时会被另一种分隔符绕过。直接测匹配谓词,不依赖当前恰好是
+   * 精确放行这个偶然。
+   */
+  it('⚠️ 排除匹配分隔符无关：每个排除项的 / 与 : 两种形式都命中', () => {
+    for (const denied of __testing.DENIED_SUB_SCOPES) {
+      const slash = denied.replace(/:/g, '/');
+      const colon = denied.replace(/\//g, ':');
+      expect(__testing.matchesDeniedSubScope(slash)).toBe(true);
+      expect(__testing.matchesDeniedSubScope(colon)).toBe(true);
+      // 更深一层同样命中(两种分隔符)。
+      expect(__testing.matchesDeniedSubScope(`${slash}/inner`)).toBe(true);
+      expect(__testing.matchesDeniedSubScope(`${colon}:inner`)).toBe(true);
+    }
+  });
+
+  it('⚠️ 假设 localDb 被误加回根放行，localDb:messages（冒号形式）仍被排除表挡住', () => {
+    // 现在 localDb 是精确放行,localDb:messages 本就不放行;这条锁的是纵深防御本身 ——
+    // 排除表对冒号形式也生效,不靠「恰好精确放行」。
+    expect(__testing.matchesDeniedSubScope('localDb:messages')).toBe(true);
+    expect(__testing.matchesDeniedSubScope('localDb/messages')).toBe(true);
+  });
 });
 
 /**
