@@ -60,6 +60,7 @@ import { attachSessionReferenceMetadata } from '../../shared/sessionReferenceMet
 import {
   appendRecoveryCheckpointPrompt,
   buildRecoveryCheckpoint,
+  RECOVERY_CHECKPOINT_MARKER,
   type RecoveryContextSnapshot,
 } from './recoveryCoordinator.js';
 
@@ -2605,6 +2606,12 @@ export class AgentInputCoordinator {
     // renderer/device-link payload. Keep the projection minimal and avoid
     // echoing transcript-derived summaries to remote controllers.
     delete projected.recoveryCheckpoint;
+    if (typeof projected.text === 'string' && projected.text.includes(RECOVERY_CHECKPOINT_MARKER)) {
+      projected.text = projected.text.slice(0, projected.text.indexOf(RECOVERY_CHECKPOINT_MARKER));
+    }
+    if (typeof projected.persistedContent === 'string' && projected.persistedContent.includes(RECOVERY_CHECKPOINT_MARKER)) {
+      projected.persistedContent = projected.persistedContent.slice(0, projected.persistedContent.indexOf(RECOVERY_CHECKPOINT_MARKER));
+    }
     return projected;
   }
 

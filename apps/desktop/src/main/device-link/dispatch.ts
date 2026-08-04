@@ -73,6 +73,7 @@ import { createOfflinePushQueue } from './offlinePushQueue';
 import * as subscriptions from './subscriptions';
 import { LEGACY_TOPIC, type ActiveController } from './subscriptions';
 import { MAKER_PUSH } from '../maker-ipc/channels.js';
+import { RECOVERY_CHECKPOINT_MARKER } from '../maker-ipc/recoveryCoordinator.js';
 import { projectInteractionRequestForRemote } from '../cindy-brain/ghostSetupInteractionBridge.js';
 import {
   remoteWorkingDirRejectionToIpcError,
@@ -1860,8 +1861,6 @@ function mergeRemoteAgentMeta(agentMeta: unknown, patch: Record<string, unknown>
   const { recoveryCheckpoint: _, ...safe } = agentMeta as Record<string, unknown>;
   return { ...safe, ...patch };
 }
-
-const RECOVERY_CHECKPOINT_MARKER = '\n\n[CINDY_RECOVERY_CHECKPOINT v1]';
 
 function stripRecoveryCheckpointFromMessage(record: Record<string, unknown>): Record<string, unknown> {
   const agentMeta = record.agentMeta;
