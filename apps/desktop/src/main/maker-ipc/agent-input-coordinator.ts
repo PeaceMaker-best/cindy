@@ -1885,6 +1885,20 @@ export class AgentInputCoordinator {
               sessionId,
               error: errorMessage(err),
             });
+            // Revalidate after the failed await: user may have sent a new
+            // message, cleared the error, or closed the session while the
+            // snapshot read was failing.
+            const stateAfterCatch = this.getState(sessionId);
+            if (stateAfterCatch.recovery !== recovery) {
+              return { projection: this.getProjection(sessionId), outcome: 'superseded' };
+            }
+            if (
+              opts?.auto &&
+              (!stateAfterCatch.autoResumePending ||
+                stateAfterCatch.autoResumeAttemptToken !== attemptToken)
+            ) {
+              return { projection: this.getProjection(sessionId), outcome: 'superseded' };
+            }
           }
         }
         const clientId = crypto.randomUUID();
