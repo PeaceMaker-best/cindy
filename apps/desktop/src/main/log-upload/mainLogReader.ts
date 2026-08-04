@@ -4,8 +4,8 @@
  * 三件事：
  *  1. **记录边界识别**（`MAIN_LOG_RECORD_HEAD_RE`）—— 与写侧的续行转义是同一条安全
  *     不变量的两半，见 `shared/mainLogRecordFormat.ts`；
- *  2. **哨兵之前的内容一律丢弃** —— 转义引入之前写下的日志没有转义，其中可能含伪造的
- *     记录头；哨兵把「这段内容由哪个版本写的」变成文件内可判定的事实；
+ *  2. **未转义的存量文件整份丢弃** —— 转义引入之前写下的日志没有转义，其中可能含伪造的
+ *     记录头。判据是「文件第 0 字节就是格式哨兵」，见 `startsWithFormatSentinel`；
  *  3. **定位读取**（`findOffsetAtOrBefore`）—— 单文件超过字节预算时不能简单读尾部，
  *     崩溃后堆积的新日志会把崩溃现场挤出窗口。main 日志按天单文件内时间严格递增且每条
  *     记录首行自带可解析时间戳，因此可以二分查找到崩溃锚点附近的字节偏移。
@@ -37,13 +37,14 @@ export interface ParseMainLogOptions {
    */
   fromFileStart: boolean;
   /**
-   * 是否已经在**本文件更早的位置**见过哨兵。
+   * 本文件是否**整份**由带续行转义的版本写成（= 第 0 字节就是格式哨兵）。
+   * 由调用方用 `startsWithFormatSentinel()` 判定后传入。
    *
-   * 定位读取会跳过文件开头（哨兵通常就在那里），所以偏移读取时不能要求「窗口内必须
-   * 再出现一次哨兵」——那会让崩溃补传恒采到 0 条。调用方按「窗口起点之前是否存在哨兵」
-   * 传入（见 `readMainLogRecords`）。
+   * false 表示文件里含（或可能含）未转义的存量内容 —— 一条也不产出。不做「哨兵之后
+   * 才信」的细分：哨兵行的形状由正文可以逐字构造，未转义正文里嵌一行伪造哨兵就能开闸
+   * （2026-08-04 review P1）。文件级 all-or-nothing 才是能自证的判据。
    */
-  sentinelAlreadySeen: boolean;
+  escapedFormat: boolean;
   /** 用于抹掉真实用户名（见 redact）。 */
   homeDir?: string;
 }
@@ -52,8 +53,6 @@ export interface ParseMainLogResult {
   records: ParsedRecord[];
   linesScanned: number;
   droppedBySource: number;
-  /** 本窗口内是否出现过哨兵（供调用方级联判断）。 */
-  sawSentinel: boolean;
 }
 
 interface PendingRecord {
@@ -85,10 +84,15 @@ export function parseMainLogText(
   text: string,
   options: ParseMainLogOptions,
 ): ParseMainLogResult {
+  // 未转义的存量文件:一条也不产出。调用方本应连窗口都不读(见 collect.ts),这里是同一条
+  // 判据的第二道 —— 参数忘了传对时失败方向必须是「少传」。
+  if (!options.escapedFormat) {
+    return { records: [], linesScanned: 0, droppedBySource: 0 };
+  }
+
   const records: ParsedRecord[] = [];
   let linesScanned = 0;
   let droppedBySource = 0;
-  let sawSentinel = options.sentinelAlreadySeen;
   let pending: PendingRecord | null = null;
 
   const flush = (): void => {
@@ -96,12 +100,8 @@ export function parseMainLogText(
     const current = pending;
     pending = null;
     const rawMsg = current.lines.join('\n');
-    if (isSentinel(current.scope, rawMsg)) {
-      sawSentinel = true;
-      return; // 哨兵本身不上报
-    }
-    // 哨兵之前的内容一律丢弃(可能是未转义的旧格式)。
-    if (!sawSentinel) return;
+    // 哨兵记录本身不上报(它不是信任凭据,只是一行标记 —— 信任来自 escapedFormat)。
+    if (isSentinel(current.scope, rawMsg)) return;
     // 第二层:来源白名单。deny-by-default,未知来源直接丢。
     if (!isAllowedScope(current.scope)) {
       droppedBySource += 1;
@@ -140,7 +140,7 @@ export function parseMainLogText(
       };
       continue;
     }
-    // 续行:并入当前记录。没有当前记录(窗口第一行就是续行,或哨兵前的残留)则丢弃。
+    // 续行:并入当前记录。没有当前记录(窗口第一行就是续行)则丢弃。
     if (pending) pending.lines.push(line);
   }
   flush();
@@ -149,7 +149,6 @@ export function parseMainLogText(
     records: records.filter((r) => Number.isFinite(r.tsMs)),
     linesScanned,
     droppedBySource,
-    sawSentinel,
   };
 }
 
@@ -206,45 +205,41 @@ async function firstRecordTimestampAt(
 }
 
 /**
- * 文件内首个格式哨兵**记录**的结束字节偏移；找不到返回 null。
+ * 文件**第一行**是否就是格式哨兵 —— 即「整份文件都由带续行转义的版本写成」。
+ * 这是本文件唯一的信任凭据；false ⇒ 整份文件不上报。
  *
- * 只读文件开头一小段：哨兵由 logger 在打开当天文件时立刻写入，正常情况下就在文件最前面
- * （同一天多次启动会有多个哨兵，认第一个）。读不到就按「未见过哨兵」处理，让窗口内自己
- * 去找——最坏结果是这一天采不到内容，而不是把旧格式内容放出去。
+ * ## 为什么判据是「第 0 字节」而不是「文件里出现过哨兵」
  *
- * ⚠️ 必须按**完整记录头 + 哨兵正文**校验整行，不能拿哨兵串去 `indexOf` 搜任意位置
- * （2026-08-04 review 指出的隐私逃逸路径）：升级前的未转义正文里只要出现
- * `[logger] #cindy-log-format:2` 这段文字（用户对话内容完全可以包含它），子串匹配就会把
- * 那一行认成哨兵、置位 `sentinelAlreadySeen`，于是它后面被封禁来源里伪造的放行记录头
- * 全部绕过「哨兵之前一律丢弃」这道闸被上传。
+ * 哨兵行的形状（记录头 + `[logger]` + 固定串）**完全由日志正文可以逐字构造**。只要判据是
+ * 「出现过」，未转义的存量文件里就能嵌一行伪造哨兵、随后跟若干伪造的放行 scope 记录头，
+ * 把对话正文当基础设施日志送出去（2026-08-04 review P1；此前按整行精确校验也只是让伪造
+ * 变麻烦，没有消除它）。
  *
- * 偏移必须按**字节**算：调用方拿它和 `startOffset`（字节）比较，而日志正文里有大量中文，
- * 字符下标与字节偏移不是一回事——用 `text.indexOf` 的字符下标当字节偏移会偏小，
- * 让「哨兵在窗口起点之前」的判断偏向误判为真。
+ * 而第 0 字节不可能是正文：
+ *  - 新版本新建当天文件后的第一次写入就是哨兵（`logger.ensureDailySlot`）；
+ *  - 旧版本写的文件，第 0 字节是它自己那条真实记录的记录头，旧版本从不写这个串。
  *
- * 只认**完整的**哨兵行（后面必须有换行符落在缓冲区内）：headBytes 边界可能把行截断，
- * 半行不该被当成哨兵。
+ * ## 代价（有意接受）
+ *
+ * 跨越升级那一刻的当天文件（前半段是旧版本写的、后半段追加在哨兵之后）整份不可上报。
+ * 只影响**每台机器升级当天的那一个文件**：更早的纯存量文件本来就一条都不放行，之后的
+ * 文件哨兵都在第 0 字节。用一天的可观测性换掉一条无法自证的信任链，值得。
+ *
+ * ## 实现约束
+ *
+ * 只认**完整**的第一行（缓冲区内必须出现 `\n`）：读取长度边界可能把行截断，半行不算。
+ * 哨兵行长度固定在 ~60 字节，`headBytes` 只需覆盖一行。
  */
-export async function sentinelOffset(
+export async function startsWithFormatSentinel(
   file: RandomAccessFile,
-  headBytes = 64 * 1024,
-): Promise<number | null> {
+  headBytes = 512,
+): Promise<boolean> {
   const buf = await file.read(0, headBytes);
-  if (buf.length === 0) return null;
+  if (buf.length === 0) return false;
   const text = buf.toString('utf8');
-  let byteOffset = 0;
-  const lines = text.split('\n');
-  for (let i = 0; i < lines.length; i += 1) {
-    const rawLine = lines[i];
-    // 该行连同它的 '\n' 占多少字节;最后一段没有 '\n'(split 的产物),不计。
-    const isLastSegment = i === lines.length - 1;
-    const lineBytes = Buffer.byteLength(rawLine, 'utf8') + (isLastSegment ? 0 : 1);
-    if (!isLastSegment && isSentinelLine(rawLine.replace(/\r$/, ''))) {
-      return byteOffset + lineBytes;
-    }
-    byteOffset += lineBytes;
-  }
-  return null;
+  const nl = text.indexOf('\n');
+  if (nl < 0) return false;
+  return isSentinelLine(text.slice(0, nl).replace(/\r$/, ''));
 }
 
 /** 整行是否**就是**一条哨兵记录：合法记录头 + scope 为 logger + 正文恰好是哨兵串。 */

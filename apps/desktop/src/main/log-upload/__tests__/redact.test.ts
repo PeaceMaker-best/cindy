@@ -6,7 +6,7 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { homeUserName, redact } from '../redact';
+import { __testing, homeUserName, redact } from '../redact';
 
 /** 表驱动：输入 → 必须消失的子串。 */
 /**
@@ -177,6 +177,52 @@ describe('redact', () => {
   it('规则是无状态的：同一输入连续跑两次结果一致（正则 lastIndex 不串）', () => {
     const input = `token=${FAKE.jwt} and again ${FAKE.skAnt}`;
     expect(redact(input)).toBe(redact(input));
+  });
+
+  /**
+   * 2026-08-04 review P1 的回归锁：`sensitive-field-kv` 的值取到空白为止，遇到
+   * `token=Bearer <opaque>` 只抹掉 `Bearer` 这个词；而独立的 `bearer` 规则排在它之后，
+   * 等它跑到时 `Bearer` 前缀已被替换、正则再也匹配不上——凭证本体于是全程无人处理。
+   * 现在由 `sensitive-field-auth-scheme` 在 kv 规则之前把「字段名 + scheme」一路抹到行尾。
+   */
+  describe('⚠️ 敏感字段名后面跟鉴权 scheme：凭证本体必须一起抹掉', () => {
+    const OPAQUE = 'AbCdEf0123456789opaqueTokenBody';
+    const FIELD_FORMS = [
+      `authorization=Bearer ${OPAQUE}`,
+      `token: Bearer ${OPAQUE}`,
+      `access_token=Bearer ${OPAQUE}`,
+      `credential=Basic ${OPAQUE}`,
+      `secret: Token ${OPAQUE}`,
+      `api_key=ApiKey ${OPAQUE}`,
+      // scheme 大小写不敏感;凭证本体带 `.` `_` `-` 等 kv 值字符集之外的分隔符也要覆盖。
+      `token=bearer ${OPAQUE}.sig_part-2`,
+    ];
+
+    it.each(FIELD_FORMS)('%s', (input) => {
+      const out = redact(`req failed: ${input}`);
+      expect(out).not.toContain(OPAQUE);
+    });
+
+    it('AWS4-HMAC-SHA256 这类带逗号空格的凭证也整段抹掉（分隔符处收手就会漏）', () => {
+      const out = redact(
+        `authorization=AWS4-HMAC-SHA256 Credential=${FAKE.awsAk}/20260804, Signature=${OPAQUE}`,
+      );
+      expect(out).not.toContain(OPAQUE);
+      expect(out).not.toContain(FAKE.awsAk);
+    });
+
+    it('规则顺序被写死：auth-scheme 必须排在 sensitive-field-kv 之前', () => {
+      const names = __testing.RULES.map((r) => r.name);
+      expect(names.indexOf('sensitive-field-auth-scheme')).toBeLessThan(
+        names.indexOf('sensitive-field-kv'),
+      );
+    });
+
+    it('不误伤没有 scheme 的普通 kv（值仍按原规则取到空白为止）', () => {
+      const out = redact('update check: token=abc123 channel=stable elapsed=812ms');
+      expect(out).toContain('channel=stable');
+      expect(out).toContain('elapsed=812ms');
+    });
   });
 });
 

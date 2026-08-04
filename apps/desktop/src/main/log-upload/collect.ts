@@ -22,7 +22,7 @@ import { parseAgentLogText } from './agentLogReader';
 import {
   findOffsetAtOrBefore,
   parseMainLogText,
-  sentinelOffset,
+  startsWithFormatSentinel,
   type RandomAccessFile,
 } from './mainLogReader';
 import type { CollectResult, CollectStats, ParsedRecord, UploadRecord } from './types';
@@ -159,6 +159,7 @@ export async function collectLogs(
     kept: 0,
     droppedBySource: 0,
     droppedByCap: 0,
+    filesSkippedLegacyFormat: 0,
     lookbackDays,
   };
   const all: ParsedRecord[] = [];
@@ -172,6 +173,14 @@ export async function collectLogs(
     try {
       const size = await file.size();
       if (size <= 0) continue;
+
+      // 未转义的存量 main 文件整份跳过(判据见 startsWithFormatSentinel)。放在读窗口之前:
+      // 既省掉一次大块读,也让「跳过」这件事只有一处判定。
+      if (plan.kind === 'main' && !(await startsWithFormatSentinel(file))) {
+        stats.filesSkippedLegacyFormat += 1;
+        continue;
+      }
+
       const perFileBudget = Math.min(MAX_BYTES_PER_FILE, budget);
 
       // ── 定位读取 ──────────────────────────────────────────────────────────
@@ -190,14 +199,6 @@ export async function collectLogs(
         fromFileStart = false;
       }
 
-      // 哨兵在文件开头。窗口从中间切进来时,要先确认哨兵在窗口起点**之前**已经出现过,
-      // 否则窗口内找不到哨兵会把整段内容丢掉(崩溃补传恒采到 0 条)。
-      let sentinelAlreadySeen = false;
-      if (plan.kind === 'main' && startOffset > 0) {
-        const at = await sentinelOffset(file);
-        sentinelAlreadySeen = at !== null && at <= startOffset;
-      }
-
       const buf = await file.read(startOffset, perFileBudget);
       if (buf.length === 0) continue;
       stats.filesRead += 1;
@@ -208,7 +209,8 @@ export async function collectLogs(
       if (plan.kind === 'main') {
         const parsed = parseMainLogText(text, {
           fromFileStart,
-          sentinelAlreadySeen,
+          // 走到这里说明第 0 字节就是哨兵(上面已 continue 掉不是的)。
+          escapedFormat: true,
           homeDir: deps.homeDir,
         });
         all.push(...parsed.records);

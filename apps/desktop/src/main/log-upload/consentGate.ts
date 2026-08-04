@@ -3,7 +3,8 @@
  *
  * 关键约束：
  *  - **手动上传**只要求「已配置目标 + 已同意《隐私政策》」。点击按钮本身即用户对这一次
- *    上传的意图，**不看「使用统计」开关**——那是行为埋点的偏好，与排障上传不是一件事。
+ *    上传的意图，**不看「使用统计」开关**——那是行为埋点的偏好，与排障上传不是一件事；
+ *    也**不读「崩溃时自动上传」开关**（连读都不读，见下方注释）。
  *  - **自动上传（崩溃）**额外要求用户显式开启了「崩溃时自动上传」，该开关默认关闭。
  *  - **授权判定必须读到最新值**：开发版与正式版共享同一份 userData，用户可能在另一个实例
  *    里刚刚关掉授权。所以每次判定前先让持久层现读盘（`refreshFromDisk`），不能用进程内的
@@ -41,7 +42,10 @@ export interface ConsentGateDeps {
   refreshFromDisk(): void;
   /** 已明示同意《隐私政策》。读不出来时抛异常，不要返回 false（那会被当成明确拒绝）。 */
   readPrivacyConsentAccepted(): boolean;
-  /** 「崩溃时自动上传」开关。同上，读不出来抛异常。 */
+  /**
+   * 「崩溃时自动上传」开关。同上，读不出来抛异常。
+   * 只在自动路径上被调用——手动路径不看这个开关，所以也不该被它的读取故障牵连。
+   */
   readCrashAutoUploadEnabled(): boolean;
 }
 
@@ -50,19 +54,26 @@ export function evaluateGate(deps: ConsentGateDeps, reason: LogUploadReason): Ga
   if (!deps.isTargetConfigured()) return { kind: 'denied', reason: 'not-configured' };
 
   let consented: boolean;
-  let crashAutoEnabled: boolean;
   try {
     deps.refreshFromDisk();
     consented = deps.readPrivacyConsentAccepted();
+  } catch {
+    return { kind: 'unknown' };
+  }
+  if (!consented) return { kind: 'denied', reason: 'no-consent' };
+
+  // 手动路径到此为止:**不读崩溃开关**。读了就得处理它读不出来的情况,而那会让
+  // 「崩溃自动上传偏好文件损坏」把用户主动点的上传也一起堵掉 —— 恰好是用户最需要交日志的
+  // 时候(2026-08-04 review P2)。手动上传的放行条件里本来就没有这个开关。
+  if (reason === 'manual') return { kind: 'allowed' };
+
+  let crashAutoEnabled: boolean;
+  try {
     crashAutoEnabled = deps.readCrashAutoUploadEnabled();
   } catch {
     return { kind: 'unknown' };
   }
-
-  if (!consented) return { kind: 'denied', reason: 'no-consent' };
-  if (reason !== 'manual' && !crashAutoEnabled) {
-    return { kind: 'denied', reason: 'crash-auto-off' };
-  }
+  if (!crashAutoEnabled) return { kind: 'denied', reason: 'crash-auto-off' };
   return { kind: 'allowed' };
 }
 

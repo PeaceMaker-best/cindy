@@ -36,6 +36,7 @@ function collected(records: UploadRecord[]): CollectResult {
     stats: {
       filesRead: 1,
       bytesRead: 100,
+      filesSkippedLegacyFormat: 0,
       linesScanned: records.length,
       kept: records.length,
       droppedBySource: 0,

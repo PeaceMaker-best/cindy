@@ -184,6 +184,77 @@ describe('第一层源白名单：会话目录与调试原文永不被打开', (
   });
 });
 
+/**
+ * 「整份文件的格式信任」这条判据的锁（2026-08-04 review）。判据 = 第 0 字节就是格式哨兵。
+ * 两个方向都要锁住：不满足时一条都不产出，满足时不受文件大小与读窗口位置影响。
+ */
+describe('格式信任：只信第 0 字节就是哨兵的 main 文件', () => {
+  const logDir = path.join('/tmp', 'cindy-logs');
+
+  it('没有哨兵的存量文件整份跳过，并单独计数', async () => {
+    const today = dayKey(NOW);
+    const { deps } = harness({
+      [path.join(logDir, `main-${today}.log`)]: [
+        mainLine(NOW - 40_000, 'INFO ', 'lifecycle', 'legacy infra record'),
+        mainLine(NOW - 30_000, 'FATAL', 'process', 'legacy crash record'),
+      ].join('\n'),
+    });
+
+    const result = await collectLogs(deps, { reason: 'manual', anchors: [] });
+
+    expect(result.records).toHaveLength(0);
+    expect(result.stats.filesSkippedLegacyFormat).toBe(1);
+  });
+
+  it('哨兵在第 0 字节、但被封禁来源在中段伪造了一行哨兵 ⇒ 正常按转义格式解析', async () => {
+    const today = dayKey(NOW);
+    const { deps } = harness({
+      [path.join(logDir, `main-${today}.log`)]: [
+        SENTINEL,
+        // 被封禁来源的多行正文,续行已转义 ⇒ 伪造哨兵只是续行,不影响任何判定。
+        mainLine(
+          NOW - 40_000,
+          'DEBUG',
+          'voice-input:recorder',
+          `draft: 私密内容\n${SENTINEL}\n${mainLine(NOW - 39_000, 'INFO ', 'lifecycle', '伪造记录')}`,
+        ),
+        mainLine(NOW - 30_000, 'INFO ', 'lifecycle', 'real infra record'),
+      ].join('\n'),
+    });
+
+    const result = await collectLogs(deps, { reason: 'manual', anchors: [] });
+
+    expect(result.records.map((r) => r.msg)).toEqual(['real infra record']);
+    expect(JSON.stringify(result.records)).not.toContain('私密内容');
+    expect(result.stats.filesSkippedLegacyFormat).toBe(0);
+  });
+
+  /**
+   * 旧实现只扫文件开头 64KB 找哨兵：`logger` 是追加写，升级当天的哨兵会落在文件中段，
+   * 于是「窗口从中间切进来」的定位读取判不出哨兵、把整段窗口丢掉，崩溃补传恒采到 0 条
+   * （2026-08-04 review copilot）。判据改成第 0 字节后与文件大小、窗口位置都无关。
+   */
+  it('文件远大于 64KB 且读窗口从中段切入时仍能采到崩溃现场', async () => {
+    const crashAt = NOW - 3 * 60 * 60 * 1000;
+    const today = dayKey(NOW);
+    const filler = (tsMs: number): string =>
+      mainLine(tsMs, 'INFO ', 'lifecycle', `noise ${'x'.repeat(300)}`);
+    const lines = [SENTINEL];
+    // 崩溃之前先堆 ~120KB,把崩溃记录推到远离文件头的位置。
+    for (let i = 400; i > 0; i -= 1) lines.push(filler(crashAt - i * 1000));
+    lines.push(mainLine(crashAt, 'FATAL', 'process', 'uncaughtException: boom'));
+    for (let i = 1; i <= 400; i += 1) lines.push(filler(crashAt + i * 1000));
+    const content = lines.join('\n');
+    expect(Buffer.byteLength(content, 'utf8')).toBeGreaterThan(64 * 1024);
+
+    const { deps } = harness({ [path.join(logDir, `main-${today}.log`)]: content });
+    const result = await collectLogs(deps, { reason: 'crash-backfill', anchors: [crashAt] });
+
+    expect(result.stats.filesSkippedLegacyFormat).toBe(0);
+    expect(result.records.some((r) => r.msg.includes('uncaughtException'))).toBe(true);
+  });
+});
+
 describe('第四层：上报记录只有五个白名单字段', () => {
   it('产出的对象没有 tsMs 等内部字段', async () => {
     const logDir = path.join('/tmp', 'cindy-logs');

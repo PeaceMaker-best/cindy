@@ -99,6 +99,36 @@ describe('evaluateGate', () => {
     expect(verdict).toEqual({ kind: 'unknown' });
     expect(verdict.kind).not.toBe('denied');
   });
+
+  /**
+   * 上一条的反面（2026-08-04 review P2）：把「读不出来 ⇒ unknown」做进闸之后，手动上传
+   * 也会被崩溃开关的读取故障牵连——`unknown` 在 IPC 层映射成 PRIVACY_CONSENT_REQUIRED，
+   * 于是「崩溃自动上传偏好文件损坏」把用户主动点的上传一并堵掉，恰好是最需要交日志的时候。
+   * 手动路径的放行条件里本来就没有这个开关，所以**连读都不该读**。
+   */
+  it('⚠️ 手动路径不读崩溃开关：开关记录不可读也照样放行', () => {
+    const read = vi.fn<() => boolean>(() => {
+      throw new Error('unreadable');
+    });
+    const deps = gate({ readCrashAutoUploadEnabled: read });
+    expect(evaluateGate(deps, 'manual')).toEqual({ kind: 'allowed' });
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it('手动路径连开关本身都不看：关着也放行', () => {
+    const read = vi.fn<() => boolean>(() => false);
+    expect(evaluateGate(gate({ readCrashAutoUploadEnabled: read }), 'manual')).toEqual({
+      kind: 'allowed',
+    });
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it('未同意时不读崩溃开关（结论已定，不必再碰第二份文件）', () => {
+    const read = vi.fn<() => boolean>(() => true);
+    const deps = gate({ readPrivacyConsentAccepted: () => false, readCrashAutoUploadEnabled: read });
+    expect(evaluateGate(deps, 'crash-backfill')).toEqual({ kind: 'denied', reason: 'no-consent' });
+    expect(read).not.toHaveBeenCalled();
+  });
 });
 
 describe('isManualUploadAvailable', () => {

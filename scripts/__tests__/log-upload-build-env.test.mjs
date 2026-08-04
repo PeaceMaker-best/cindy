@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
+import { afterEach, test } from 'node:test';
 
 import {
   LOG_UPLOAD_TARGET_ENV,
@@ -26,12 +26,28 @@ const VALID = {
   dev: null,
 };
 
+/**
+ * 本文件建过的临时目录。用 `afterEach` 统一回收，与 `client-endpoint-build-env.test.mjs`
+ * 同款——不用在测试执行期调 `test.after()` 注册根级钩子（那依赖 node:test 的导出形态与
+ * 「运行中注册根钩子」这个未承诺的行为）。
+ */
+const tempDirs = [];
+
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+/** 建一个本用例专属的临时目录（结束时由 afterEach 回收）。 */
+function makeTempDir(prefix) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  tempDirs.push(dir);
+  return dir;
+}
+
 /** 把一份配置写进临时文件，返回路径。逐个用例独立目录，结束即清理。 */
 function writeConfig(config) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-log-upload-cfg-'));
-  const file = path.join(dir, 'log-upload.json');
+  const file = path.join(makeTempDir('cindy-log-upload-cfg-'), 'log-upload.json');
   fs.writeFileSync(file, typeof config === 'string' ? config : JSON.stringify(config));
-  test.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   return file;
 }
 
@@ -82,8 +98,7 @@ test('global 缺失 ⇒ 抛错', () => {
 });
 
 test('文件不存在 ⇒ 抛错并说明真值来源', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cindy-log-upload-missing-'));
-  test.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const dir = makeTempDir('cindy-log-upload-missing-');
   assert.throws(
     () => loadLogUploadTargets({ configPath: path.join(dir, 'log-upload.json') }),
     /缺少日志上报配置[\s\S]*cindy-build-scripts/,

@@ -40,6 +40,15 @@ const SENSITIVE_FIELD_NAMES =
 /** 鉴权 / Cookie 类整头。值一律整段抹掉，不保留任何前缀片段。 */
 const AUTH_HEADER_NAMES = 'authorization|proxy-authorization|cookie|set-cookie|x-api-key';
 
+/**
+ * 鉴权 scheme 关键字（HTTP `Authorization` 的 scheme + 常见 bot / 云厂商形态）。
+ *
+ * 存在的理由：这些形态里 **scheme 与凭证之间有一个空格**，而 `sensitive-field-kv` 的值
+ * 取到空白为止——于是 `token=Bearer <opaque>` 只会被抹掉 `Bearer` 这个词，凭证本体原样
+ * 留在上报正文里（2026-08-04 review P1）。命中 scheme 时必须一路抹到行尾。
+ */
+const AUTH_SCHEMES = 'Bearer|Basic|Digest|Negotiate|NTLM|Token|Bot|ApiKey|AWS4-HMAC-SHA256';
+
 const RULES: readonly RedactRule[] = [
   // ── 整头 / 整值 ────────────────────────────────────────────────────────────
   {
@@ -61,6 +70,21 @@ const RULES: readonly RedactRule[] = [
       'gi',
     ),
     replace: (_m, head: string, tail: string) => `${head}${tag('sensitive-field')}${tail}`,
+  },
+  {
+    // 敏感字段名 + 鉴权 scheme：`authorization=Bearer xxx` / `token: Basic xxx`。
+    // **必须排在 sensitive-field-kv 之前**：那条规则的值取到空白为止，会只抹掉 `Bearer`
+    // 这个词而把凭证本体留下；而独立的 `bearer` 规则排在它之后，等它跑到时 `Bearer`
+    // 前缀已经被替换掉、正则再也匹配不上，凭证于是全程无人处理（2026-08-04 review P1）。
+    //
+    // 值一路取到**行尾**，与 auth-header 同款 over-redact：`AWS4-HMAC-SHA256` 这类
+    // scheme 的凭证本身就带逗号和空格，在任何分隔符处收手都会漏。
+    name: 'sensitive-field-auth-scheme',
+    pattern: new RegExp(
+      `\\b(${SENSITIVE_FIELD_NAMES})\\s*[:=]\\s*(?:${AUTH_SCHEMES})\\b[^\\n]*`,
+      'gi',
+    ),
+    replace: (_m, name: string) => `${name}=${tag('sensitive-field')}`,
   },
   {
     // k=v / k: v（非 JSON）。值取到空白、`&`、`;`、`,`、`"`、`'` 为止。
@@ -167,4 +191,4 @@ export function homeUserName(homeDir?: string): string | null {
   return last && last.length > 0 ? last : null;
 }
 
-export const __testing = { RULES, SENSITIVE_FIELD_NAMES, AUTH_HEADER_NAMES };
+export const __testing = { RULES, SENSITIVE_FIELD_NAMES, AUTH_HEADER_NAMES, AUTH_SCHEMES };

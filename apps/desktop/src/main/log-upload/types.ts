@@ -47,6 +47,11 @@ export interface CollectStats {
   droppedBySource: number;
   /** 因条数上限被锚点裁剪掉的条数。 */
   droppedByCap: number;
+  /**
+   * 因「不是转义版本写的」被整份跳过的 main 文件数（见 `startsWithFormatSentinel`）。
+   * 单独计数是为了让「升级当天采到 0 条」在本机日志里能一眼归因，而不是查半天读窗口。
+   */
+  filesSkippedLegacyFormat: number;
   /** 实际回溯的天数。 */
   lookbackDays: number;
 }

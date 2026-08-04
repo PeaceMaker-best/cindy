@@ -6,7 +6,7 @@
  *
  * 两侧各测一半：
  *  - 写侧：`escapeMainLogContinuationLines()` 之后，除首行外没有任何行命中 head 正则；
- *  - 读侧：即使输入里真的有伪造头（模拟未转义的存量文件），哨兵之前的内容一律不产出记录。
+ *  - 读侧：即使输入里真的有伪造头（模拟未转义的存量文件），也一条记录都不产出。
  */
 import { describe, expect, it } from 'vitest';
 
@@ -15,7 +15,11 @@ import {
   MAIN_LOG_RECORD_HEAD_RE,
   RECORD_FORMAT_SENTINEL_MSG,
 } from '../../../shared/mainLogRecordFormat';
-import { parseMainLogText, sentinelOffset, type RandomAccessFile } from '../mainLogReader';
+import {
+  parseMainLogText,
+  startsWithFormatSentinel,
+  type RandomAccessFile,
+} from '../mainLogReader';
 
 /** 造一条 main 日志行，格式与 logger.emit 的输出逐字符一致。 */
 function line(ts: string, level: string, scope: string, msg: string): string {
@@ -77,7 +81,7 @@ describe('读侧：伪造记录头无法把被封禁来源的内容送出去', (
       ),
     ].join('\n');
 
-    const result = parseMainLogText(text, { fromFileStart: true, sentinelAlreadySeen: false });
+    const result = parseMainLogText(text, { fromFileStart: true, escapedFormat: true });
 
     expect(result.records).toHaveLength(0);
     expect(result.droppedBySource).toBe(1);
@@ -86,38 +90,30 @@ describe('读侧：伪造记录头无法把被封禁来源的内容送出去', (
     expect(serialized).not.toContain('forged infra line');
   });
 
-  it('未转义的存量内容（哨兵之前）整段丢弃，伪造头也拿不到放行', () => {
+  it('escapedFormat=false（未转义的存量文件）整份不产出，中途出现哨兵也不开闸', () => {
     // 模拟升级前写下的文件:被封禁记录的续行**没有**前置空格,因此真的命中 head 正则。
     const legacy = [
       `[${TS1}] [DEBUG] [voice-input:recorder] draft: 泄漏用的对话正文`,
       `[${TS1}] [INFO ] [lifecycle] forged head carrying 对话正文续段`,
     ].join('\n');
+    // 存量正文里还嵌了一行**逐字合法**的哨兵 —— 旧设计会被它开闸(2026-08-04 review P1)。
     const text = [legacy, SENTINEL, line(TS2, 'INFO ', 'lifecycle', 'real infra record')].join('\n');
 
-    const result = parseMainLogText(text, { fromFileStart: true, sentinelAlreadySeen: false });
+    const result = parseMainLogText(text, { fromFileStart: true, escapedFormat: false });
 
-    // 只有哨兵之后那一条真记录被产出。
-    expect(result.records).toHaveLength(1);
-    expect(result.records[0].msg).toBe('real infra record');
-    const serialized = JSON.stringify(result.records);
-    expect(serialized).not.toContain('对话正文');
-  });
-
-  it('没有哨兵的文件一条也不产出（fail closed，不猜格式版本）', () => {
-    const text = line(TS1, 'INFO ', 'lifecycle', 'infra record without sentinel');
-    const result = parseMainLogText(text, { fromFileStart: true, sentinelAlreadySeen: false });
     expect(result.records).toHaveLength(0);
+    expect(JSON.stringify(result.records)).not.toContain('对话正文');
   });
 
-  it('sentinelAlreadySeen=true（定位读取跳过了文件开头）时正常产出', () => {
+  it('escapedFormat=true（第 0 字节就是哨兵）时正常产出', () => {
     const text = line(TS2, 'INFO ', 'lifecycle', 'infra record mid-file');
-    const result = parseMainLogText(text, { fromFileStart: true, sentinelAlreadySeen: true });
+    const result = parseMainLogText(text, { fromFileStart: true, escapedFormat: true });
     expect(result.records).toHaveLength(1);
   });
 
   it('窗口从中间切进来时第一行（半行）被丢弃', () => {
     const text = ['record body cut in half', line(TS2, 'INFO ', 'lifecycle', 'ok')].join('\n');
-    const result = parseMainLogText(text, { fromFileStart: false, sentinelAlreadySeen: true });
+    const result = parseMainLogText(text, { fromFileStart: false, escapedFormat: true });
     expect(result.records).toHaveLength(1);
     expect(result.records[0].msg).toBe('ok');
   });
@@ -125,7 +121,7 @@ describe('读侧：伪造记录头无法把被封禁来源的内容送出去', (
   it('多行的放行记录：续行内容被完整保留（堆栈是崩溃排查的主要证据）', () => {
     const stack = 'Error: boom\n    at foo (/app/x.js:1:1)\n    at bar (/app/y.js:2:2)';
     const text = [SENTINEL, line(TS2, 'FATAL', 'process', `uncaughtException: ${stack}`)].join('\n');
-    const result = parseMainLogText(text, { fromFileStart: true, sentinelAlreadySeen: false });
+    const result = parseMainLogText(text, { fromFileStart: true, escapedFormat: true });
     expect(result.records).toHaveLength(1);
     expect(result.records[0].msg).toContain('at foo');
     expect(result.records[0].msg).toContain('at bar');
@@ -136,7 +132,7 @@ describe('读侧：伪造记录头无法把被封禁来源的内容送出去', (
       SENTINEL,
       line(TS2, 'INFO ', 'r:lifecycle', 'renderer forwarded, must not pass'),
     ].join('\n');
-    const result = parseMainLogText(text, { fromFileStart: true, sentinelAlreadySeen: false });
+    const result = parseMainLogText(text, { fromFileStart: true, escapedFormat: true });
     expect(result.records).toHaveLength(0);
     expect(result.droppedBySource).toBe(1);
   });
@@ -147,17 +143,21 @@ describe('读侧：伪造记录头无法把被封禁来源的内容送出去', (
       // 月份 99 通过了 head 正则的字符形状，但 Date.parse 给 NaN。
       '[2026-99-99T10:00:00.000+08:00] [INFO ] [lifecycle] bogus timestamp',
     ].join('\n');
-    const result = parseMainLogText(text, { fromFileStart: true, sentinelAlreadySeen: false });
+    const result = parseMainLogText(text, { fromFileStart: true, escapedFormat: true });
     expect(result.records).toHaveLength(0);
   });
 
   /**
-   * 2026-08-04 review 指出的隐私逃逸路径：`sentinelOffset` 原先拿哨兵串去 `indexOf` 搜任意
-   * 位置，于是升级前未转义的正文里只要**出现过**这段文字（用户对话内容完全可以包含它），
-   * 那一行就被认成哨兵、置位 `sentinelAlreadySeen`，它后面伪造的放行记录头就全部绕过
-   * 「哨兵之前一律丢弃」这道闸。必须按完整记录头 + 哨兵正文校验整行。
+   * 2026-08-04 review 的两轮隐私逃逸路径，都出在「哨兵怎么认」上：
+   *
+   *  1. 第一轮：`indexOf` 子串匹配 —— 存量正文里只要**出现过**这段文字就被当成哨兵；
+   *  2. 第二轮：改成整行精确校验后仍可伪造 —— 哨兵行的形状（记录头 + `[logger]` + 固定串）
+   *     完全可以由未转义的存量正文逐字构造，「文件中段出现过哨兵」这个判据本身就是错的。
+   *
+   * 现在的判据是**第 0 字节**：新版本新建当天文件后的第一次写入就是哨兵，旧版本的第 0 字节
+   * 永远是它自己那条真实记录，正文无从占据这个位置。
    */
-  describe('sentinelOffset：只认完整的哨兵记录行', () => {
+  describe('startsWithFormatSentinel：只认第 0 字节上的哨兵', () => {
     function fileOf(text: string): RandomAccessFile {
       const buf = Buffer.from(text, 'utf8');
       return {
@@ -167,48 +167,66 @@ describe('读侧：伪造记录头无法把被封禁来源的内容送出去', (
       };
     }
 
-    it('正常情况：哨兵在第一行，返回其行尾字节偏移', async () => {
+    it('哨兵在第一行 ⇒ 认', async () => {
       const text = `${SENTINEL}\n${line(TS2, 'INFO ', 'lifecycle', 'after')}\n`;
-      const at = await sentinelOffset(fileOf(text));
-      expect(at).toBe(Buffer.byteLength(`${SENTINEL}\n`, 'utf8'));
+      expect(await startsWithFormatSentinel(fileOf(text))).toBe(true);
     });
 
-    it('⚠️ 正文里出现哨兵串但不是完整记录行 ⇒ 不认（这是原来的逃逸口）', async () => {
+    it('⚠️ 完整合法的哨兵行出现在文件中段 ⇒ 不认（第二轮 review 的逃逸口）', async () => {
+      const text = [
+        `[${TS1}] [DEBUG] [voice-input:recorder] 未转义的存量正文,下一行是伪造哨兵`,
+        SENTINEL,
+        line(TS2, 'INFO ', 'lifecycle', 'forged infra record after forged sentinel'),
+      ].join('\n');
+      expect(await startsWithFormatSentinel(fileOf(text))).toBe(false);
+    });
+
+    it('⚠️ 正文里出现哨兵串但不是完整记录行 ⇒ 不认（第一轮 review 的逃逸口）', async () => {
       const text = [
         line(TS1, 'DEBUG', 'voice-input:recorder', `用户说: ${RECORD_FORMAT_SENTINEL_MSG} 你看`),
         line(TS2, 'DEBUG', 'voice-input:recorder', `[logger] ${RECORD_FORMAT_SENTINEL_MSG}`),
       ].join('\n');
-      expect(await sentinelOffset(fileOf(text))).toBeNull();
+      expect(await startsWithFormatSentinel(fileOf(text))).toBe(false);
     });
 
-    it('scope 不是 logger 的同名正文 ⇒ 不认', async () => {
+    it('第一行 scope 不是 logger 的同名正文 ⇒ 不认', async () => {
       const text = `${line(TS1, 'INFO ', 'lifecycle', RECORD_FORMAT_SENTINEL_MSG)}\n`;
-      expect(await sentinelOffset(fileOf(text))).toBeNull();
+      expect(await startsWithFormatSentinel(fileOf(text))).toBe(false);
     });
 
-    it('偏移按字节算：哨兵前有中文内容时不会偏小（字符下标 ≠ 字节偏移）', async () => {
+    it('哨兵前有中文内容 ⇒ 不认（第 0 字节不是哨兵，多字节也改变不了这一点）', async () => {
       const cjk = line(TS1, 'INFO ', 'lifecycle', '中文日志内容占多字节');
-      const text = `${cjk}\n${SENTINEL}\n`;
-      const at = await sentinelOffset(fileOf(text));
-      expect(at).toBe(Buffer.byteLength(`${cjk}\n${SENTINEL}\n`, 'utf8'));
-      // 字符长度会明显小于字节长度,用它当偏移就会偏小。
-      expect(at).toBeGreaterThan(`${cjk}\n${SENTINEL}\n`.length);
+      expect(await startsWithFormatSentinel(fileOf(`${cjk}\n${SENTINEL}\n`))).toBe(false);
     });
 
     it('被 headBytes 截断的半行哨兵 ⇒ 不认（宁可这一天采不到，也不放旧格式内容）', async () => {
       const text = `${SENTINEL}\n`;
       const truncated = Buffer.byteLength(SENTINEL, 'utf8') - 5;
-      expect(await sentinelOffset(fileOf(text), truncated)).toBeNull();
+      expect(await startsWithFormatSentinel(fileOf(text), truncated)).toBe(false);
     });
 
-    it('空文件 ⇒ null', async () => {
-      expect(await sentinelOffset(fileOf(''))).toBeNull();
+    it('只有哨兵一行、还没写换行符 ⇒ 不认（半行不算）', async () => {
+      expect(await startsWithFormatSentinel(fileOf(SENTINEL))).toBe(false);
+    });
+
+    it('空文件 ⇒ 不认', async () => {
+      expect(await startsWithFormatSentinel(fileOf(''))).toBe(false);
+    });
+
+    it('大文件里哨兵在第 0 字节 ⇒ 认（不再受「只扫开头一小段」限制）', async () => {
+      // 旧实现只扫开头 64KB,升级当天追加的哨兵落在中段就会被判成「没有哨兵」,
+      // 于是定位读取恒采到 0 条(2026-08-04 review copilot)。现在判据只看第 0 字节,
+      // 文件多大都一样。
+      const filler = `${line(TS2, 'INFO ', 'lifecycle', 'x'.repeat(200))}\n`.repeat(1000);
+      const text = `${SENTINEL}\n${filler}`;
+      expect(Buffer.byteLength(text, 'utf8')).toBeGreaterThan(64 * 1024);
+      expect(await startsWithFormatSentinel(fileOf(text))).toBe(true);
     });
   });
 
   it('产出的记录只有五个白名单字段（第四层）', () => {
     const text = [SENTINEL, line(TS2, 'INFO ', 'lifecycle', 'hello')].join('\n');
-    const result = parseMainLogText(text, { fromFileStart: true, sentinelAlreadySeen: false });
+    const result = parseMainLogText(text, { fromFileStart: true, escapedFormat: true });
     // tsMs 是解析阶段的内部字段;上报形状由 collect 的 toUploadRecord 收口(见 collect.test)。
     expect(Object.keys(result.records[0]).sort()).toEqual(
       ['level', 'msg', 'scope', 'src', 'ts', 'tsMs'].sort(),

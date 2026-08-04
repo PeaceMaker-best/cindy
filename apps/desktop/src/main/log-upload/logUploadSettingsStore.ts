@@ -58,11 +58,48 @@ const store = createOverrideSettingsFile<LogUploadSettings>({
 });
 
 /**
+ * 盘上这条记录**第一次被本进程看到时**是什么状态。与 analytics 那份同款，理由也同款：
+ * `createOverrideSettingsFile` 读到坏 JSON 会**把文件删掉**并缓存一个未自定义的默认态,
+ * 于是「现读」再也看不到损坏 —— 而设置页挂载即调的 `logUploadSettingsPayload()` 就会触发
+ * 这次读取，它远早于延迟执行的启动补传（2026-08-04 review P2）。
+ *
+ * 所以在任何 store 读写之前先做一次只读探针，把结论钉在内存里：
+ *   none    = 没有记录（从未自定义，跟随默认值关闭）
+ *   valid   = 有一份能解析的记录
+ *   invalid = 有记录但解析不出来 —— 授权闸必须据此判 `unknown`，否则会当成「用户把开关
+ *             关了」并清空待补传标记，一次坏文件永久丢掉崩溃现场
+ */
+type RecordProbe = 'none' | 'valid' | 'invalid';
+let recordProbe: RecordProbe | null = null;
+
+function probeSettingsFile(): RecordProbe {
+  try {
+    const file = settingsFilePath();
+    if (!fs.existsSync(file)) return 'none';
+    const parsed: unknown = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? 'valid' : 'invalid';
+  } catch {
+    // 读不出来 / 解析失败都算「在、但非法」，绝不当成「没有记录」。
+    return 'invalid';
+  }
+}
+
+function probeRecordOnce(): RecordProbe {
+  if (recordProbe !== null) return recordProbe;
+  recordProbe = probeSettingsFile();
+  if (recordProbe !== 'none') {
+    log.info('log-upload settings record probed', { probe: recordProbe });
+  }
+  return recordProbe;
+}
+
+/**
  * 现读盘。授权闸每次判定前调用：开发版与正式版共享 userData，用户可能在另一个实例里刚刚
  * 关掉开关，进程内的旧缓存不能继续放行上传（需求 §4.3）。
  * mtime 守卫让「文件没变」时零开销。
  */
 export function refreshLogUploadSettingsFromDisk(): void {
+  probeRecordOnce();
   store.invalidateIfChanged();
 }
 
@@ -70,44 +107,54 @@ export function refreshLogUploadSettingsFromDisk(): void {
  * 盘上的开关记录**现在是否可读**。语义与 `isAnalyticsConsentRecordReadable()` 一致：
  * 文件不存在算可读（= 从未自定义，跟随默认值关闭），只有「在、但解析不出来」算不可读。
  *
- * 同样是为了让授权闸能把「读取故障」判成 `unknown` 而不是「用户把开关关了」——后者会
- * 清空待补传标记，一次坏文件就永久丢掉崩溃现场（2026-08-04 review P2）。
+ * 两道判据取交集：一是**现读**（捕捉此刻仍在盘上的损坏），二是启动期那次 `probeRecordOnce()`
+ * 的结论（store 读到坏文件会把它删掉，之后现读什么都看不到了）。任一判为损坏即不可读。
  */
 export function isLogUploadSettingsReadable(): boolean {
-  try {
-    const file = settingsFilePath();
-    if (!fs.existsSync(file)) return true;
-    const parsed: unknown = JSON.parse(fs.readFileSync(file, 'utf-8'));
-    return Boolean(parsed) && typeof parsed === 'object' && !Array.isArray(parsed);
-  } catch {
-    return false;
-  }
+  if (recordProbe === 'invalid') return false;
+  return probeSettingsFile() !== 'invalid';
 }
 
 export function readLogUploadSettings(): LogUploadSettings {
+  probeRecordOnce();
   return store.read();
 }
 
 export function isCrashAutoUploadEnabled(): boolean {
+  probeRecordOnce();
   return store.read().crashAutoUploadEnabled;
 }
 
 /** 用户是否显式设置过开关（盘上有这条 override）。 */
 export function isCrashAutoUploadCustomized(): boolean {
+  probeRecordOnce();
   return store.readState().customizedKeys.includes('crashAutoUploadEnabled');
 }
 
 export function setCrashAutoUploadEnabled(enabled: boolean): LogUploadSettings {
+  probeRecordOnce();
   // preserveDefaults:默认值就是 false,不保留的话「用户打开后又关掉」会被当成「未自定义」
   // 而删除 override,从此再也分不清「没碰过」与「显式关掉」。
   store.writePatch({ crashAutoUploadEnabled: enabled }, { preserveDefaults: true });
+  // 写入整份替换了文件内容,之前那次「损坏」的结论到此作废。不清掉的话本进程会一直把闸判成
+  // unknown —— 用户明明已经重新设过开关了,崩溃补传还得等下次重启才恢复。
+  recordProbe = 'valid';
   return store.read();
 }
 
 /** 「恢复默认」：删掉 override，重新跟随当前版本默认值。 */
 export function clearCrashAutoUploadOverride(): LogUploadSettings {
+  probeRecordOnce();
   store.writePatch({ crashAutoUploadEnabled: DEFAULTS.crashAutoUploadEnabled });
+  recordProbe = 'valid';
   return store.read();
 }
 
-export const __testing = { DEFAULTS, normalize, settingsFilePath };
+export const __testing = {
+  DEFAULTS,
+  normalize,
+  settingsFilePath,
+  resetProbe: (): void => {
+    recordProbe = null;
+  },
+};
