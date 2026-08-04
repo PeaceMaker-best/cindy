@@ -153,8 +153,8 @@ export function MorphPopover({
   const chipRectRef = useRef<DOMRect | null>(null);
   // 初始形变是否已完成(ResizeObserver 只在其后接管,避免和开场动画打架)
   const settledRef = useRef(false);
-  // 指针选择菜单动作时不把焦点归还 trigger:否则 trigger 的 focus tooltip 会压在
-  // 动作打开的下一层弹窗上。键盘关闭仍按 §14.2 回焦。
+  // 指针驱动的关闭(菜单动作、trigger toggle、outside 交接)不把焦点归还 trigger:
+  // 否则旧层会在收合结束时抢走下一层交互面的焦点。键盘关闭仍按 §14.2 回焦。
   const pointerInteractionRef = useRef(false);
 
   const requestClose = useCallback(() => onOpenChange(false), [onOpenChange]);
@@ -428,6 +428,10 @@ export function MorphPopover({
       // 面板内容可能再弹 Radix 浮层(portal 到 body,如模型行的 effort/Fast 配置
       // 子面板)——点它不算 outside,否则子面板永远点不了(整个面板会先被关掉)
       if ((t as Element).closest?.('[data-radix-popper-content-wrapper]')) return;
+      // outside pointerdown 也是鼠标关闭。目标控件可能 preventDefault 阻止默认聚焦
+      // (如 AgentSelect 为维持 composer focus-within),不能因此把旧层误判成键盘关闭、
+      // 在收合结束后延迟抢回旧 trigger 焦点并关掉刚打开的相邻弹层。
+      pointerInteractionRef.current = true;
       requestClose();
     };
     const onKeyDown = (e: KeyboardEvent) => {
