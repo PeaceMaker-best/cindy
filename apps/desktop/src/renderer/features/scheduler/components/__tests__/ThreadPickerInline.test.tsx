@@ -35,12 +35,12 @@ describe('ThreadPickerInline 会话引用状态', () => {
       />,
     );
 
-    const selectedOption = await screen.findByRole('option', { selected: true });
+    await screen.findByRole('option', {
+      name: 'scheduler.editor.thread.deletedBinding',
+      selected: true,
+    });
 
     expect(mocks.list).toHaveBeenCalledTimes(1);
-    expect(selectedOption.textContent).toBe(
-      'scheduler.editor.thread.deletedBinding',
-    );
     expect(
       screen.queryByRole('button', { name: 'scheduler.editor.runSession.card.open' }),
     ).toBeNull();
