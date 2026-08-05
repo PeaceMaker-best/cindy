@@ -76,6 +76,8 @@ describe('cindy_feishu_bot channel routing note', () => {
   it('X note names the channel and counters the 280-character prior', () => {
     expect(X_HOOK_SESSION_CHANNEL_NOTE).toContain('当前是 X 会话');
     expect(X_HOOK_SESSION_CHANNEL_NOTE).toContain('当前 X 会话');
+    expect(X_HOOK_SESSION_CHANNEL_NOTE).toContain('当前账号为付费账号');
+    expect(X_HOOK_SESSION_CHANNEL_NOTE).not.toContain('对应付费账号');
     expect(X_HOOK_SESSION_CHANNEL_NOTE).not.toContain('回答方式与普通任务及其他渠道保持一致');
     expect(X_HOOK_SESSION_CHANNEL_NOTE).toContain('不受 280 个字符限制');
     expect(X_HOOK_SESSION_CHANNEL_NOTE).toContain('无需针对当前渠道调整回答篇幅');
