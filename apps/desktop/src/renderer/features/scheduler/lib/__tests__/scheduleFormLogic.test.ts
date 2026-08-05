@@ -31,10 +31,12 @@ import {
   hasRealBinding,
   isExplicitScheduleModelUnavailable,
   isFollowingSessionSelection,
+  needsBoundSessionGenerationRouteResolution,
   resolveScheduleGenerationProviderId,
   resolveTemplateAgentFields,
   sessionAgentKindToScheduleAgentKind,
   shouldFollowBoundSessionGenerationRoute,
+  usesBoundSessionGenerationModel,
   usesBoundSessionModel,
 } from '../scheduleFormLogic';
 import type { ScheduleFormState } from '../scheduleFormLogic';
@@ -119,6 +121,61 @@ describe('shouldFollowBoundSessionGenerationRoute', () => {
       providerId: '',
       model: '',
       effort: 'high',
+    })).toBe(true);
+  });
+});
+
+describe('usesBoundSessionGenerationModel', () => {
+  it('inherits the bound session model even when provider or effort is overridden', () => {
+    expect(usesBoundSessionGenerationModel({
+      persistentSession: false,
+      targetSessionId: 'session-1',
+      model: '',
+    })).toBe(true);
+  });
+
+  it('does not treat persistent or explicit-model schedules as bound-model routes', () => {
+    expect(usesBoundSessionGenerationModel({
+      persistentSession: true,
+      targetSessionId: 'session-1',
+      model: '',
+    })).toBe(false);
+    expect(usesBoundSessionGenerationModel({
+      persistentSession: false,
+      targetSessionId: 'session-1',
+      model: 'gpt-5.5',
+    })).toBe(false);
+  });
+});
+
+describe('needsBoundSessionGenerationRouteResolution', () => {
+  it('asks main to fill either missing model or provider for bound schedules', () => {
+    expect(needsBoundSessionGenerationRouteResolution({
+      persistentSession: false,
+      targetSessionId: 'session-1',
+      model: '',
+      providerId: 'openai',
+    })).toBe(true);
+    expect(needsBoundSessionGenerationRouteResolution({
+      persistentSession: false,
+      targetSessionId: 'session-1',
+      model: 'gpt-5.5',
+      providerId: '',
+    })).toBe(true);
+  });
+
+  it('does not resolve a complete route or a persistent schedule through the session', () => {
+    expect(needsBoundSessionGenerationRouteResolution({
+      persistentSession: false,
+      targetSessionId: 'session-1',
+      model: 'gpt-5.5',
+      providerId: 'openai',
+    })).toBe(false);
+    expect(needsBoundSessionGenerationRouteResolution({
+      persistentSession: true,
+      targetSessionId: 'session-1',
+      model: '',
+      providerId: '',
     })).toBe(false);
   });
 });

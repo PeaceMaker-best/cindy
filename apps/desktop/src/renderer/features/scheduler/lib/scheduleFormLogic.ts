@@ -153,9 +153,9 @@ export function hasRealBinding(form: Pick<ScheduleFormState, 'targetSessionId'>)
 }
 
 /**
- * A bound schedule follows its session only when model, provider and effort are
- * all inherited.  Keeping this predicate in the pure form layer prevents the
- * chip, dialog and generation paths from disagreeing about mixed overrides.
+ * A bound schedule follows its session route when model and provider are both
+ * inherited. Effort is an independent runtime override and must not alter the
+ * generation route predicate.
  */
 export function isFollowingSessionSelection(input: {
   followSession?: boolean;
@@ -171,18 +171,42 @@ export function isFollowingSessionSelection(input: {
   );
 }
 
-/** 前置脚本生成沿用绑定会话的模型/来源路由。 */
+/**
+ * 前置脚本生成是否应沿用绑定会话的模型。
+ *
+ * model 是绑定任务的继承维度；provider/effort 可以独立覆盖，不能因为这两个
+ * 覆盖值存在就把空 model 当成“没有可生成的模型”。
+ */
+export function usesBoundSessionGenerationModel(
+  form: Pick<ScheduleFormState, 'persistentSession' | 'targetSessionId' | 'model'>,
+): boolean {
+  return deriveRunMode(form) === 'bound'
+    && hasRealBinding(form)
+    && !form.model.trim();
+}
+
+/** bound 任务生成前置脚本时，是否需要 main 用会话路由补齐缺省维度。 */
+export function needsBoundSessionGenerationRouteResolution(
+  form: Pick<
+    ScheduleFormState,
+    'persistentSession' | 'targetSessionId' | 'providerId' | 'model'
+  >,
+): boolean {
+  return deriveRunMode(form) === 'bound'
+    && hasRealBinding(form)
+    && (!form.model.trim() || !form.providerId.trim());
+}
+
+/** 前置脚本生成沿用绑定会话的完整模型/来源路由(努力强度是独立覆盖)。 */
 export function shouldFollowBoundSessionGenerationRoute(
   form: Pick<
     ScheduleFormState,
     'persistentSession' | 'targetSessionId' | 'providerId' | 'model' | 'effort'
   >,
 ): boolean {
-  return deriveRunMode(form) === 'bound'
-    && hasRealBinding(form)
-    && !form.providerId.trim()
-    && !form.model.trim()
-    && !form.effort.trim();
+  return needsBoundSessionGenerationRouteResolution(form)
+    && usesBoundSessionGenerationModel(form)
+    && !form.providerId.trim();
 }
 
 /** 绑定任务 model 为空时，运行模型仍来自绑定会话；provider/effort 可独立覆盖。 */

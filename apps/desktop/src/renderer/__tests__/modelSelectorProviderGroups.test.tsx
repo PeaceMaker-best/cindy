@@ -281,6 +281,7 @@ describe('ModelSelector provider groups', () => {
       currentProviderId: 'anthropic',
       sourceDisconnected: true,
       reselectEmitsChange: true,
+      selectedRowClickOpensConfiguration: true,
       onProviderChange,
     });
     await act(async () => {
@@ -293,7 +294,23 @@ describe('ModelSelector provider groups', () => {
     expect(fallbackRow.getAttribute('aria-selected')).toBe('true');
 
     fireEvent.click(fallbackRow);
-    expect(onProviderChange).toHaveBeenCalledWith('xd', modelId, 'high');
+    expect(onProviderChange).toHaveBeenCalledWith('xd', modelId, undefined);
+    expect(screen.getByRole('group', { name: /Fable 5/ })).toBeTruthy();
+  });
+
+  it('opens a selected provider configuration without persisting its derived effort', async () => {
+    const onProviderChange = vi.fn();
+    renderSelector({
+      reselectEmitsChange: true,
+      selectedRowClickOpensConfiguration: true,
+      onProviderChange,
+    });
+    await openDropdown();
+
+    fireEvent.click(screen.getByRole('option', { name: /Opus 4\.8/ }));
+
+    expect(onProviderChange).not.toHaveBeenCalled();
+    expect(screen.getByRole('group', { name: /Opus 4\.8/ })).toBeTruthy();
   });
 
   it('returns the target provider effort for the same model id', async () => {

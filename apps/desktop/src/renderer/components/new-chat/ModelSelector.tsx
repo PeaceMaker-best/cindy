@@ -474,6 +474,8 @@ interface ModelSelectorProps {
    * 会话场景不要开——那里 modelId 本就是已持久化的值，重选自己是纯无操作。
    */
   reselectEmitsChange?: boolean;
+  /** 点击当前已选模型行时打开该行的配置浮层，而不是直接收起选择器。 */
+  selectedRowClickOpensConfiguration?: boolean;
   /**
    * modelId 非空但不在可见清单时的 trigger 文案（默认落「选择模型」占位符）。
    * 供展示已持久化偏好的调用方给出诊断性文案，避免把「存过但当前不可用」显示成「没选过」。
@@ -1274,18 +1276,30 @@ function ModelSelectorContentView({
       const selectedModelHasConfiguration =
         !!selectedModel &&
         (selectedModel.efforts.length > 0 || fastEditable(providerId, selectedModel));
-      // A selected row can be the effective fallback for a stale explicit
-      // provider.  Emit the row selection before opening its configuration so
-      // clicking that highlighted fallback repairs the persisted route.
-      if (reselectEmitsChange) {
-        if (sections && providerId) onProviderChange?.(providerId, id, reconciledEffort);
-        else onModelChange(id);
-      }
-      if (
+      const opensConfiguration =
         selectedRowClickOpensConfiguration &&
         configurationEnabled &&
-        selectedModelHasConfiguration
-      ) {
+        selectedModelHasConfiguration;
+      // A selected row can be the effective fallback for a stale explicit
+      // provider.  Repair that route before opening its configuration, but do
+      // not persist the row's derived/default effort just by opening the card.
+      if (reselectEmitsChange) {
+        if (sections && providerId) {
+          const needsProviderRepair =
+            !!currentProviderId &&
+            currentProviderId !== providerId;
+          if (!opensConfiguration || needsProviderRepair) {
+            onProviderChange?.(
+              providerId,
+              id,
+              opensConfiguration ? undefined : reconciledEffort,
+            );
+          }
+        } else if (!opensConfiguration) {
+          onModelChange(id);
+        }
+      }
+      if (opensConfiguration) {
         setEditing({ providerId, modelId: id });
         return;
       }
@@ -2037,6 +2051,7 @@ export function ModelSelector({
   configurationEnabled = true,
   fallbackOption,
   reselectEmitsChange = false,
+  selectedRowClickOpensConfiguration = false,
   unknownModelLabel,
   ariaContext,
   currentProviderId,
@@ -2622,6 +2637,7 @@ export function ModelSelector({
       onNavigateToProviders={onNavigateToProviders}
       configurationEnabled={configurationEnabled}
       reselectEmitsChange={reselectEmitsChange}
+      selectedRowClickOpensConfiguration={selectedRowClickOpensConfiguration}
       pointerRevealRequiresIntent={morphEnabled}
       fluidWidth={isFieldTrigger}
       agentSwitch={contentAgentSwitch}

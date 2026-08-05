@@ -37,9 +37,10 @@ import {
   buildHookCommandForScriptFile,
   canSubmitSessionBinding,
   isExplicitScheduleModelUnavailable,
+  needsBoundSessionGenerationRouteResolution,
   parsePreRunHookTimeoutMs,
   resolveScheduleGenerationProviderId,
-  shouldFollowBoundSessionGenerationRoute,
+  usesBoundSessionGenerationModel,
 } from '../lib/scheduleFormLogic';
 import type { RunMode, ScheduleFormState } from '../hooks/useScheduleForm';
 import { BoundSessionCard } from './BoundSessionCard';
@@ -240,16 +241,17 @@ export function ScheduleFormDialog({
     const description = hookGenDesc.trim();
     if (!description || hookGenerating) return;
     const hasSessionTarget = hasRealBinding(form);
-    const followsSessionRoute = shouldFollowBoundSessionGenerationRoute(form);
-    const providerId = followsSessionRoute
-      ? undefined
+    const resolveBoundSessionRoute = needsBoundSessionGenerationRouteResolution(form);
+    const inheritsBoundSessionModel = usesBoundSessionGenerationModel(form);
+    const providerId = resolveBoundSessionRoute
+      ? form.providerId.trim() || undefined
       : resolveScheduleGenerationProviderId({
         providers,
         providerId: form.providerId,
         model: form.model,
         agentKind: form.agentKind,
       });
-    if (!followsSessionRoute && !providerId) {
+    if (!resolveBoundSessionRoute && !providerId) {
       toast.warning(t('scheduler.editor.validation.modelUnavailable', { model: form.model }));
       return;
     }
@@ -261,15 +263,16 @@ export function ScheduleFormDialog({
         description,
         scheduleName: form.name.trim() || undefined,
         providerId: providerId ?? undefined,
-        // 只有 bound + 空 model/provider/effort 才跟随 session 路由。persistent 任务即使
-        // 已回写 targetSessionId，仍按任务级选择生成，与下次 fire 的覆盖语义一致。
-        agentKind: followsSessionRoute ? undefined : form.agentKind,
-        model: followsSessionRoute ? undefined : form.model.trim() || undefined,
+        // bound 任务的缺省模型/来源维度由 main 按绑定会话补齐；provider/model 的显式
+        // 覆盖仍原样透传。persistent 任务即使已回写 targetSessionId，也按任务级选择生成。
+        agentKind: resolveBoundSessionRoute ? undefined : form.agentKind,
+        model: inheritsBoundSessionModel ? undefined : form.model.trim() || undefined,
         // 绑定会话任务:workingDir 不发(表单残留值可能是改绑前的过期项目目录,
         // 显式值会压过会话解析),真实 cwd 由 main 按会话 meta.workDir 解析 ——
         // 落盘目录/自测环境与生产运行一致
         workingDir: hasSessionTarget ? undefined : form.workingDir.trim() || undefined,
         targetSessionId: hasSessionTarget ? form.targetSessionId.trim() : undefined,
+        resolveBoundSessionRoute: resolveBoundSessionRoute ? true : undefined,
         currentCommand: form.preRunHookCommand.trim() || undefined,
       });
       if (!result.ok) {
@@ -298,9 +301,9 @@ export function ScheduleFormDialog({
     form.model,
     form.workingDir,
     form.targetSessionId,
+    form.persistentSession,
     form.preRunHookCommand,
     form.executionMode,
-    form.persistentSession,
     setField,
     t,
   ]);
