@@ -3924,6 +3924,21 @@
       "dismissButton": "확인"
     }
   },
+  "credentialStore": {
+    "banner": {
+      "message": "시스템 자격 증명 저장소를 사용할 수 없어 로그인 상태를 유지할 수 없습니다",
+      "viewHelp": "해결 방법 보기",
+      "dismiss": "닫기"
+    },
+    "dialog": {
+      "title": "시스템 자격 증명 저장소를 사용할 수 없음",
+      "intro": "Cindy가 시스템 자격 증명 저장소에서 로그인 자격 증명을 읽을 수 없어 로그인 상태와 관련 연동이 계속 실패합니다. 다음 단계를 시도해 보세요:",
+      "stepMacKeychain": "Cindy를 종료하고 '키체인 접근'을 열어 'Cindy Safe Storage'를 검색한 뒤 접근 제어를 확인하세요. 필요하면 해당 항목을 삭제하세요(저장된 연동 자격 증명은 무효화되어 다시 연결해야 합니다)",
+      "stepRestart": "Cindy 다시 시작",
+      "stepRelogin": "여전히 복구되지 않으면 로그아웃 후 다시 로그인하세요",
+      "confirm": "확인"
+    }
+  },
   "localDbGate": {
     "title": "로컬 데이터를 열 수 없습니다",
     "description": "다시 시도하거나 로그인 방식으로 돌아가 모드를 다시 선택하세요.",

@@ -510,6 +510,8 @@ interface AuthStateChangePayload {
   deviceId: string;
   hasAccountDeletionReceipt: boolean;
   accountDeletionRestored: boolean;
+  /** 持久凭证库(safeStorage)连续多个刷新周期不可用(#1687);旧版 main 不带此字段。 */
+  credentialStoreUnavailable?: boolean;
 }
 
 /**
@@ -1786,6 +1788,8 @@ interface ElectronAPI {
     deviceId: string;
     hasAccountDeletionReceipt: boolean;
     accountDeletionRestored: boolean;
+    /** 持久凭证库(safeStorage)连续多个刷新周期不可用(#1687)。 */
+    credentialStoreUnavailable?: boolean;
   }>;
   authGetLoginState: () => Promise<DesktopLoginActionResult>;
   authDispatchLoginAction: (action: DesktopLoginAction) => Promise<DesktopLoginActionResult>;

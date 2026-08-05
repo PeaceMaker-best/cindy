@@ -3924,6 +3924,21 @@
       "dismissButton": "我知道了"
     }
   },
+  "credentialStore": {
+    "banner": {
+      "message": "系统凭证存储不可用，登录状态无法维持",
+      "viewHelp": "查看解决方法",
+      "dismiss": "关闭提示"
+    },
+    "dialog": {
+      "title": "系统凭证存储不可用",
+      "intro": "Cindy 无法通过系统凭证存储读取登录凭证，登录状态和相关集成会持续失效。可尝试以下步骤恢复：",
+      "stepMacKeychain": "退出 Cindy，打开「钥匙串访问」，搜索「Cindy Safe Storage」并检查其访问控制；必要时删除该条目（已保存的集成凭证会失效，需要重新连接）",
+      "stepRestart": "重新启动 Cindy",
+      "stepRelogin": "如果仍未恢复，退出登录后重新登录",
+      "confirm": "知道了"
+    }
+  },
   "localDbGate": {
     "title": "本地数据暂时无法打开",
     "description": "可以重试，或返回登录方式后重新选择使用模式。",

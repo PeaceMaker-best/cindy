@@ -28,6 +28,7 @@ import { FeishuConflictDialogHost } from '@/components/feishuBot/FeishuConflictD
 import { GlobalDropImportListener } from '@/components/layout/GlobalDropImportListener';
 import { SessionShareImportWizard } from '@/components/settings/SessionShareImportWizard';
 import { ControlledBanner } from '@/features/remote-device/ControlledBanner';
+import { CredentialStoreBanner } from '@/components/layout/CredentialStoreBanner';
 import { useDeviceLinkRemoteProjects } from '@/features/device-link/useDeviceLinkRemoteProjects';
 import { FeatureSidebarSlotProvider } from '@/features/feature-context';
 import { useAppShortcut } from '@/hooks/useAppShortcut';
@@ -1238,6 +1239,10 @@ export function MainLayout() {
                     重跑导致的"刷新一帧"闪烁。
                     ContentHeader 在 FadeSwitcher 之外 —— header chrome 不参与路由切换
                     动画，只有注入的中部内容随路由变化。 */}
+                  {/* 持久凭证库故障全局警示条(#1687):ContentHeader 之下、路由内容之上,
+                      shrink-0 在 main 的 flex 列里独占一行把内容推下(不遮盖)。放在
+                      FadeSwitcher 之外 —— 它是全局状态提示,不参与路由切换动画。 */}
+                  <CredentialStoreBanner />
                   <FadeSwitcher key={location.pathname.split('/')[1] || 'root'}>
                     <Outlet
                       context={{

@@ -3926,6 +3926,21 @@
       "dismissButton": "Got it"
     }
   },
+  "credentialStore": {
+    "banner": {
+      "message": "System credential storage is unavailable; your signed-in state cannot be maintained",
+      "viewHelp": "View solutions",
+      "dismiss": "Dismiss"
+    },
+    "dialog": {
+      "title": "System credential storage unavailable",
+      "intro": "Cindy cannot read its sign-in credentials from the system credential storage, so the signed-in state and related integrations will keep failing. Try the following steps to recover:",
+      "stepMacKeychain": "Quit Cindy, open Keychain Access, search for \"Cindy Safe Storage\" and check its access control; delete the entry if necessary (saved integration credentials will be invalidated and need to be reconnected)",
+      "stepRestart": "Restart Cindy",
+      "stepRelogin": "If it still does not recover, sign out and sign in again",
+      "confirm": "OK"
+    }
+  },
   "localDbGate": {
     "title": "Local data could not be opened",
     "description": "Retry, or return to the sign-in choices and select a mode again.",
