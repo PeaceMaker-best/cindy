@@ -81,11 +81,15 @@ describe('cindy_feishu_bot channel routing note', () => {
     expect(X_HOOK_SESSION_CHANNEL_NOTE).not.toContain('回答方式与普通任务及其他渠道保持一致');
     expect(X_HOOK_SESSION_CHANNEL_NOTE).toContain('不受 280 个字符限制');
     expect(X_HOOK_SESSION_CHANNEL_NOTE).toContain('无需针对当前渠道调整回答篇幅');
-    expect(X_HOOK_SESSION_CHANNEL_NOTE).toContain('在 X 中尽量避免输出 URL 链接');
+    expect(X_HOOK_SESSION_CHANNEL_NOTE).toContain(
+      '在 X 中除附件引用外,尽量避免输出其他 URL 链接',
+    );
     expect(X_HOOK_SESSION_CHANNEL_NOTE).not.toContain('不要主动压缩或删减必要内容');
     expect(X_HOOK_SESSION_CHANNEL_NOTE).toContain(
-      '正文可以使用标题、列表、表格、普通段落或代码块组织内容,发布时会转换为纯文本(附件引用除外)',
+      '正文可以使用标题、列表、表格、普通段落或代码块组织内容,发布时会转换为纯文本;附件引用不受此限制',
     );
+    expect(X_HOOK_SESSION_CHANNEL_NOTE).toContain('xdt-file:///绝对路径');
+    expect(X_HOOK_SESSION_CHANNEL_NOTE).toContain('cindy-media://… 或 xdt-image://…');
     expect(X_HOOK_SESSION_CHANNEL_NOTE).toContain('不要解释或复述这些格式要求');
     expect(X_HOOK_SESSION_CHANNEL_NOTE).not.toContain('X (Twitter)');
     expect(X_HOOK_SESSION_CHANNEL_NOTE).not.toContain('公开回帖');

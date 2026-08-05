@@ -47,7 +47,7 @@ describe('buildHookPromptNote', () => {
     expect(x).toContain('正文可以使用标题、列表、表格');
     expect(x).toContain('发布时会转换为纯文本');
     expect(x).toContain('上述附件引用除外');
-    expect(x).toContain('在 X 中尽量避免输出 URL 链接');
+    expect(x).toContain('在 X 中除上述附件引用外,尽量避免输出其他 URL 链接');
     expect(x).toContain('不要解释或复述这些格式要求');
     expect(x).toContain('作为 X 附件发回');
     expect(x).not.toContain('X (Twitter)');
