@@ -261,7 +261,7 @@ export function ScheduleFormDialog({
         description,
         scheduleName: form.name.trim() || undefined,
         providerId: providerId ?? undefined,
-        // 只有 bound + 空 model/provider 才跟随 session 路由。persistent 任务即使
+        // 只有 bound + 空 model/provider/effort 才跟随 session 路由。persistent 任务即使
         // 已回写 targetSessionId，仍按任务级选择生成，与下次 fire 的覆盖语义一致。
         agentKind: followsSessionRoute ? undefined : form.agentKind,
         model: followsSessionRoute ? undefined : form.model.trim() || undefined,
@@ -293,6 +293,7 @@ export function ScheduleFormDialog({
     providers,
     form.name,
     form.providerId,
+    form.effort,
     form.agentKind,
     form.model,
     form.workingDir,

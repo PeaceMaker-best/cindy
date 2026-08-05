@@ -35,6 +35,7 @@ import {
   resolveTemplateAgentFields,
   sessionAgentKindToScheduleAgentKind,
   shouldFollowBoundSessionGenerationRoute,
+  usesBoundSessionModel,
 } from '../scheduleFormLogic';
 import type { ScheduleFormState } from '../scheduleFormLogic';
 import {
@@ -99,6 +100,7 @@ describe('shouldFollowBoundSessionGenerationRoute', () => {
       targetSessionId: 'session-1',
       providerId: '',
       model: '',
+      effort: '',
     })).toBe(true);
   });
 
@@ -108,6 +110,15 @@ describe('shouldFollowBoundSessionGenerationRoute', () => {
       targetSessionId: 'session-1',
       providerId: 'tapsvc',
       model: 'gpt-5.5',
+      effort: '',
+    })).toBe(false);
+
+    expect(shouldFollowBoundSessionGenerationRoute({
+      persistentSession: false,
+      targetSessionId: 'session-1',
+      providerId: '',
+      model: '',
+      effort: 'high',
     })).toBe(false);
   });
 });
@@ -129,6 +140,14 @@ describe('isFollowingSessionSelection', () => {
 
   it('does not treat an unbound empty selection as follow-session', () => {
     expect(isFollowingSessionSelection({ ...base, followSession: false })).toBe(false);
+  });
+});
+
+describe('usesBoundSessionModel', () => {
+  it('keeps provider/effort-only overrides on the bound session model route', () => {
+    expect(usesBoundSessionModel({ followSession: true, model: '' })).toBe(true);
+    expect(usesBoundSessionModel({ followSession: true, model: 'gpt-5.5' })).toBe(false);
+    expect(usesBoundSessionModel({ followSession: false, model: '' })).toBe(false);
   });
 });
 

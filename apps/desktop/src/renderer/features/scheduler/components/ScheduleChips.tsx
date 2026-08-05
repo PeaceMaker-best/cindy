@@ -42,7 +42,11 @@ import {
   type CodexScheduleConfig,
 } from '../lib/cronCodexPreset';
 import { getScheduleDefaultModel, type EffortValue } from '../hooks/useScheduleForm';
-import { isFollowingSessionSelection, PENDING_SESSION_ID } from '../lib/scheduleFormLogic';
+import {
+  isFollowingSessionSelection,
+  PENDING_SESSION_ID,
+  usesBoundSessionModel,
+} from '../lib/scheduleFormLogic';
 import type { SessionReference } from '../../../../shared/sessionReference';
 
 export type Destination = 'local' | 'worktree' | 'thread';
@@ -1122,14 +1126,21 @@ export function ModelEffortChip({
     providerId,
     effort: effortValue,
   });
-  const effectiveId = isFollowingSession ? '' : modelValue || getScheduleDefaultModel(agentKind);
+  const followsSessionModel = usesBoundSessionModel({ followSession, model: modelValue });
+  const effectiveId = followsSessionModel ? '' : modelValue || getScheduleDefaultModel(agentKind);
   const current = models.find((m) => m.id === effectiveId);
   const allowedEfforts = (current?.efforts ?? []) as readonly EffortValue[];
   const fallbackEffort = (current?.defaultEffort ?? 'high') as EffortValue;
   const effectiveEffort: EffortValue = effortValue && allowedEfforts.includes(effortValue) ? effortValue : fallbackEffort;
   const effortLabel = (e: EffortValue) => t(`effortLevels.${e}`);
-  const display = isFollowingSession
-    ? t('scheduler.chips.model.followSession')
+  const display = followsSessionModel
+    ? [
+      t('scheduler.chips.model.followSession'),
+      providerId.trim()
+        ? (providers.find((provider) => provider.id === providerId)?.name ?? providerId)
+        : null,
+      effortValue ? effortLabel(effortValue) : null,
+    ].filter(Boolean).join(' · ')
     : current
       ? `${current.displayName} · ${allowedEfforts.length ? effortLabel(effectiveEffort) : t('scheduler.chips.model.effortDefault')}`
       : t('scheduler.chips.model.default');

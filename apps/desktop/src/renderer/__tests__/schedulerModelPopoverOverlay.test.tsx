@@ -211,4 +211,24 @@ describe('scheduler model popover overlay behavior', () => {
     });
     expect(requestProviderModelsAutoRefresh).toHaveBeenCalledWith('model-selector-open');
   });
+
+  it('keeps an effort-only bound override labeled as following the session model', () => {
+    render(
+      <ModelEffortChip
+        agentKind="claude-code"
+        modelValue=""
+        onChangeModel={vi.fn()}
+        effortValue="high"
+        onChangeEffort={vi.fn()}
+        followSession
+        providerId=""
+        onChangeProviderId={vi.fn()}
+      />,
+    );
+    expect(
+      screen.getByRole('button', {
+        name: 'scheduler.chips.model.followSession · effortLevels.high',
+      }),
+    ).toBeTruthy();
+  });
 });

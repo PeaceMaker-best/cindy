@@ -231,11 +231,14 @@ export function SubagentModelSection() {
         : undefined;
       // ModelSelector 已按目标来源行的 catalog/记忆解析出统一选择结果；优先消费它，
       // 只有旧调用方未提供第三参时才回落本地记忆/当前值。
-      const preferredEffort = reconciledEffort || rememberedEffort;
-      const nextEffort = resolveCodexEffort(
-        model,
-        isCodexSubagentEffort(preferredEffort) ? preferredEffort : current.codexEffort,
-      );
+      const preferredEffort = reconciledEffort ?? rememberedEffort;
+      // 空串是共享选择器对“目标来源不支持 effort”的明确回传，不能被旧 effort 复活。
+      const nextEffort = reconciledEffort === ''
+        ? null
+        : resolveCodexEffort(
+          model,
+          isCodexSubagentEffort(preferredEffort) ? preferredEffort : current.codexEffort,
+        );
       if (
         model === current.codex &&
         nextProviderId === current.codexProviderId &&

@@ -171,14 +171,26 @@ export function isFollowingSessionSelection(input: {
   );
 }
 
-/** True only for a bound schedule that intentionally follows its session route. */
+/** 前置脚本生成沿用绑定会话的模型/来源路由。 */
 export function shouldFollowBoundSessionGenerationRoute(
-  form: Pick<ScheduleFormState, 'persistentSession' | 'targetSessionId' | 'providerId' | 'model'>,
+  form: Pick<
+    ScheduleFormState,
+    'persistentSession' | 'targetSessionId' | 'providerId' | 'model' | 'effort'
+  >,
 ): boolean {
   return deriveRunMode(form) === 'bound'
     && hasRealBinding(form)
     && !form.providerId.trim()
-    && !form.model.trim();
+    && !form.model.trim()
+    && !form.effort.trim();
+}
+
+/** 绑定任务 model 为空时，运行模型仍来自绑定会话；provider/effort 可独立覆盖。 */
+export function usesBoundSessionModel(input: {
+  followSession?: boolean;
+  model: string;
+}): boolean {
+  return Boolean(input.followSession && !input.model.trim());
 }
 
 /**

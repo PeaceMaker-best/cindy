@@ -201,6 +201,11 @@ vi.mock('@/components/new-chat/ModelSelector', () => ({
         />
         <button
           type="button"
+          data-testid={`${vendor}:pick-provider-row-empty`}
+          onClick={() => props.onProviderChange?.(providerId, modelId, '')}
+        />
+        <button
+          type="button"
           data-testid={`${vendor}:pick-stale-provider-row`}
           onClick={() => props.onProviderChange?.('ghost-provider', modelId)}
         />
@@ -522,6 +527,20 @@ describe('SubagentModelSection Codex row', () => {
       codex: 'gpt-5.6-terra',
       codexProviderId: 'openai',
       codexEffort: 'low',
+    });
+  });
+
+  it('clears a provider row effort when the shared selector returns an explicit empty value', async () => {
+    settingsGet.mockResolvedValue(
+      makeState({ codex: 'gpt-5.6-terra', codexProviderId: 'openai', codexEffort: 'high' }),
+    );
+    render(<SubagentModelSection />);
+    fireEvent.click(await screen.findByTestId('codex:pick-provider-row-empty'));
+    await waitFor(() => expect(settingsSet).toHaveBeenCalledTimes(1));
+    expect(settingsSet).toHaveBeenCalledWith({
+      codex: 'gpt-5.6-terra',
+      codexProviderId: 'openai',
+      codexEffort: null,
     });
   });
 
