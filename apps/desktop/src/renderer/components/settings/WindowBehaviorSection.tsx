@@ -1,12 +1,13 @@
 /**
  * WindowBehaviorSection — 「应用行为」section:本机相关的应用级开关。
  *
- * 三项设置:
+ * 四项设置:
  *  1. 「保持电脑唤醒」(keepAwake):main 用 powerSaveBlocker 防系统休眠、放行锁屏,
  *     让后台 agent / 定时任务持续运行。跨平台生效(mac/win/linux),故常驻显示。
  *  2. 「关闭主窗口时」(windowsCloseBehavior):仅 Windows 显示,选择退出或收起到托盘。
  *  3. 「后台窗口首次左键点击仅激活不透传」(swallowActivationClick,PR #446):仅
  *     macOS + Windows 有实际效果,Linux 上两条底层路径均 no-op,故该行在 Linux 隐藏。
+ *  4. 「连接中断后自动继续任务」:跨平台、Host 级主开关，只取消尚在退避中的排期。
  *
  * 卡片样式沿用 NotificationSection 的规格(rounded 12 / Card bg / 1px Board /
  * padding 20)以保持视觉一致。
@@ -19,7 +20,9 @@ import { Switch } from '@/components/ui/switch';
 import { cn } from '@/lib/utils';
 import { useSwallowActivationClickSettings } from '@/hooks/useSwallowActivationClickSettings';
 import { useKeepAwakeSetting } from '@/hooks/useKeepAwakeSetting';
+import { useInterruptedTurnAutoResumeSettings } from '@/hooks/useInterruptedTurnAutoResumeSettings';
 import type { WindowsCloseBehavior } from '../../../shared/windowBehavior';
+import { DefaultOverrideControls } from './DefaultOverrideControls';
 
 /** 一张开关卡片:左侧标签 + 说明(+ 可选补充说明行),右侧开关。 */
 function BehaviorCard({
@@ -29,6 +32,8 @@ function BehaviorCard({
   checked,
   onCheckedChange,
   ariaLabel,
+  disabled,
+  controls,
 }: {
   label: string;
   hint: string;
@@ -36,6 +41,8 @@ function BehaviorCard({
   checked: boolean;
   onCheckedChange: (next: boolean) => void;
   ariaLabel: string;
+  disabled?: boolean;
+  controls?: ReactNode;
 }) {
   return (
     <div
@@ -58,7 +65,15 @@ function BehaviorCard({
         {note}
       </div>
 
-      <Switch checked={checked} onCheckedChange={onCheckedChange} aria-label={ariaLabel} />
+      <div className="flex shrink-0 items-center gap-2">
+        {controls}
+        <Switch
+          checked={checked}
+          onCheckedChange={onCheckedChange}
+          aria-label={ariaLabel}
+          disabled={disabled}
+        />
+      </div>
     </div>
   );
 }
@@ -66,6 +81,7 @@ function BehaviorCard({
 export function WindowBehaviorSection() {
   const { enabled, setEnabled } = useSwallowActivationClickSettings();
   const { keepAwake, setKeepAwake } = useKeepAwakeSetting();
+  const interruptedAutoResume = useInterruptedTurnAutoResumeSettings();
   const { t } = useTranslation();
   // macOS 上 acceptFirstMouse 是 Cocoa 级参数、只在 BrowserWindow 构造时读一次,
   // 用户切完开关下次启动才生效——单独渲染一行"需要重启应用"避免和主 hint 混在
@@ -113,6 +129,22 @@ export function WindowBehaviorSection() {
         checked={keepAwake}
         onCheckedChange={(v) => void setKeepAwake(v)}
         ariaLabel={t('settings.devices.keepAwake')}
+      />
+
+      <BehaviorCard
+        label={t('settings.windowBehavior.interruptedAutoResume.label')}
+        hint={t('settings.windowBehavior.interruptedAutoResume.hint')}
+        checked={interruptedAutoResume.enabled}
+        onCheckedChange={(next) => void interruptedAutoResume.setEnabled(next)}
+        ariaLabel={t('settings.windowBehavior.interruptedAutoResume.aria')}
+        disabled={interruptedAutoResume.pending}
+        controls={
+          <DefaultOverrideControls
+            isCustomized={interruptedAutoResume.isCustomized}
+            disabled={interruptedAutoResume.pending}
+            onReset={() => void interruptedAutoResume.reset()}
+          />
+        }
       />
 
       {isWindows && (
