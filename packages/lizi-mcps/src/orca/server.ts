@@ -396,7 +396,7 @@ function makeActionableValidationError(
   schema: z.ZodObject<ZodRawShape>,
   rawArgs: unknown,
   issues: ZodIssueLike[],
-  expectedCall: string,
+  exampleCall: string,
 ) {
   const validationErrors = summarizeValidationIssues(issues, rawArgs);
   const missingFields = validationErrors
@@ -407,15 +407,17 @@ function makeActionableValidationError(
     .map((issue) => issue.path);
   const wrappedArgs = unexpectedFields.includes('args');
   const hint = wrappedArgs
-    ? `Pass ${name} arguments at the top level; do not wrap them in "args". Follow expected_call, fix every listed field, and retry.`
-    : `Follow expected_call, fix every listed field, and retry ${name}.`;
+    ? `Move the fields inside "args" to the top level without changing their values, remove the "args" wrapper and any other unexpected fields, fix every listed field, and retry ${name}. example_call only demonstrates the argument shape; do not copy its business values.`
+    : `Fix every listed field against schema while preserving valid user-provided values, then retry ${name}. example_call only demonstrates the argument shape; do not copy its business values.`;
 
   return errorPayload('INVALID_ARGS', hint, {
     tool: name,
     validation_errors: validationErrors,
     missing_fields: missingFields,
     unexpected_fields: unexpectedFields,
-    expected_call: expectedCall,
+    example_call: exampleCall,
+    example_only: true,
+    example_note: 'Structure only. Preserve the user-requested worker count, roles, agents, labels, and tasks when retrying.',
     schema: z.toJSONSchema(schema, { target: 'draft-7' }),
   });
 }
@@ -460,7 +462,7 @@ class DirectToolSink extends XdtHelperToolRegistry {
       const schema = z.strictObject(def.inputShape);
       // Curated examples stay concise, while parsing them against the live schema
       // makes schema/example drift fail immediately during server construction.
-      const expectedCall = `${def.name}(${JSON.stringify(
+      const exampleCall = `${def.name}(${JSON.stringify(
         schema.parse(ACTIONABLE_VALIDATION_EXAMPLES[def.name]),
       )})`;
       this.mcp.registerTool(
@@ -477,7 +479,7 @@ class DirectToolSink extends XdtHelperToolRegistry {
               schema,
               rawArgs,
               parsed.error.issues as unknown as ZodIssueLike[],
-              expectedCall,
+              exampleCall,
             );
           }
           return def.handler(parsed.data as { [K in keyof T]: z.infer<T[K]> });

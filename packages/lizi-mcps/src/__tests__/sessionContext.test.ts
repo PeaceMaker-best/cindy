@@ -185,7 +185,12 @@ describe('dynamic lizi MCP session context', () => {
       const result = await client.callTool({
         name: 'create_worker',
         arguments: {
-          args: { role: 'reviewer', agent: 'codex', label: 'reviewer_1' },
+          args: {
+            role: 'architect',
+            agent: 'pi',
+            label: 'planner_1',
+            initial_task: 'plan the release',
+          },
           debug: true,
         },
       });
@@ -197,11 +202,14 @@ describe('dynamic lizi MCP session context', () => {
           tool: 'create_worker',
           missing_fields: ['role', 'agent', 'label'],
           unexpected_fields: ['args', 'debug'],
-          expected_call:
+          example_call:
             'create_worker({"role":"reviewer","agent":"codex","label":"worker_1"})',
+          example_only: true,
         },
       });
-      expect(payload.data.hint).toContain('top level');
+      expect(payload.data.hint).toContain('without changing their values');
+      expect(payload.data.example_note).toContain('Preserve the user-requested');
+      expect(JSON.stringify(payload)).not.toContain('plan the release');
       expect(payload.data.validation_errors).toEqual(expect.arrayContaining([
         expect.objectContaining({
           path: 'role',
@@ -240,8 +248,9 @@ describe('dynamic lizi MCP session context', () => {
           tool: 'create_workers',
           missing_fields: ['workers'],
           unexpected_fields: ['args'],
-          expected_call:
+          example_call:
             'create_workers({"workers":[{"role":"reviewer","agent":"codex","label":"worker_1"},{"role":"tester","agent":"codex","label":"worker_2"}]})',
+          example_only: true,
         },
       });
       expect(deps.createWorker).not.toHaveBeenCalled();
