@@ -697,6 +697,7 @@ import {
   resetInterruptedTurnAutoResumeSettings,
   writeInterruptedTurnAutoResumeEnabled,
 } from './maker-host/interrupted-turn-auto-resume-store.js';
+import { createInterruptedTurnAutoResumeSettingsHandlers } from './maker-ipc/interruptedTurnAutoResumeSettingsHandlers.js';
 import { clearAllSessionProviders } from './maker-host/session-provider-store.js';
 import { clearAllSessionRuntimeAxes } from './maker-host/session-effort-store.js';
 import { clearAllSessionRuntimeControlStates } from './maker-ipc/sessionRuntimeControl.js';
@@ -1392,6 +1393,14 @@ const updatePresentationLog = createLogger('update-presentation');
 const voicePowerBroadcastLog = createLogger('voice-input-power');
 const sessionDragPreviewLog = createLogger('session-drag-preview');
 const piSubagentLog = createLogger('pi-subagent');
+const interruptedTurnAutoResumeSettingsHandlers =
+  createInterruptedTurnAutoResumeSettingsHandlers({
+    readState: readInterruptedTurnAutoResumeSettingsState,
+    writeEnabled: writeInterruptedTurnAutoResumeEnabled,
+    reset: resetInterruptedTurnAutoResumeSettings,
+    cancelWaiting: cancelWaitingInterruptedTurnAutoResumes,
+    log: createLogger('interrupted-turn-auto-resume-settings'),
+  });
 let rendererBootGuard: RendererBootGuard | null = null;
 
 const lifecycleDbClientManager = createLifecycleDbClientManager({
@@ -4375,24 +4384,18 @@ const registerIpcHandlers = () => {
 
   ipcMain.handle(MAKER_IPC_INVOKE.INTERRUPTED_TURN_AUTO_RESUME_GET, async (event) => {
     assertTrustedAppRendererEvent(event);
-    return interruptedTurnAutoResumeWire();
+    return interruptedTurnAutoResumeSettingsHandlers.get();
   });
   ipcMain.handle(
     MAKER_IPC_INVOKE.INTERRUPTED_TURN_AUTO_RESUME_SET,
     async (event, enabled: unknown) => {
       assertTrustedAppRendererEvent(event);
-      if (typeof enabled !== 'boolean') {
-        throwIpcError('INVALID_PARAMS', 'interrupted turn auto-resume enabled required (boolean)');
-      }
-      await writeInterruptedTurnAutoResumeEnabled(enabled);
-      if (!enabled) cancelWaitingInterruptedTurnAutoResumes();
-      return { ...interruptedTurnAutoResumeWire(), effective: 'immediate' as const };
+      return interruptedTurnAutoResumeSettingsHandlers.set(enabled);
     },
   );
   ipcMain.handle(MAKER_IPC_INVOKE.INTERRUPTED_TURN_AUTO_RESUME_RESET, async (event) => {
     assertTrustedAppRendererEvent(event);
-    await resetInterruptedTurnAutoResumeSettings();
-    return { ...interruptedTurnAutoResumeWire(), effective: 'immediate' as const };
+    return interruptedTurnAutoResumeSettingsHandlers.reset();
   });
 
   ipcMain.handle(MAKER_IPC_INVOKE.COMPACTION_GET_PCT, async (event) => {
@@ -9350,15 +9353,6 @@ function silentEncryptedRetryWire() {
 
 function sessionRuntimeFallbackWire() {
   const state = readSessionRuntimeFallbackSettingsState();
-  return {
-    enabled: state.value.enabled,
-    isCustomized: state.isCustomized,
-    defaultEnabled: state.defaults.enabled,
-  };
-}
-
-function interruptedTurnAutoResumeWire() {
-  const state = readInterruptedTurnAutoResumeSettingsState();
   return {
     enabled: state.value.enabled,
     isCustomized: state.isCustomized,
