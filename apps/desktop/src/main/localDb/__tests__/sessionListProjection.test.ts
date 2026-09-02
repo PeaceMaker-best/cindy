@@ -132,6 +132,7 @@ describe('sessionToCamel list preview cache', () => {
       fastMode: false,
       planModeEnabled: false,
       clearedAt: null,
+      maintenanceClearedAt: 123,
       pinnedAt: null,
       userSendAt: null,
       agentKind: 'cc',
@@ -158,6 +159,7 @@ describe('sessionToCamel list preview cache', () => {
     } as SessionRowWithCount);
     expect(session.preview).toBe('cached preview');
     expect(session._count?.messages).toBe(4);
+    expect(session.maintenanceClearedAt).toBe('1970-01-01T00:00:00.123Z');
   });
 
   it('sanitizes cached listPreview the same way as SQL extracts', () => {

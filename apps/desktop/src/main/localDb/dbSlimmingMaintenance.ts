@@ -710,6 +710,15 @@ function compactWorkingCopy(
             WHERE id IN (SELECT id FROM temp.db_slimming_targets)`,
         );
       }
+      if (sessionColumns.has('maintenance_cleared_at')) {
+        activeDb
+          .prepare(
+            `UPDATE sessions
+                SET maintenance_cleared_at = MAX(COALESCE(maintenance_cleared_at, 0), ?)
+              WHERE id IN (SELECT id FROM temp.db_slimming_targets)`,
+          )
+          .run(Math.floor(request.scannedAt));
+      }
       if (request.includeActiveTasks === true) {
         if (tableExists(activeDb, 'session_goals')) {
           activeDb.exec(

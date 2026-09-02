@@ -87,6 +87,12 @@ export const sessions = sqliteTable(
      */
     planModeEnabled: integer('plan_mode_enabled', { mode: 'boolean' }).notNull().default(false),
     clearedAt: integer('cleared_at'), // unix ms
+    /**
+     * Database slimming physically removed this session's persisted history.
+     * Kept separate from clearedAt: /clear is a logical visibility boundary
+     * that also participates in resume/import behavior.
+     */
+    maintenanceClearedAt: integer('maintenance_cleared_at'), // unix ms
     pinnedAt: integer('pinned_at'), // unix ms
     /**
      * 任务现状一句话摘要（仅置顶段卡片模式展示/生成）。

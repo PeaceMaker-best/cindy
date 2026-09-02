@@ -96,7 +96,9 @@ export function setSessionRuntimeProjector(projector: SessionRuntimeProjector | 
  * 提炼成 `Session.preview` 纯文本。两字段可选——单字段 bump 等不带它们的路径
  * preview 落 null，渲染端兜底隐藏。
  */
-export type SessionRowWithCount = SessionRow & {
+export type SessionRowWithCount = Omit<SessionRow, 'maintenanceClearedAt'> & {
+  /** Optional for legacy/manual projections; current local rows always include it. */
+  maintenanceClearedAt?: number | null;
   messageCount: number;
   latestMessageContent?: string | null;
   latestMessageExtract?: string | null;
@@ -232,6 +234,7 @@ export function sessionToCamel(row: SessionRowWithCount): Session {
     fastMode: !!row.fastMode,
     planModeEnabled: !!row.planModeEnabled,
     clearedAt: msToIso(row.clearedAt),
+    maintenanceClearedAt: msToIso(row.maintenanceClearedAt),
     pinnedAt: msToIso(row.pinnedAt),
     userSendAt: msToIso(row.userSendAt),
     agentKind: row.agentKind as AgentKind,
@@ -364,6 +367,7 @@ export function sessionCreateToRow(
     // 计划模式默认 OFF；草稿里开了计划模式的会话显式传 true。
     planModeEnabled: !!body?.planModeEnabled,
     clearedAt: null,
+    maintenanceClearedAt: null,
     pinnedAt: null,
     userSendAt: null,
     agentKind: body?.agentKind ?? 'cc',

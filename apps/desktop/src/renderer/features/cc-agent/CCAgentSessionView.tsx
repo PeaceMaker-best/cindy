@@ -4315,7 +4315,7 @@ export function CCAgentSessionView({
       workingDir={session?.workingDir ?? ''}
       messages={messages}
       historyLoaded={historyLoaded}
-      historyCleared={Boolean(session?.clearedAt)}
+      historyCleared={Boolean(session?.clearedAt || session?.maintenanceClearedAt)}
       taskUpdates={taskUpdates}
       isSessionStreaming={isStreaming}
       continuationTurnClientId={continuationTurnClientId}

@@ -77,6 +77,7 @@ function createCleanupFixture(): void {
       context_tokens INTEGER NOT NULL DEFAULT 0,
       context_window INTEGER NOT NULL DEFAULT 0,
       cleared_at INTEGER,
+      maintenance_cleared_at INTEGER,
       summary TEXT,
       codex_plan_json TEXT,
       codex_history_has_product_prompt INTEGER,
@@ -349,7 +350,7 @@ describe('runDbSlimmingMaintenance', () => {
         db.prepare(`
           SELECT title, status, updated_at, total_token_usage, total_cost_usd,
                  sdk_session_id, list_preview, list_preview_role, list_message_count,
-                 context_tokens, context_window, cleared_at,
+                 context_tokens, context_window, cleared_at, maintenance_cleared_at,
                  summary, codex_plan_json, codex_history_has_product_prompt,
                  active_turn_started_at, last_turn_ended_at
             FROM sessions WHERE id = 'archived-boundary'
@@ -367,6 +368,7 @@ describe('runDbSlimmingMaintenance', () => {
         context_tokens: 100,
         context_window: 200,
         cleared_at: null,
+        maintenance_cleared_at: 2_000,
         summary: 'summary',
         codex_plan_json: '{}',
         codex_history_has_product_prompt: 1,
@@ -376,7 +378,7 @@ describe('runDbSlimmingMaintenance', () => {
       expect(
         db.prepare(`
           SELECT sdk_session_id, list_preview, list_preview_role, list_message_count,
-                 cleared_at, codex_plan_json
+                 cleared_at, maintenance_cleared_at, codex_plan_json
             FROM sessions WHERE id = 'active-old'
         `).get(),
       ).toEqual({
@@ -385,6 +387,7 @@ describe('runDbSlimmingMaintenance', () => {
         list_preview_role: 'assistant',
         list_message_count: 1,
         cleared_at: 50,
+        maintenance_cleared_at: null,
         codex_plan_json: '{}',
       });
     } finally {
@@ -477,7 +480,7 @@ describe('runDbSlimmingMaintenance', () => {
       expect(
         db.prepare(`
           SELECT status, updated_at, sdk_session_id, list_preview, list_preview_role,
-                 list_message_count, cleared_at, codex_plan_json, summary
+                 list_message_count, cleared_at, maintenance_cleared_at, codex_plan_json, summary
             FROM sessions WHERE id = 'active-old'
         `).get(),
       ).toEqual({
@@ -488,13 +491,14 @@ describe('runDbSlimmingMaintenance', () => {
         list_preview_role: null,
         list_message_count: null,
         cleared_at: 2_000,
+        maintenance_cleared_at: 2_000,
         codex_plan_json: null,
         summary: null,
       });
       expect(
         db.prepare(`
           SELECT updated_at, sdk_session_id, list_preview, list_preview_role,
-                 list_message_count, cleared_at, codex_plan_json, summary
+                 list_message_count, cleared_at, maintenance_cleared_at, codex_plan_json, summary
             FROM sessions WHERE id = 'active-updated-after-scan'
         `).get(),
       ).toEqual({
@@ -504,6 +508,7 @@ describe('runDbSlimmingMaintenance', () => {
         list_preview_role: 'assistant',
         list_message_count: 1,
         cleared_at: null,
+        maintenance_cleared_at: null,
         codex_plan_json: '{}',
         summary: 'summary',
       });

@@ -235,6 +235,11 @@ export interface Session {
    */
   planModeEnabled?: boolean;
   clearedAt: string | null; // ISO 8601 — messages before this timestamp are hidden
+  /**
+   * ISO timestamp of the latest database-slimming pass that physically removed
+   * this session's history. Optional for payloads from older Desktop peers.
+   */
+  maintenanceClearedAt?: string | null;
   pinnedAt: string | null;  // ISO 8601 — when pinned, null = not pinned
   /**
    * 用户最近一次"按下发送"的时刻（ISO 8601，null = 从未发过）。
