@@ -31,7 +31,10 @@ import {
   generateTitleWithAuxiliaryModel,
   generateTitleWithAuxiliaryModelResult,
 } from '../maker-host/auxiliary-title-one-shot.js';
-import { validateTitleOutput } from '../maker-host/title-output-validation.js';
+import {
+  validateGeneratedTitleLocale,
+  validateTitleOutput,
+} from '../maker-host/title-output-validation.js';
 import {
   regenerateTitleMaterial,
   type RegenerateTitleMaterial,
@@ -111,13 +114,14 @@ export async function generateMakerSessionTitle(
   // "请提供用户消息内容"式回复当标题返回。直接放弃,调用方保留默认名。
   const trimmed = message.trim();
   if (!trimmed) return null;
-  return generateTitleWithAuxiliaryModel(
+  const locale = getResolvedMainLocale();
+  const generated = await generateTitleWithAuxiliaryModel(
     {
       sessionId: sessionId ?? '',
       agentKind,
       prompt: buildAutoTitlePrompt(
         trimmed.slice(0, AUTO_TITLE_MESSAGE_SLICE),
-        getResolvedMainLocale(),
+        locale,
       ),
     },
     {
@@ -125,6 +129,17 @@ export async function generateMakerSessionTitle(
       listConnectedProviders: listConnectedProvidersForAgent,
     },
   );
+  if (!generated) return null;
+  const title = validateGeneratedTitleLocale(generated, trimmed, locale);
+  if (!title) {
+    log.warn('auto title rejected model output', {
+      sessionId: sessionId ?? '',
+      agentKind,
+      locale,
+      reason: 'unattributed-script',
+    });
+  }
+  return title;
 }
 
 /** regenerate 的依赖注入面——单测用内存实现替换 DB / LLM 调用。 */
@@ -213,10 +228,11 @@ export async function regenerateMakerSessionTitle(
           : `Assistant: ${m.text.slice(0, REGENERATE_ASSISTANT_SLICE)}`,
       )
       .join('\n');
+    const locale = getResolvedMainLocale();
     const generated = await deps.generateTitle(
       sessionId,
       agentKind,
-      buildRegenerateTitlePrompt(openingText, transcript, getResolvedMainLocale()),
+      buildRegenerateTitlePrompt(openingText, transcript, locale),
     );
     if (generated.status !== 'ok') {
       const context = { sessionId, agentKind, reason: generated.status };
@@ -233,12 +249,18 @@ export async function regenerateMakerSessionTitle(
     // Regenerate has a stricter product contract than the shared auto-title path:
     // one line, ≤20 Unicode characters, and no transcript/meta wrapper. The model is
     // not trusted to enforce this by prompt alone.
-    const title = validateTitleOutput(generated.title, 20);
+    const normalizedTitle = validateTitleOutput(generated.title, 20);
+    const referenceText = [openingText, ...recent.map((message) => message.text)]
+      .filter((text): text is string => Boolean(text))
+      .join('\n');
+    const title = normalizedTitle
+      ? validateGeneratedTitleLocale(normalizedTitle, referenceText, locale)
+      : null;
     if (!title) {
       log.warn('regenerate session title rejected model output', {
         sessionId,
         agentKind,
-        reason: 'invalid-output',
+        reason: normalizedTitle ? 'unattributed-script' : 'invalid-output',
       });
       throwIpcError('INTERNAL', 'AI title generation failed');
     }

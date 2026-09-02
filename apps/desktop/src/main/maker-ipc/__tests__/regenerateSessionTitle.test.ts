@@ -48,7 +48,7 @@ import { getResolvedMainLocale } from '../../i18n.js';
 import type { RegenerateTitleMaterial } from '../../localDb/latestMessageText.js';
 
 beforeEach(() => {
-  vi.mocked(getResolvedMainLocale).mockReturnValue('en');
+  vi.mocked(getResolvedMainLocale).mockReturnValue('zh-CN');
   vi.clearAllMocks();
 });
 
@@ -338,6 +338,20 @@ describe('regenerateMakerSessionTitle', () => {
     ).rejects.toThrow(/\[INTERNAL\]/);
   });
 
+  it('AI 重命名同样拒绝素材中没有依据的异文片段', async () => {
+    vi.mocked(getResolvedMainLocale).mockReturnValue('zh-CN');
+    const deps = makeDeps({
+      generateTitle: vi.fn(async () => generatedTitle('夏日合照自然合成 ആവശ്യ')),
+    });
+
+    await expect(regenerateMakerSessionTitle('s1', deps)).rejects.toThrow(/\[INTERNAL\]/);
+    expect(logger.warn).toHaveBeenCalledWith('regenerate session title rejected model output', {
+      sessionId: 's1',
+      agentKind: 'claude-code',
+      reason: 'unattributed-script',
+    });
+  });
+
   it('依赖异常被脱敏为通用 INTERNAL 错误，不向 renderer 透传原始错误', async () => {
     const deps = makeDeps({
       collectMaterial: vi.fn(async () => {
@@ -392,6 +406,30 @@ describe('generateMakerSessionTitle', () => {
     expect(request.agentKind).toBe('claude-code');
     expect(request.prompt).toContain('帮我排查登录失败');
     expect(request.prompt).not.toContain('  帮我排查登录失败');
+  });
+
+  it('zh-CN 模型标题凭空混入马拉雅拉姆文字时拒绝并回落原文占位', async () => {
+    vi.mocked(getResolvedMainLocale).mockReturnValue('zh-CN');
+    vi.mocked(generateTitleViaProvider).mockResolvedValueOnce('夏日合照自然合成 ആവശ്യ');
+
+    expect(
+      await generateMakerSessionTitle('请自然合成这张夏日合照', 'claude-code', 's1'),
+    ).toBeNull();
+    expect(logger.warn).toHaveBeenCalledWith('auto title rejected model output', {
+      sessionId: 's1',
+      agentKind: 'claude-code',
+      locale: 'zh-CN',
+      reason: 'unattributed-script',
+    });
+  });
+
+  it('首条输入本身包含外文时允许模型保留同一段文字', async () => {
+    vi.mocked(getResolvedMainLocale).mockReturnValue('zh-CN');
+    vi.mocked(generateTitleViaProvider).mockResolvedValueOnce('处理 ആവശ്യ 字段');
+
+    expect(
+      await generateMakerSessionTitle('接口里的 ആവശ്യ 字段是什么意思？', 'codex', 's1'),
+    ).toBe('处理 ആവശ്യ 字段');
   });
 
   it.each([

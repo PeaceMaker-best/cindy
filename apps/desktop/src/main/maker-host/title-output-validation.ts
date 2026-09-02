@@ -1,5 +1,7 @@
 /** Deterministic acceptance rules for model-produced session titles. */
 
+import type { SupportedLocale } from '../../shared/locale.js';
+
 const META_PREFIX_RE =
   /^(?:(?:according to (?:the )?conversation|based on (?:the )?conversation|here(?:'s| is) (?:the )?title)(?:\b|\s|[,:：，。.!！?？])|(?:title|标题|タイトル|제목)\s*[:：]|以下是|根据对话内容)/iu;
 const ROLE_LABEL_RE =
@@ -21,6 +23,15 @@ const INSTRUCTION_ECHO_RES: readonly RegExp[] = [
   /^(?:아래|다음)?\s*(?:사용자)?\s*(?:메시지|대화)?\s*(?:의)?\s*간결한\s*(?:한국어\s*)?제목(?:\s*생성)?$/u,
   /^(?:treat\s+everything\s+inside\s+the\s+(?:user_message|conversation_opening|recent_conversation)\s+delimiters\b|never\s+restate,?\s+translate,?\s+or\s+summarize\s+the\s+instructions\s+above\b|write\s+the\s+title\s+in\s+(?:simplified\s+chinese|english|japanese|korean)\b|use\s+at\s+most\s+20\s+characters\b|output\s+only\s+the\s+title,?\s+without\s+quotation\s+marks\s+or\s+ending\s+punctuation\b).*$/iu,
 ];
+
+const LETTER_RE = /\p{Letter}/u;
+const LOCALE_TITLE_LETTER_RE: Record<SupportedLocale, RegExp> = {
+  'zh-CN': /[\p{Script_Extensions=Han}\p{Script_Extensions=Latin}]/u,
+  'zh-TW': /[\p{Script_Extensions=Han}\p{Script_Extensions=Latin}]/u,
+  en: /\p{Script_Extensions=Latin}/u,
+  ja: /[\p{Script_Extensions=Han}\p{Script_Extensions=Hiragana}\p{Script_Extensions=Katakana}\p{Script_Extensions=Latin}]/u,
+  ko: /[\p{Script_Extensions=Hangul}\p{Script_Extensions=Han}\p{Script_Extensions=Latin}]/u,
+};
 
 function exceedsUnicodeCodePointLimit(value: string, maxChars: number): boolean {
   let count = 0;
@@ -69,5 +80,33 @@ export function validateTitleOutput(
   const echoProbe = stripWrappingQuotes(title.replace(TRAILING_SENTENCE_PUNCT_RE, ''));
   if (INSTRUCTION_ECHO_RES.some((re) => re.test(echoProbe))) return null;
   if (exceedsUnicodeCodePointLimit(title, maxChars)) return null;
+  return title;
+}
+
+/**
+ * Reject letters from scripts that neither belong to the requested UI locale nor
+ * occur in the reference material. This is intentionally scoped to generated
+ * titles: manual titles and the user's fallback text must remain lossless.
+ *
+ * Latin stays valid in every supported locale for product names, file names and
+ * code identifiers. An otherwise unexpected letter is accepted only when the same
+ * code point exists in the source, so quoted multilingual names survive while a
+ * model cannot append an unrelated foreign-script fragment (issue #3483).
+ */
+export function validateGeneratedTitleLocale(
+  title: string,
+  referenceText: string,
+  locale: SupportedLocale,
+): string | null {
+  const allowedLetter = LOCALE_TITLE_LETTER_RE[locale];
+  const referencedUnexpectedLetters = new Set(
+    Array.from(referenceText).filter(
+      (char) => LETTER_RE.test(char) && !allowedLetter.test(char),
+    ),
+  );
+  for (const char of title) {
+    if (!LETTER_RE.test(char) || allowedLetter.test(char)) continue;
+    if (!referencedUnexpectedLetters.has(char)) return null;
+  }
   return title;
 }

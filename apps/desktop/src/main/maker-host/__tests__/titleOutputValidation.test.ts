@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 
-import { validateTitleOutput } from '../title-output-validation.js';
+import {
+  validateGeneratedTitleLocale,
+  validateTitleOutput,
+} from '../title-output-validation.js';
 
 describe('validateTitleOutput', () => {
   it.each([
@@ -97,5 +100,41 @@ describe('validateTitleOutput', () => {
   it('uses Unicode code points for the length limit', () => {
     expect(validateTitleOutput('😀😀😀', 3)).toBe('😀😀😀');
     expect(validateTitleOutput('😀😀😀😀', 3)).toBeNull();
+  });
+});
+
+describe('validateGeneratedTitleLocale', () => {
+  it('rejects an unattributed Malayalam suffix in a Chinese title', () => {
+    expect(
+      validateGeneratedTitleLocale('夏日合照自然合成 ആവശ്യ', '请自然合成这张夏日合照', 'zh-CN'),
+    ).toBeNull();
+  });
+
+  it('keeps normal Chinese and common Latin product/code names', () => {
+    expect(validateGeneratedTitleLocale('夏日合照自然合成', '请合成这张照片', 'zh-CN')).toBe(
+      '夏日合照自然合成',
+    );
+    expect(validateGeneratedTitleLocale('修复 Mivo API 登录', '帮我排查登录问题', 'zh-CN')).toBe(
+      '修复 Mivo API 登录',
+    );
+  });
+
+  it('allows an unexpected script when the generated title quotes the source text', () => {
+    expect(
+      validateGeneratedTitleLocale(
+        '处理 ആവശ്യ 字段',
+        '接口里的 ആവശ്യ 字段是什么意思？',
+        'zh-CN',
+      ),
+    ).toBe('处理 ആവശ്യ 字段');
+  });
+
+  it('accepts the native scripts of Japanese and Korean locales', () => {
+    expect(validateGeneratedTitleLocale('サーバー問題の修正', 'fix server', 'ja')).toBe(
+      'サーバー問題の修正',
+    );
+    expect(validateGeneratedTitleLocale('로그인 문제 수정', 'fix login', 'ko')).toBe(
+      '로그인 문제 수정',
+    );
   });
 });
