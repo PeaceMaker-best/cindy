@@ -107,7 +107,7 @@ describe('WindowBehaviorSection interrupted turn auto-resume setting', () => {
     ).toBeTruthy();
   });
 
-  it('does not let a stale initial read overwrite a local change', async () => {
+  it('waits for the authoritative setting before accepting a toggle', async () => {
     const api = installElectronApi();
     let resolveInitial!: (value: {
       enabled: boolean;
@@ -125,10 +125,17 @@ describe('WindowBehaviorSection interrupted turn auto-resume setting', () => {
     const toggle = await screen.findByRole('switch', {
       name: 'settings.windowBehavior.interruptedAutoResume.aria',
     });
+    expect(toggle).toHaveProperty('disabled', true);
     fireEvent.click(toggle);
-    await waitFor(() => expect(api.interruptedTurnAutoResumeSet).toHaveBeenCalledWith(false));
+    expect(api.interruptedTurnAutoResumeSet).not.toHaveBeenCalled();
 
-    resolveInitial({ enabled: true, isCustomized: false, defaultEnabled: true });
-    await waitFor(() => expect(toggle.getAttribute('data-state')).toBe('unchecked'));
+    resolveInitial({ enabled: false, isCustomized: true, defaultEnabled: true });
+    await waitFor(() => {
+      expect(toggle).toHaveProperty('disabled', false);
+      expect(toggle.getAttribute('data-state')).toBe('unchecked');
+    });
+
+    fireEvent.click(toggle);
+    await waitFor(() => expect(api.interruptedTurnAutoResumeSet).toHaveBeenCalledWith(true));
   });
 });

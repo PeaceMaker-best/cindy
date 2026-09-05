@@ -156,11 +156,11 @@ export function WindowBehaviorSection() {
         checked={interruptedAutoResume.enabled}
         onCheckedChange={(next) => void interruptedAutoResume.setEnabled(next)}
         ariaLabel={t('settings.windowBehavior.interruptedAutoResume.aria')}
-        disabled={interruptedAutoResume.pending}
+        disabled={interruptedAutoResume.loading || interruptedAutoResume.pending}
         controls={
           <DefaultOverrideControls
             isCustomized={interruptedAutoResume.isCustomized}
-            disabled={interruptedAutoResume.pending}
+            disabled={interruptedAutoResume.loading || interruptedAutoResume.pending}
             onReset={() => void interruptedAutoResume.reset()}
           />
         }

@@ -21,6 +21,7 @@ const DEFAULT_STATE: InterruptedTurnAutoResumeState = {
 export function useInterruptedTurnAutoResumeSettings() {
   const { t } = useTranslation();
   const [state, setState] = useState(DEFAULT_STATE);
+  const [loading, setLoading] = useState(true);
   const [pending, setPending] = useState(false);
   const mounted = useRef(true);
   const hasLocalEdit = useRef(false);
@@ -32,7 +33,10 @@ export function useInterruptedTurnAutoResumeSettings() {
       .then((next) => {
         if (mounted.current && !hasLocalEdit.current) setState(next);
       })
-      .catch((error) => log.warn('load interrupted turn auto-resume setting failed', error));
+      .catch((error) => log.warn('load interrupted turn auto-resume setting failed', error))
+      .finally(() => {
+        if (mounted.current) setLoading(false);
+      });
     return () => {
       mounted.current = false;
     };
@@ -40,7 +44,7 @@ export function useInterruptedTurnAutoResumeSettings() {
 
   const commit = useCallback(
     async (operation: () => Promise<InterruptedTurnAutoResumeState>) => {
-      if (pending) return;
+      if (loading || pending) return;
       hasLocalEdit.current = true;
       setPending(true);
       try {
@@ -53,7 +57,7 @@ export function useInterruptedTurnAutoResumeSettings() {
         if (mounted.current) setPending(false);
       }
     },
-    [pending, t],
+    [loading, pending, t],
   );
 
   const setEnabled = useCallback(
@@ -66,5 +70,5 @@ export function useInterruptedTurnAutoResumeSettings() {
     [commit],
   );
 
-  return { ...state, pending, setEnabled, reset };
+  return { ...state, loading, pending, setEnabled, reset };
 }
