@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   getModelVisibilityOverride: vi.fn(),
   getSessionProvider: vi.fn(),
   getMaker: vi.fn(),
+  executeDetach: vi.fn(),
 }));
 
 vi.mock('../../../logger', () => ({ createLogger: () => mocks.logger }));
@@ -30,9 +31,10 @@ vi.mock('../../binding', () => ({
   bindingStore: {
     get: vi.fn(),
     detach: vi.fn(),
+    applyPersistedDetach: vi.fn(),
     listByIdentity: vi.fn(() => []),
   },
-  executeDetach: vi.fn(),
+  executeDetach: mocks.executeDetach,
 }));
 vi.mock('../controlProjects', () => ({
   listProjectsForControl: vi.fn(async () => []),
@@ -75,6 +77,7 @@ function makeRepo(overrides: Partial<ImSessionRepo> = {}): ImSessionRepo {
     peekSessionById: vi.fn(async () => null),
     prepareNewSession: vi.fn(async () => defaultRow),
     createSession: vi.fn(async () => defaultRow),
+    createFreshSession: vi.fn(async () => ({ current: defaultRow, previous: defaultRow })),
     getDefaultEffortFor: vi.fn(() => 'high' as const),
     ...overrides,
   };
@@ -158,6 +161,7 @@ describe('IM slash commands', () => {
         permissionModes: [{ id: 'auto', displayName: 'Auto', description: 'Safe default' }],
       }),
     });
+    mocks.executeDetach.mockResolvedValue({ wasAttached: false, targetSessionId: null });
   });
 
   it('does not create or reset a session when /new defaults are unauthenticated', async () => {
@@ -195,85 +199,6 @@ describe('IM slash commands', () => {
     expect(handled).toBe(true);
     expect(withMarkdown).toHaveBeenCalledWith('ou_user', ui.slash.help);
     expect(mocks.sendMarkdownText).not.toHaveBeenCalled();
-  });
-
-  it('slash 回复发送失败时仍镜像到群主流以释放保留', async () => {
-    const { handlers } = makeHarness();
-    mocks.sendMarkdownText.mockRejectedValueOnce(new Error('send failed'));
-    const mirrorTerminalReply = vi.fn(async () => undefined);
-
-    const handled = await handlers.handleSlashCommand('/help', {
-      botContextId: 'bot',
-      userId: 'ou_user',
-      mirrorTerminalReply,
-    });
-
-    expect(handled).toBe(true);
-    expect(mirrorTerminalReply).toHaveBeenCalledTimes(1);
-    expect(mirrorTerminalReply).toHaveBeenCalledWith(ui.slash.help);
-  });
-
-  it('已确认双投时把首个 markdown 终态镜像到群主流', async () => {
-    const { handlers } = makeHarness();
-    const mirrorTerminalReply = vi.fn(async () => undefined);
-
-    const handled = await handlers.handleSlashCommand('/help', {
-      botContextId: 'bot',
-      userId: 'ou_user',
-      mirrorTerminalReply,
-    });
-
-    expect(handled).toBe(true);
-    expect(mocks.sendMarkdownText).toHaveBeenCalledWith('ou_user', ui.slash.help);
-    expect(mirrorTerminalReply).toHaveBeenCalledTimes(1);
-    expect(mirrorTerminalReply).toHaveBeenCalledWith(ui.slash.help);
-  });
-
-  it('已确认双投时把卡片型 slash 的正文镜像到群主流', async () => {
-    const spec = {
-      title: '选择模型',
-      body: '当前 **claude-opus-4-8**',
-      buttons: [{ id: 'pick', label: '切换' }],
-    };
-    const { handlers, cards } = makeHarness();
-    vi.mocked(cards.buildModelPickerCard).mockReturnValue(spec);
-    const mirrorTerminalReply = vi.fn(async () => undefined);
-
-    const handled = await handlers.handleSlashCommand('/model', {
-      botContextId: 'bot',
-      userId: 'ou_user',
-      mirrorTerminalReply,
-    });
-
-    expect(handled).toBe(true);
-    expect(mocks.sendInteractiveCard).toHaveBeenCalled();
-    expect(mirrorTerminalReply).toHaveBeenCalledTimes(1);
-    expect(mirrorTerminalReply).toHaveBeenCalledWith(spec.body);
-  });
-
-  it('卡片型 slash 消费开场白卡后仍镜像正文到群主流', async () => {
-    const spec = {
-      title: '接管',
-      body: '选择一个工作区',
-      buttons: [{ id: 'pick', label: '选择' }],
-    };
-    const { handlers, cards } = makeHarness();
-    vi.mocked(cards.buildControlPickerCard).mockReturnValue(spec);
-    const withCard = vi.fn(async () => true);
-    const mirrorTerminalReply = vi.fn(async () => undefined);
-
-    const handled = await handlers.handleSlashCommand('/ctr', {
-      botContextId: 'bot',
-      userId: 'ou_user',
-      consumePendingOpener: { withMarkdown: vi.fn(async () => false), withCard },
-      mirrorTerminalReply,
-    });
-
-    expect(handled).toBe(true);
-    expect(withCard).toHaveBeenCalledWith('ou_user', spec);
-    expect(mocks.sendInteractiveCard).not.toHaveBeenCalled();
-    expect(mirrorTerminalReply).toHaveBeenCalledTimes(1);
-    expect(mirrorTerminalReply).toHaveBeenCalledWith(spec.body);
   });
 
   it('首条 slash 消费失败时回落正常发送', async () => {
@@ -373,20 +298,87 @@ describe('IM slash commands', () => {
     expect(mocks.resetSessionToDefaults).not.toHaveBeenCalled();
   });
 
-  it('resets an existing session to the current defaults after /new', async () => {
-    const prepared = { ...defaultRow, agentKind: 'codex' as const, model: 'gpt-5.5' };
-    const repo = makeRepo({ prepareNewSession: vi.fn(async () => prepared) });
-    const { handlers } = makeHarness({ repo });
+  it('creates a distinct Telegram task from the current Pi, Grok, provider, and Full access defaults after /new', async () => {
+    const { bindingStore } = await import('../../binding');
+    vi.mocked(bindingStore.get).mockReturnValueOnce('attached-desktop-task');
+    vi.mocked(bindingStore.applyPersistedDetach).mockResolvedValueOnce(true);
+    const prepared = {
+      ...defaultRow,
+      agentKind: 'pi' as const,
+      model: 'grok-4.6',
+      providerId: 'xai',
+      permissionMode: 'bypassPermissions' as const,
+    };
+    const fresh = { ...prepared, id: 'telegram-new-task' };
+    const createFreshSession = vi.fn(async () => ({ current: fresh, previous: defaultRow }));
+    const repo = makeRepo({
+      prepareNewSession: vi.fn(async () => prepared),
+      createFreshSession,
+    });
+    const { handlers, turnRunner } = makeHarness({
+      repo,
+      adapterOverrides: {
+        channel: 'telegram',
+        sessions: {
+          source: 'telegram',
+          sessionIdFor: () => 'telegram-legacy-task',
+          createTaskOnNew: true,
+          defaultTitle: () => 'Telegram',
+          ensureWorkingDir: () => '/tmp/telegram',
+          extraInsertColumns: () => ({}),
+        },
+      },
+    });
 
     await handlers.handleSlashCommand('/new', { botContextId: 'bot', userId: 'ou_user' });
 
-    expect(mocks.resetSessionToDefaults).toHaveBeenCalledWith(
-      'feishu-session',
-      expect.anything(),
+    const identity = { channel: 'telegram', botContextId: 'bot', userId: 'ou_user' };
+    expect(createFreshSession).toHaveBeenCalledWith(
+      'bot',
+      'ou_user',
+      undefined,
       prepared,
-      'feishu',
+      { identity, targetSessionId: 'attached-desktop-task' },
     );
+    expect(createFreshSession.mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(bindingStore.applyPersistedDetach).mock.invocationCallOrder[0]!,
+    );
+    expect(bindingStore.applyPersistedDetach).toHaveBeenCalledWith(
+      identity,
+      'attached-desktop-task',
+    );
+    expect(mocks.executeDetach).not.toHaveBeenCalled();
+    expect(mocks.resetSessionToDefaults).not.toHaveBeenCalled();
+    expect(turnRunner.disposeOneSession).toHaveBeenCalledWith(defaultRow.id);
     expect(mocks.sendMarkdownText).toHaveBeenCalledWith('ou_user', ui.slash.new);
+  });
+
+  it('keeps /ctr attached when Telegram task rotation fails', async () => {
+    const createFreshSession = vi.fn(async () => {
+      throw new Error('db unavailable');
+    });
+    const repo = makeRepo({ createFreshSession });
+    const { handlers } = makeHarness({
+      repo,
+      adapterOverrides: {
+        channel: 'telegram',
+        sessions: {
+          source: 'telegram',
+          sessionIdFor: () => 'telegram-legacy-task',
+          createTaskOnNew: true,
+          defaultTitle: () => 'Telegram',
+          ensureWorkingDir: () => '/tmp/telegram',
+          extraInsertColumns: () => ({}),
+        },
+      },
+    });
+
+    await expect(
+      handlers.handleSlashCommand('/new', { botContextId: 'bot', userId: 'ou_user' }),
+    ).rejects.toThrow('db unavailable');
+    expect(mocks.executeDetach).not.toHaveBeenCalled();
+    const { bindingStore } = await import('../../binding');
+    expect(bindingStore.applyPersistedDetach).not.toHaveBeenCalled();
   });
 
   it('does not send /model picker when creating the target session would fail auth', async () => {

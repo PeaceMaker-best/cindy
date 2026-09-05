@@ -425,6 +425,8 @@ describe('cc routingTransform — owner boundary 不得把占位 key fail-open �
   });
 
   it('finalize 之后、localHandler 调用前才 pending → 503,不读旧 owner OAuth', async () => {
+    // Resolve normally so this exercises dispatch revalidation, not lookup failure.
+    setClaudeProxySessionIdResolver(() => null);
     gatewayKey = null;
     let pending = false;
     setClaudeProxyOwnerBoundaryPendingChecker(() => pending);
@@ -446,6 +448,7 @@ describe('cc routingTransform — owner boundary 不得把占位 key fail-open �
   });
 
   it('finalize 之后 owner scope 变了但 pending 仍 false → 503,不读旧 owner OAuth', async () => {
+    setClaudeProxySessionIdResolver(() => null);
     gatewayKey = null;
     let scopeKey = 'cloud:owner-a:1';
     setClaudeProxyOwnerBoundaryPendingChecker(() => false);
@@ -467,13 +470,15 @@ describe('cc routingTransform — owner boundary 不得把占位 key fail-open �
     });
   });
 
-  it('resolver 抛错但有网关 key 时分类器仍换 key(#831),不 passthrough 占位', () => {
+  it('resolver 抛错时即使有网关 key 也本地拒绝,不猜测请求归属 (#3631)', async () => {
     const decision = createModelRoutingTransform()(
       { model: 'claude-haiku-4-5-20251001' },
       ctxWith({ ...SESSION_HEADER, 'x-api-key': PLACEHOLDER }),
     );
-    expect(decision).toEqual({
-      headerOverride: { 'x-api-key': 'sk-gw', authorization: 'Bearer sk-gw' },
+    const { writeHead, end } = await invokeLocalHandler(await decision);
+    expect(writeHead).toHaveBeenCalledWith(503, expect.any(Object));
+    expect(JSON.parse(end.mock.calls[0][0])).toMatchObject({
+      error: { code: 'routing_temporarily_unavailable' },
     });
   });
 });
@@ -725,6 +730,36 @@ describe('pi routingTransform — xdt session header selects the Pi provider rou
 
     expect(decision).toEqual({ localHandler: expect.any(Function) });
   });
+
+  it.each([
+    ['openai', 'xai', '/v1/responses'],
+    ['xai', 'openai', '/codex/responses'],
+  ] as const)(
+    'rejects a stale %s header after the host re-pins the PI session to %s',
+    async (staleHeader, pinnedProvider, url) => {
+      setSessionProvider('sess-pi', pinnedProvider);
+      registerPiProxySession('sess-pi', 'session-secret', () => pinnedProvider);
+      const decision = await createModelRoutingTransform()(
+        undefined,
+        ctxWith({
+          'x-cindy-pi-session-id': 'sess-pi',
+          'x-cindy-pi-session-token': 'session-secret',
+          'x-cindy-pi-provider-id': staleHeader,
+        }, url),
+      );
+      const response = {
+        status: 0,
+        body: '',
+        writeHead(status: number) { this.status = status; },
+        end(body: string) { this.body = body; },
+      };
+
+      await decision?.localHandler?.({ res: response } as never);
+
+      expect(response.status).toBe(403);
+      expect(response.body).toContain('pi_provider_mismatch');
+    },
+  );
 
   it('rejects an implicit native header that differs from the host-resolved PI source', async () => {
     clearSessionProvider('sess-pi');

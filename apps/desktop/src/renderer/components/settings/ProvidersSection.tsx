@@ -37,12 +37,14 @@ import {
 import { cn } from '@/lib/utils';
 import { useProviders } from '@/hooks/useProviders';
 import { isChatGptConnectionConnected, useCodexAuth } from '@/hooks/useCodexAuth';
+import { codexRecoveryActionKey, codexRecoveryDescriptionKey } from '@/hooks/codexAuthRecovery';
 import { useApiKey } from '@/hooks/useApiKey';
 import { extractIpcError } from '@/utils/ipcError';
 import { useModelAccessStatus } from '@/hooks/useModelAccessStatus';
 import { useModelAccessCreditUsage } from '@/hooks/useModelAccessCreditUsage';
 import { useXdAssetPrimaryAction } from '@/hooks/useXdAssetPrimaryAction';
 import { useReducedMotion } from '@/hooks/useReducedMotion';
+import { Button } from '@/components/ui/button';
 import { useConfirmDialog } from '@/components/ui/confirm-dialog-provider';
 import { useSignInToCindy } from '@/hooks/useSignInToCindy';
 import { useProviderOAuthDeviceCode } from '@/hooks/useProviderOAuthDeviceCode';
@@ -200,23 +202,9 @@ function PillButton({
   disabled?: boolean;
 }) {
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={disabled}
-      className={cn(
-        'flex h-8 shrink-0 items-center justify-center rounded-full px-6 text-13 font-medium transition-colors',
-        'border',
-        disabled && 'cursor-not-allowed opacity-60',
-      )}
-      style={{
-        backgroundColor: 'var(--settings-btn-secondary-bg)',
-        borderColor: 'var(--settings-btn-secondary-border)',
-        color: 'var(--settings-btn-secondary-text)',
-      }}
-    >
+    <Button variant="secondary" size="md" onClick={onClick} disabled={disabled}>
       {label}
-    </button>
+    </Button>
   );
 }
 
@@ -237,24 +225,9 @@ function CtaPillButton({
   className?: string;
 }) {
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={cn(
-        'flex shrink-0 items-center justify-center rounded-full px-6 text-13 font-medium transition-opacity hover:opacity-90',
-        size === 'lg' ? 'h-9' : 'h-8',
-        className,
-      )}
-      style={{
-        // Black Pill(最高强调档)按 DESIGN.md §4 用 pure 对:--accent-cta-bg-pure
-        // (Light 纯黑 / Dark 纯白反转)配 --accent-pure-cta-fg。--accent-cta-bg 在
-        // 默认 Light 下是 #262626,与规范的 #000000 差一档,不能混用。
-        backgroundColor: 'var(--accent-cta-bg-pure)',
-        color: 'var(--accent-pure-cta-fg)',
-      }}
-    >
+    <Button variant="cta" size={size} onClick={onClick} className={className}>
       {label}
-    </button>
+    </Button>
   );
 }
 
@@ -585,7 +558,7 @@ function OpenAiHeader({ provider, onChanged }: { provider?: ProviderView; onChan
   const credentialScope = reconnectRequired
     ? (state.credentialScope ?? 'unknown')
     : (reconnectCredentialScope ?? 'unknown');
-
+  const oauthWritesBlocked = state.oauthWritesBlocked === true;
   const handleLogout = useCallback(async () => {
     const confirmed = await confirm({
       title: t('settings.connections.codex.logoutConfirm.title'),
@@ -610,6 +583,8 @@ function OpenAiHeader({ provider, onChanged }: { provider?: ProviderView; onChan
       onChanged();
     } else if (outcome === 'unverified') {
       toast.error(t('chatgptAuthRecovery.verificationFailed'));
+    } else if (outcome === 'blocked') {
+      toast.error(t('chatgptAuthRecovery.devWriteBlocked'));
     } else if (outcome === 'failed') {
       toast.error(t('settings.connections.codex.toast.loginFailed'));
     }
@@ -621,18 +596,21 @@ function OpenAiHeader({ provider, onChanged }: { provider?: ProviderView; onChan
       await refresh();
       return;
     }
-    await handleLogin();
-  }, [handleLogin, loggingIn, recoveryCheck, refresh]);
+    if (reconnectRequired && credentialScope === 'system-shared') {
+      try {
+        const opened = await window.electronAPI.openChatGPTApp();
+        if (!opened.success) toast.error(t('chatgptAuthRecovery.openAppFailed'));
+      } catch {
+        toast.error(t('chatgptAuthRecovery.openAppFailed'));
+      }
+      return;
+    }
+    if (reconnectRequired) await handleLogin();
+  }, [credentialScope, handleLogin, loggingIn, reconnectRequired, recoveryCheck, refresh, t]);
 
   const recoveryDetail = reconnectRequired ? (
     <p className="text-12 leading-relaxed text-[var(--settings-integration-subtitle)]">
-      {t(
-        credentialScope === 'system-shared'
-          ? 'chatgptAuthRecovery.systemSharedInvalidated'
-          : credentialScope === 'instance-isolated'
-            ? 'chatgptAuthRecovery.instanceIsolatedInvalidated'
-            : 'chatgptAuthRecovery.unknownInvalidated',
-      )}
+      {t(codexRecoveryDescriptionKey(credentialScope))}
     </p>
   ) : null;
 
@@ -648,24 +626,25 @@ function OpenAiHeader({ provider, onChanged }: { provider?: ProviderView; onChan
     <div className="flex shrink-0 items-center gap-2.5">
       <ReconnectRequiredPill />
       <PillButton
-        label={t(
-          recoveryCheck === 'checking' || loggingIn
-            ? 'chatgptAuthRecovery.checking'
-            : recoveryCheck === 'failed'
-              ? 'chatgptAuthRecovery.recheck'
-              : 'chatgptAuthRecovery.relogin',
-        )}
+        label={t(codexRecoveryActionKey(credentialScope, loggingIn ? 'checking' : recoveryCheck))}
         onClick={() => void handleRecovery()}
-        disabled={recoveryCheck === 'checking' || loggingIn}
+        disabled={
+          recoveryCheck === 'checking' ||
+          loggingIn ||
+          (oauthWritesBlocked && credentialScope !== 'system-shared')
+        }
       />
     </div>
   ) : (
     <PillButton
       label={
-        loggingIn
-          ? t('settings.providers.openai.cancelConnect')
-          : t('settings.providers.openai.connect')
+        oauthWritesBlocked
+          ? t('chatgptAuthRecovery.devReadOnly')
+          : loggingIn
+            ? t('settings.providers.openai.cancelConnect')
+            : t('settings.providers.openai.connect')
       }
+      disabled={oauthWritesBlocked}
       onClick={() => {
         if (loggingIn) void cancelLogin();
         else void handleLogin();

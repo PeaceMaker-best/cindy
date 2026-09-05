@@ -41,10 +41,16 @@ function installElectronApi() {
     state = { enabled: true, isCustomized: false, defaultEnabled: true };
     return state;
   });
+  const getLinuxCloseBehavior = vi.fn(async () => 'minimize' as const);
+  const setLinuxCloseBehavior = vi.fn(async (behavior: 'quit' | 'minimize') => behavior);
   Object.defineProperty(window, 'electronAPI', {
     configurable: true,
     value: {
       platform: 'linux',
+      windowBehavior: {
+        getLinuxCloseBehavior,
+        setLinuxCloseBehavior,
+      },
       maker: {
         interruptedTurnAutoResumeGet,
         interruptedTurnAutoResumeSet,

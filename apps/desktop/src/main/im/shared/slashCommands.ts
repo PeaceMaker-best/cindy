@@ -62,12 +62,6 @@ export interface SlashCtx {
     withMarkdown(userId: string, markdown: string): Promise<boolean>;
     withCard(userId: string, spec: InteractiveCardSpec): Promise<boolean>;
   };
-  /**
-   * 已确认双投时由 messageHandler 注入: 首个 markdown 终态同步到群主流。
-   * 只应消费一次(与 consumePendingOpener 同口径)。卡片回复镜像卡片正文
-   * （没有正文时退回标题）；按钮仍只在话题内可点。
-   */
-  mirrorTerminalReply?: (text: string) => Promise<void>;
 }
 
 export interface ImSlashHandlers {
@@ -100,27 +94,6 @@ export function createSlashHandlers(
    * 群主流 @ 开话题的首条 slash: 首个回复经 ctx.consumePendingOpener 就地
    * patch 开场白卡(消费过一次后回落正常发送)。
    */
-  async function mirrorFirstSlashReply(ctx: SlashCtx, text: string): Promise<void> {
-    const mirror = ctx.mirrorTerminalReply;
-    if (!mirror) return;
-    const trimmed = text.trim();
-    if (!trimmed) return;
-    ctx.mirrorTerminalReply = undefined;
-    try {
-      await mirror(trimmed);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      log.warn(`slash parent-chat mirror failed (non-fatal): ${msg}`);
-    }
-  }
-
-  function slashCardMirrorText(spec: InteractiveCardSpec | null | undefined): string {
-    if (!spec || typeof spec !== 'object') return '';
-    const body = typeof spec.body === 'string' ? spec.body.trim() : '';
-    const title = typeof spec.title === 'string' ? spec.title.trim() : '';
-    return body || title;
-  }
-
   async function safeSendText(ctx: SlashCtx, text: string): Promise<void> {
     try {
       if (ctx.consumePendingOpener) {
@@ -144,10 +117,6 @@ export function createSlashHandlers(
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log.warn(`safeSendText failed (non-fatal): ${msg}`);
-    } finally {
-      // Thread send failure must still consume the parent-chat retain; otherwise
-      // enqueue retention pins confirmed forever.
-      await mirrorFirstSlashReply(ctx, text);
     }
   }
 
@@ -184,8 +153,6 @@ export function createSlashHandlers(
       const msg = err instanceof Error ? err.message : String(err);
       log.warn(`safeSendCard failed (non-fatal): ${msg}`);
       return false;
-    } finally {
-      await mirrorFirstSlashReply(ctx, slashCardMirrorText(spec));
     }
   }
 
@@ -302,7 +269,36 @@ export function createSlashHandlers(
           );
           return true;
         }
-        // 找到当前 IM 会话行；没有历史会话时按已通过认证的默认值创建一行。
+        if (adapter.sessions.createTaskOnNew) {
+          if (!repo.createFreshSession) {
+            throw new Error(`${channel} session rotation is not available`);
+          }
+          const identity: IdentityKey = {
+            channel,
+            botContextId: ctx.botContextId,
+            userId: ctx.userId,
+          };
+          const attachedTargetSessionId = bindingStore.get(identity);
+          const { previous } = await repo.createFreshSession(
+            ctx.botContextId,
+            ctx.userId,
+            undefined,
+            prepared,
+            attachedTargetSessionId
+              ? { identity, targetSessionId: attachedTargetSessionId }
+              : null,
+          );
+          // Session rotation and the persisted `/ctr` detach commit in one
+          // SQLite transaction. Only mirror that committed deletion in memory;
+          // a newer concurrent takeover is preserved by the expected target.
+          if (attachedTargetSessionId) {
+            await bindingStore.applyPersistedDetach(identity, attachedTargetSessionId);
+          }
+          if (previous) await turnRunner.disposeOneSession(previous.id);
+          await safeSendText(ctx, ui.slash.new);
+          return true;
+        }
+        // Legacy single-row channels keep their established reset semantics.
         const existing = await repo.findActiveSession(ctx.botContextId, ctx.userId);
         const row =
           existing ?? (await repo.createSession(ctx.botContextId, ctx.userId, undefined, prepared));
